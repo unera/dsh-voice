@@ -12,6 +12,7 @@ import { basename, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
 import { splitReply } from './markup.mjs'
+import { createTrace } from './trace.mjs'
 
 /**
  * How long the device may take to hand over a recording, in seconds.
@@ -283,6 +284,8 @@ export function createVoiceLoop ({
    * @returns a short outcome for the log.
    */
   async function exchange (want, nodeName) {
+    const trace = createTrace({ id: `pull-${nodeName}-${Date.now()}`, node: nodeName, log })
+    trace.mark('received')
     active.set(nodeName, { sessionId: want?.sessionId ?? bindings.get(nodeName) ?? null })
     mkdirSync(cacheDir, { recursive: true })
     const record = await nodes.call(nodeName, 'voice', 'record', {
@@ -294,6 +297,7 @@ export function createVoiceLoop ({
       active.delete(nodeName)
       log.info?.('[dsh-voice] no recording', { node: nodeName, code: record?.code ?? record?.status })
       if (record?.code === 'voice_timeout') await say(nodeName, 'Не услышал попробуй ещё раз.')
+      trace.done('no-recording', { code: record?.code ?? null })
       return { status: 'no-recording', code: record?.code ?? null }
     }
     const devicePath = record.payload.path
@@ -306,6 +310,7 @@ export function createVoiceLoop ({
       cleanup([localPath])
       log.warn?.('[dsh-voice] the recording did not arrive', { node: nodeName, message: copy?.message })
       await say(nodeName, 'Не смог забрать запись.')
+      trace.done('no-copy')
       return { status: 'no-copy' }
     }
     let text = ''
@@ -315,10 +320,12 @@ export function createVoiceLoop ({
     } catch (error) {
       log.warn?.('[dsh-voice] transcription failed:', error?.message ?? error)
     }
+    trace.mark('transcribed')
     if (!text) {
       active.delete(nodeName)
       cleanup([localPath])
       await say(nodeName, NOT_HEARD)
+      trace.done('empty')
       return { status: 'empty' }
     }
     const sessionId = await sessionFor(nodeName, want?.sessionId ?? null, want?.node ?? null)
@@ -326,15 +333,17 @@ export function createVoiceLoop ({
     // The wait is registered before the message is delivered: a turn that starts
     // and ends quickly otherwise finishes before anyone is awaiting it, and the
     // answer to the *previous* question is what gets spoken.
-    awaiting.set(sessionId, { node: nodeName, mode: want?.mode ?? 'ptt', turn: null })
+    awaiting.set(sessionId, { node: nodeName, mode: want?.mode ?? 'ptt', turn: null, trace })
     try {
       await deliver({ sessionId, text, node: nodeName, mode: want?.mode ?? 'ptt' })
+      trace.mark('delivered')
     } catch (error) {
       active.delete(nodeName)
       cleanup([localPath])
       awaiting.delete(sessionId)
       log.warn?.('[dsh-voice] delivery failed:', error?.message ?? error)
       await say(nodeName, 'Не смог передать запрос.')
+      trace.done('no-session')
       return { status: 'no-session' }
     }
     cleanup([localPath])
@@ -394,6 +403,8 @@ export function createVoiceLoop ({
    * @returns a short outcome for the log.
    */
   async function exchangeFromFile (event, nodeName) {
+    const trace = createTrace({ id: event?.id ?? null, node: nodeName, at: event?.at ?? null, log })
+    trace.mark('received')
     let text = ''
     try {
       const transcript = await transcribe(event.path)
@@ -401,22 +412,28 @@ export function createVoiceLoop ({
     } catch (error) {
       log.warn?.('[dsh-voice] transcription failed:', error?.message ?? error)
     }
+    trace.mark('transcribed')
     if (!text) {
       cleanup([event.path])
       await say(nodeName, NOT_HEARD)
+      trace.done('empty')
       return { status: 'empty', id: event?.id ?? null }
     }
     const sessionId = await sessionFor(nodeName, event?.sessionId ?? null, event?.node ?? null)
     active.set(nodeName, { sessionId })
-    awaiting.set(sessionId, { node: nodeName, mode: event?.mode ?? 'upload', turn: null })
+    // The wait is registered before the message is delivered: a turn that starts and ends
+    // quickly would otherwise finish before anyone awaits it.
+    awaiting.set(sessionId, { node: nodeName, mode: event?.mode ?? 'upload', turn: null, trace })
     try {
       await deliver({ sessionId, text, node: nodeName, mode: 'upload' })
+      trace.mark('delivered')
     } catch (error) {
       awaiting.delete(sessionId)
       active.delete(nodeName)
       cleanup([event.path])
       log.warn?.('[dsh-voice] delivery failed:', error?.message ?? error)
       await say(nodeName, 'Не смог передать запрос.')
+      trace.done('no-session')
       return { status: 'no-session' }
     }
     // The recording has done its job: keeping it would only grow the cache.
@@ -438,7 +455,10 @@ export function createVoiceLoop ({
       const waiting = awaiting.get(sessionId)
       // The first turn that opens after the delivery is the one to answer; a
       // later turn belongs to whoever writes into the session next.
-      if (waiting && waiting.turn === null) waiting.turn = event.data?.turn ?? null
+      if (waiting && waiting.turn === null) {
+        waiting.turn = event.data?.turn ?? null
+        waiting.trace?.mark('turn-start', { turn: waiting.turn })
+      }
       return
     }
     const assistant = assistantTextOf(event)
@@ -461,10 +481,15 @@ export function createVoiceLoop ({
     drafts.delete(sessionId)
     if (!target) return
     if (target.node) active.delete(target.node)
+    target.trace?.mark('turn-end', { reason })
     const { speak } = splitReply(text)
-    if (!speak.trim()) return
+    target.trace?.mark('split', { speakChars: speak.trim().length })
+    if (!speak.trim()) {
+      target.trace?.done('silent')
+      return
+    }
     try {
-      await speakAnswer({ sessionId, text: speak, node: target.node })
+      await speakAnswer({ sessionId, text: speak, node: target.node, trace: target.trace })
     } catch (error) {
       log.warn?.('[dsh-voice] speech failed:', error?.message ?? error)
     }
@@ -477,7 +502,7 @@ export function createVoiceLoop ({
    * own engine: that keeps the synthesis path exercised, and the moment `voice.play` exists
    * the file is already there. Until then the text is what the phone actually plays.
    */
-  async function speakAnswer ({ sessionId, text, node }) {
+  async function speakAnswer ({ sessionId, text, node, trace = null }) {
     let audioPath = null
     if (textToSpeech?.resolve && textToSpeech?.synthesize) {
       try {
@@ -487,6 +512,7 @@ export function createVoiceLoop ({
         const speech = await textToSpeech.synthesize(spec, new AbortController().signal)
         audioPath = join(cacheDir, `say-${Date.now()}.wav`)
         writeFileSync(audioPath, speech.audio)
+        trace?.mark('synthesized', { seconds: Number(speech.seconds?.toFixed?.(2) ?? speech.seconds) })
         log.info?.('[dsh-voice] synthesized', { session: sessionId, seconds: speech.seconds })
       } catch (error) {
         // The device can still speak the text; a missing model must not silence the answer.
@@ -494,6 +520,8 @@ export function createVoiceLoop ({
       }
     }
     await say(node, text)
+    trace?.mark('spoken')
+    trace?.done('ok')
     if (audioPath) cleanup([audioPath])
     return { spoken: true }
   }

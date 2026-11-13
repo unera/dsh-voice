@@ -9,6 +9,28 @@ This package synthesizes nothing and sends nothing. A Host that wants audio
 installs a text-to-speech provider and a layer that reads `splitReply()`; this
 package only makes the turn *legible* as spoken.
 
+## Where the time goes
+
+Every exchange writes one line per stage it reached, milliseconds counted from the moment the
+event arrived, and exactly one closing line with the deltas:
+
+```
+[dsh-voice] exchange take-1 node=A059P stage=received ms=0
+[dsh-voice] exchange take-1 node=A059P stage=transcribed ms=312
+[dsh-voice] exchange take-1 node=A059P stage=delivered ms=340
+[dsh-voice] exchange take-1 node=A059P stage=turn-start ms=351 turn=7
+[dsh-voice] exchange take-1 node=A059P stage=turn-end ms=4120 reason=completed
+[dsh-voice] exchange take-1 node=A059P stage=split ms=4122 speakChars=68
+[dsh-voice] exchange take-1 node=A059P stage=synthesized ms=5030 seconds=6.8
+[dsh-voice] exchange take-1 node=A059P stage=spoken ms=5310
+[dsh-voice] exchange take-1 node=A059P done total=5310ms
+            segments={record: 4800, upload: 180, stt: 312, model: 3769, tts: 908, play: 280}
+```
+
+`record` and `upload` come from the device (`x-record-start/-stop`, `x-sent-at` against the
+server's `receivedAt`); a segment that never happened is absent from the line, not a zero. A
+failed exchange closes with `reason=empty`, `reason=no-session`, `reason=silent` and so on.
+
 ## Two ways a recording arrives
 
 | path | who starts it | what the loop calls |

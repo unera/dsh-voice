@@ -407,3 +407,111 @@ test('an empty transcript from an upload is answered out loud and closes the exc
   assert.match(said[0].data.text, /Не расслышал/)
   assert.equal(existsSync(take), false)
 })
+
+test('one exchange writes every stage it reached and exactly one closing line', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-trace-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const take = join(dir, 'take.wav')
+  writeFileSync(take, wavBytes())
+
+  const lines = []
+  const nodes = stubNodes({ 'voice.say': { status: 'ok' } })
+  const loop = createVoiceLoop({
+    nodes,
+    speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
+    textToSpeech: {
+      resolve: (request) => request,
+      synthesize: async () => ({ audio: wavBytes(), seconds: 1.5 }),
+    },
+    sessions: { flush: async () => {} },
+    sessionController: {
+      resolveAgent: async () => ({ agent: { followup: () => {} } }),
+      create: async () => ({ sessionId: 'session-trace' }),
+    },
+    cacheDir: join(dir, 'cache'),
+    log: { info: (line) => lines.push(line), warn: () => {}, debug: () => {} },
+  })
+
+  await loop.handleUpload({
+    node: 19,
+    nodeName: 'A059P',
+    id: 'trace-1',
+    path: take,
+    at: { recordStart: 1000, recordStop: 2200, sentAt: 2300, receivedAt: 2500 },
+  })
+  await loop.observeSessionEvent({ id: 'session-trace' }, { type: 'turn/start', data: { turn: 1 } })
+  await loop.observeSessionEvent({ id: 'session-trace' }, {
+    type: 'assistant/message',
+    data: { turn: 1, message: { content: [{ type: 'text', text: '--- # say\nготово' }] } },
+  })
+  await loop.observeSessionEvent({ id: 'session-trace' }, { type: 'turn/end', data: { turn: 1, reason: 'completed' } })
+
+  const stages = lines.filter((line) => line.includes('stage=')).map((line) => /stage=(\S+)/.exec(line)[1])
+  assert.deepEqual(stages, ['received', 'transcribed', 'delivered', 'turn-start', 'turn-end', 'split', 'synthesized', 'spoken'])
+  for (const line of lines.filter((item) => item.includes('stage='))) {
+    assert.match(line, /^\[dsh-voice] exchange trace-1 node=A059P stage=/)
+    assert.match(line, / ms=\d+/)
+  }
+
+  const doneLines = lines.filter((line) => line.includes(' done '))
+  assert.equal(doneLines.length, 1, 'exactly one closing line per exchange')
+  const done = doneLines[0]
+  assert.match(done, /^\[dsh-voice] exchange trace-1 node=A059P done total=\d+ms /)
+  for (const segment of ['record: 1200', 'upload: 200', 'stt:', 'model:', 'tts:', 'play:']) {
+    assert.ok(done.includes(segment), `done must carry ${segment}: ${done}`)
+  }
+})
+
+test('an exchange without client times has no record or upload segment', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-trace-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const take = join(dir, 'take.wav')
+  writeFileSync(take, wavBytes())
+
+  const lines = []
+  const loop = createVoiceLoop({
+    nodes: stubNodes({ 'voice.say': { status: 'ok' } }),
+    speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
+    sessions: { flush: async () => {} },
+    sessionController: {
+      resolveAgent: async () => ({ agent: { followup: () => {} } }),
+      create: async () => ({ sessionId: 'session-plain' }),
+    },
+    cacheDir: join(dir, 'cache'),
+    log: { info: (line) => lines.push(line), warn: () => {}, debug: () => {} },
+  })
+
+  await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'plain-1', path: take })
+  await loop.observeSessionEvent({ id: 'session-plain' }, { type: 'turn/start', data: { turn: 1 } })
+  await loop.observeSessionEvent({ id: 'session-plain' }, {
+    type: 'assistant/message',
+    data: { turn: 1, message: { content: [{ type: 'text', text: '--- # screen\nтолько текст' }] } },
+  })
+  await loop.observeSessionEvent({ id: 'session-plain' }, { type: 'turn/end', data: { turn: 1, reason: 'completed' } })
+  const done = lines.find((line) => line.includes(' done '))
+  assert.ok(done, 'a closing line is written even without client times')
+  assert.doesNotMatch(done, /record:/)
+  assert.doesNotMatch(done, /upload:/)
+})
+
+test('an empty transcript closes the exchange with reason=empty', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-trace-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const take = join(dir, 'take.wav')
+  writeFileSync(take, wavBytes())
+
+  const lines = []
+  const loop = createVoiceLoop({
+    nodes: stubNodes({ 'voice.say': { status: 'ok' } }),
+    speechToText: { resolve: (r) => r, transcribe: async () => ({ text: '' }) },
+    sessions: { flush: async () => {} },
+    sessionController: { resolveAgent: async () => ({ agent: { followup: () => {} } }) },
+    cacheDir: join(dir, 'cache'),
+    log: { info: (line) => lines.push(line), warn: () => {}, debug: () => {} },
+  })
+
+  await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'empty-1', path: take })
+  const done = lines.filter((line) => line.includes(' done '))
+  assert.equal(done.length, 1)
+  assert.match(done[0], /reason=empty/)
+})
