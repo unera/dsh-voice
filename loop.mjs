@@ -13,6 +13,7 @@ import { randomUUID } from 'node:crypto'
 
 import { splitReply } from './markup.mjs'
 import { createTrace } from './trace.mjs'
+import { toVoiceNote } from './audio.mjs'
 
 /**
  * How long the device may take to hand over a recording, in seconds.
@@ -131,6 +132,9 @@ export function createVoiceLoop ({
       } catch {}
     }
   }
+
+  /** Where a synthesized answer waits for the device to fetch it. */
+  const outputDir = join(cacheDir, 'out')
 
   /** Recording ids already handled: a retry must not become a second answer. */
   const seen = new Map()
@@ -333,7 +337,7 @@ export function createVoiceLoop ({
     // The wait is registered before the message is delivered: a turn that starts
     // and ends quickly otherwise finishes before anyone is awaiting it, and the
     // answer to the *previous* question is what gets spoken.
-    awaiting.set(sessionId, { node: nodeName, mode: want?.mode ?? 'ptt', turn: null, trace })
+    awaiting.set(sessionId, { node: nodeName, mode: want?.mode ?? 'ptt', turn: null, trace, synth: 'device' })
     try {
       await deliver({ sessionId, text, node: nodeName, mode: want?.mode ?? 'ptt' })
       trace.mark('delivered')
@@ -423,7 +427,7 @@ export function createVoiceLoop ({
     active.set(nodeName, { sessionId })
     // The wait is registered before the message is delivered: a turn that starts and ends
     // quickly would otherwise finish before anyone awaits it.
-    awaiting.set(sessionId, { node: nodeName, mode: event?.mode ?? 'upload', turn: null, trace })
+    awaiting.set(sessionId, { node: nodeName, mode: event?.mode ?? 'upload', turn: null, trace, synth: event?.synth ?? 'device' })
     try {
       await deliver({ sessionId, text, node: nodeName, mode: 'upload' })
       trace.mark('delivered')
@@ -485,11 +489,11 @@ export function createVoiceLoop ({
     const { speak } = splitReply(text)
     target.trace?.mark('split', { speakChars: speak.trim().length })
     if (!speak.trim()) {
-      target.trace?.done('silent')
+      target.trace?.done('silent', { synth: target.synth ?? 'device' })
       return
     }
     try {
-      await speakAnswer({ sessionId, text: speak, node: target.node, trace: target.trace })
+      await speakAnswer({ sessionId, text: speak, node: target.node, trace: target.trace, synth: target.synth })
     } catch (error) {
       log.warn?.('[dsh-voice] speech failed:', error?.message ?? error)
     }
@@ -502,28 +506,74 @@ export function createVoiceLoop ({
    * own engine: that keeps the synthesis path exercised, and the moment `voice.play` exists
    * the file is already there. Until then the text is what the phone actually plays.
    */
-  async function speakAnswer ({ sessionId, text, node, trace = null }) {
-    let audioPath = null
-    if (textToSpeech?.resolve && textToSpeech?.synthesize) {
+  async function speakAnswer ({ sessionId, text, node, trace = null, synth = 'device' }) {
+    const mode = synth === 'host' ? 'host' : 'device'
+    // `device`: the phone reads the text with its own engine and the host does no synthesis at
+    // all. It used to synthesize a file and delete it immediately — nine seconds of work per
+    // reply for a sound nobody heard.
+    if (mode === 'device') return await dispatch({ node, text, trace, synth: mode })
+    try {
+      const speech = await synthesize(text)
+      const wavPath = join(cacheDir, `say-${Date.now()}.wav`)
+      writeFileSync(wavPath, speech.audio)
+      trace?.mark('synthesized', { seconds: Number(speech.seconds?.toFixed?.(2) ?? speech.seconds) })
+      const ogg = join(outputDir, `${trace?.id ?? Date.now()}.ogg`)
+      mkdirSync(outputDir, { recursive: true })
       try {
-        // The provider speaks at its own rate: Silero refuses a tempo it cannot
-        // honour, and a tempo belongs to the playback step, not to synthesis.
-        const spec = textToSpeech.resolve({ text, speed: 1, format: 'wav' })
-        const speech = await textToSpeech.synthesize(spec, new AbortController().signal)
-        audioPath = join(cacheDir, `say-${Date.now()}.wav`)
-        writeFileSync(audioPath, speech.audio)
-        trace?.mark('synthesized', { seconds: Number(speech.seconds?.toFixed?.(2) ?? speech.seconds) })
-        log.info?.('[dsh-voice] synthesized', { session: sessionId, seconds: speech.seconds })
-      } catch (error) {
-        // The device can still speak the text; a missing model must not silence the answer.
-        log.warn?.('[dsh-voice] synthesis failed, speaking with the device engine:', error?.message ?? error)
+        await toVoiceNote(wavPath, ogg, tempo(), { signal: new AbortController().signal })
+      } finally {
+        cleanup([wavPath])
       }
+      return await dispatch({ node, path: ogg, seconds: speech.seconds, trace, synth: mode })
+    } catch (error) {
+      // A broken synthesizer must not leave the person without an answer: the device engine is
+      // always there, and the log says which path actually spoke.
+      log.warn?.('[dsh-voice] synthesis failed, falling back to the device engine:', error?.message ?? error)
+      trace?.mark('tts-failed', { error: error?.message?.slice(0, 80) ?? String(error) })
+      return await dispatch({ node, text, trace, synth: 'device', reason: 'tts-failed' })
     }
-    await say(node, text)
-    trace?.mark('spoken')
-    trace?.done('ok')
-    if (audioPath) cleanup([audioPath])
-    return { spoken: true }
+  }
+
+  /**
+   * Hand the answer to the device and return immediately.
+   *
+   * Speaking takes as long as the sentence does, and the node queue must not wait for it: the
+   * press that follows is a different exchange. `voice.stop` is what cuts a speech short.
+   *
+   * @param args - text (device engine) or path (host audio), the node, and the trace.
+   * @returns `{spoken}` without waiting for the device to finish talking.
+   */
+  async function dispatch ({ node, text = null, path = null, seconds = null, trace = null, synth, reason = null }) {
+    const method = path ? 'play' : 'say'
+    const data = path ? { path, ...seconds === null ? {} : { seconds } } : { text }
+    const pending = nodes.call(node, 'voice', method, data)
+    if (pending && typeof pending.catch === 'function') {
+      // The outcome is not awaited, but it is never swallowed silently either.
+      pending.catch((error) => log.warn?.('[dsh-voice] the device did not take the answer:', error?.message ?? error))
+    }
+    trace?.mark('spoken', path && Number.isFinite(Number(seconds)) ? { via: method, seconds } : { via: method })
+    if (path && pending && typeof pending.finally === 'function') {
+      // The device fetches the file by the command it is answering; only then is it litter.
+      pending.finally(() => cleanup([path])).catch(() => cleanup([path]))
+    } else if (path) {
+      setTimeout(() => cleanup([path]), 60_000).unref?.()
+    }
+    trace?.done(reason ?? 'ok', { synth })
+    return { spoken: true, method }
+  }
+
+  /** The configured playback tempo, applied to host audio only. */
+  function tempo () {
+    const configured = Number(textToSpeech?.snapshot?.().selection?.speed ?? 1)
+    return Number.isFinite(configured) && configured > 0 ? configured : 1
+  }
+
+  /** Ask the service for audio; a missing service is a failure, not a silence. */
+  async function synthesize (text) {
+    if (!textToSpeech?.resolve || !textToSpeech?.synthesize) throw new Error('text-to-speech is not installed')
+    // The provider speaks at its own rate: a tempo belongs to playback, not to synthesis.
+    const spec = textToSpeech.resolve({ text, speed: 1, format: 'wav' })
+    return await textToSpeech.synthesize(spec, new AbortController().signal)
   }
 
   if (typeof on === 'function') {

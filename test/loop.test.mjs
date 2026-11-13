@@ -437,6 +437,7 @@ test('one exchange writes every stage it reached and exactly one closing line', 
     nodeName: 'A059P',
     id: 'trace-1',
     path: take,
+    synth: 'host',
     at: { recordStart: 1000, recordStop: 2200, sentAt: 2300, receivedAt: 2500 },
   })
   await loop.observeSessionEvent({ id: 'session-trace' }, { type: 'turn/start', data: { turn: 1 } })
@@ -514,4 +515,137 @@ test('an empty transcript closes the exchange with reason=empty', async (t) => {
   const done = lines.filter((line) => line.includes(' done '))
   assert.equal(done.length, 1)
   assert.match(done[0], /reason=empty/)
+})
+
+/** Drive a full exchange by event: upload, a completed turn with one answer. */
+async function drive (loop, { id, dir, synth, answer = '--- # say\nготово' }) {
+  const take = join(dir, `${id}.wav`)
+  writeFileSync(take, wavBytes())
+  const outcome = await loop.handleUpload({ node: 19, nodeName: 'A059P', id, path: take, synth })
+  await loop.observeSessionEvent({ id: outcome.session }, { type: 'turn/start', data: { turn: 1 } })
+  await loop.observeSessionEvent({ id: outcome.session }, {
+    type: 'assistant/message',
+    data: { turn: 1, message: { content: [{ type: 'text', text: answer }] } },
+  })
+  await loop.observeSessionEvent({ id: outcome.session }, { type: 'turn/end', data: { turn: 1, reason: 'completed' } })
+  return outcome
+}
+
+function bareLoop ({ dir, synthService, nodes, lines = [] }) {
+  return createVoiceLoop({
+    nodes,
+    speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
+    textToSpeech: synthService,
+    sessions: { flush: async () => {} },
+    sessionController: {
+      resolveAgent: async () => ({ agent: { followup: () => {} } }),
+      create: async () => ({ sessionId: `session-${Math.random().toString(36).slice(2, 8)}` }),
+    },
+    cacheDir: join(dir, 'cache'),
+    log: { info: (line) => lines.push(line), warn: () => {}, debug: () => {} },
+  })
+}
+
+test('synth=device never touches the synthesizer', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-synth-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  let synthesized = 0
+  const nodes = stubNodes({ 'voice.say': { status: 'ok' } })
+  const loop = bareLoop({
+    dir,
+    nodes,
+    synthService: {
+      resolve: (r) => r,
+      synthesize: async () => { synthesized += 1; return { audio: wavBytes(), seconds: 1 } },
+    },
+  })
+
+  await drive(loop, { id: 'device-1', dir, synth: 'device' })
+  assert.equal(synthesized, 0, 'the device engine speaks, the host does not synthesize')
+  assert.deepEqual(nodes.calls.map((call) => call.method), ['say'])
+})
+
+test('synth=host synthesizes, converts and plays the file', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-synth-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  let synthesized = 0
+  const nodes = stubNodes({ 'voice.play': { status: 'ok' } })
+  const lines = []
+  const loop = bareLoop({
+    dir,
+    nodes,
+    lines,
+    synthService: {
+      resolve: (r) => r,
+      synthesize: async () => { synthesized += 1; return { audio: wavBytes(), seconds: 1.5 } },
+    },
+  })
+
+  await drive(loop, { id: 'host-1', dir, synth: 'host' })
+  assert.equal(synthesized, 1)
+  const play = nodes.calls.filter((call) => call.method === 'play')
+  assert.equal(play.length, 1)
+  assert.match(play[0].data.path, /\/cache\/out\/host-1\.ogg$/)
+  assert.equal(play[0].data.seconds, 1.5)
+  assert.equal(nodes.calls.filter((call) => call.method === 'say').length, 0)
+
+  const done = lines.find((line) => line.includes(' done '))
+  assert.match(done, /synth=host/)
+  assert.match(done, /tts:/)
+})
+
+test('a broken synthesizer falls back to the device engine with reason=tts-failed', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-synth-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodes = stubNodes({ 'voice.say': { status: 'ok' } })
+  const lines = []
+  const loop = bareLoop({
+    dir,
+    nodes,
+    lines,
+    synthService: {
+      resolve: (r) => r,
+      synthesize: async () => { throw new Error('silero is not ready') },
+    },
+  })
+
+  await drive(loop, { id: 'broken-1', dir, synth: 'host' })
+  assert.equal(nodes.calls.filter((call) => call.method).at(-1).method, 'say')
+  const done = lines.find((line) => line.includes(' done '))
+  assert.match(done, /reason=tts-failed/)
+  assert.doesNotMatch(done, /tts:/, 'no synthesis happened, so there is no tts segment')
+})
+
+test('speaking does not hold the next exchange', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-synth-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  let spokenResolve = null
+  const nodes = {
+    calls: [],
+    call (node, api, method, data) {
+      this.calls.push({ node, api, method, data })
+      // the device reports back only when the sentence is finished — which never happens here
+      if (method === 'say') return new Promise((resolve) => { spokenResolve = resolve })
+      return Promise.resolve({ status: 'ok' })
+    },
+  }
+  const loop = bareLoop({
+    dir,
+    nodes,
+    synthService: { resolve: (r) => r, synthesize: async () => ({ audio: wavBytes(), seconds: 1 }) },
+  })
+
+  const first = drive(loop, { id: 'slow-1', dir, synth: 'device' })
+  await first
+  // the first `say` is still pending; a second exchange must not queue behind it
+  const second = await loop.handleUpload({
+    node: 19,
+    nodeName: 'A059P',
+    id: 'fast-2',
+    path: (() => { const path = join(dir, 'fast.wav'); writeFileSync(path, wavBytes()); return path })(),
+    synth: 'device',
+  })
+  assert.equal(second.status, 'delivered')
+  assert.equal(nodes.calls.filter((call) => call.method === 'say').length, 1, 'the second answer is not sent while the first speaks')
+  spokenResolve?.({ status: 'ok' })
 })

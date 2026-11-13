@@ -9,6 +9,18 @@ This package synthesizes nothing and sends nothing. A Host that wants audio
 installs a text-to-speech provider and a layer that reads `splitReply()`; this
 package only makes the turn *legible* as spoken.
 
+## Who speaks
+
+`synth=device` (default) means the phone reads the text with its own engine — the host does no
+synthesis at all. `synth=host` means the answer must sound like our voice: the host synthesizes,
+converts the provider's WAV to OGG/Opus with the configured tempo, and hands the file to
+`voice.play`; the device fetches it by the command it answers, and the file is removed once it
+has.
+
+Neither call is awaited: speaking takes as long as the sentence, and the next press must not
+queue behind it. `voice.stop` is what cuts a speech short. When a host synthesis fails the loop
+falls back to the device engine and closes the line with `reason=tts-failed`.
+
 ## Where the time goes
 
 Every exchange writes one line per stage it reached, milliseconds counted from the moment the
