@@ -195,11 +195,45 @@ function cacheDirectory (config) {
 export function installLoop (ctx, config = {}) {
   if (typeof ctx?.on !== 'function') return undefined
   const log = config.logger ?? (typeof ctx.logger === 'function' ? ctx.logger('dsh-voice') : console)
-  const nodes = service(ctx, 'nodes')
-  if (!nodes?.call) {
-    log.warn?.('[dsh-voice] the nodes service is absent: the voice loop stays off')
+  // The nodes plugin may register its service after this one loads: cordis
+  // announces every registration on `internal/service`, so a missing service is
+  // a reason to wait, not to give up. Without this the loop stayed off on every
+  // boot where the profile order put voice before nodes.
+  // The loop needs three services, and any of them may register after this
+  // plugin: a missing one is a reason to wait, not to give up. Without this the
+  // loop stayed off on every boot whose profile order put voice before nodes.
+  const required = ['nodes', 'speechToText', 'textToSpeech']
+  const missing = () => required.filter((name) => {
+    const value = service(ctx, name)
+    return name === 'nodes' ? !value?.call : !value
+  })
+  const absent = missing()
+  if (absent.length > 0) {
+    log.info?.(`[dsh-voice] waiting for services: ${absent.join(', ')}`)
+    let disposeWait = null
+    disposeWait = ctx.on('internal/service', () => {
+      if (missing().length > 0) return
+      try {
+        disposeWait?.()
+      } catch {}
+      startLoop(ctx, { ...config, logger: log })
+    }, { global: true })
     return undefined
   }
+  return startLoop(ctx, { ...config, logger: log, nodes: service(ctx, 'nodes') })
+}
+
+/**
+ * Build and wire the loop once its services are known to exist.
+ *
+ * @param ctx - owning Host context.
+ * @param config - `cacheDir`, `logger`, and the resolved `nodes` service.
+ * @returns the loop, or undefined when the host cannot listen to nodes.
+ */
+function startLoop (ctx, config) {
+  const log = config.logger
+  const nodes = config.nodes ?? service(ctx, 'nodes')
+  if (!nodes?.call) return undefined
   let createUserMessage = null
   const loop = createVoiceLoop({
     nodes,
