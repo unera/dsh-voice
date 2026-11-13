@@ -14,6 +14,7 @@
     "markup.mjs",
     "loop.mjs",
     "trace.mjs",
+    "audio.mjs",
     "README.md",
     "LICENSE",
     "cordis.patch.yml",
