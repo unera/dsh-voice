@@ -1,0 +1,49 @@
+{
+  "name": "@dr-co/dsh-voice",
+  "version": "0.1.0",
+  "description": "Voice markup for DeepSeek Harness: an input marker lifted at agent/pre-step, and the reply contract for spoken answers.",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./markup": "./markup.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.mjs",
+    "markup.mjs",
+    "README.md",
+    "LICENSE",
+    "cordis.patch.yml"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/unera/dsh-voice.git"
+  },
+  "homepage": "https://github.com/unera/dsh-voice#readme",
+  "bugs": {
+    "url": "https://github.com/unera/dsh-voice/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "voice",
+    "speech",
+    "plugin"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

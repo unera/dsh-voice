@@ -1,0 +1,9 @@
+# Bundle layer for @dr-co/dsh-voice.
+#
+# One row: the plugin that lifts the input voice marker at `agent/pre-step` and
+# registers the reply contract in the system prompt. It synthesizes nothing and
+# sends nothing — a Host that wants a spoken answer installs a text-to-speech
+# provider and the layer that reads `splitReply`.
+- insert:
+    - id: dsh-voice
+      name: '@dr-co/dsh-voice'
