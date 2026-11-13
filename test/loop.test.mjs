@@ -249,3 +249,67 @@ test('nothing is left on disk after an exchange', async () => {
     rmSync(work, { recursive: true, force: true })
   }
 })
+
+test('a second take from the same node reuses the session it already has', async (t) => {
+  const created = []
+  const { loop, dir } = makeLoop({
+    nodes: stubNodes({
+      'voice.record': () => ({ status: 'ok', payload: { path: '/dev/x.wav' } }),
+      'files.copyFromDevice': ({ data }) => {
+        writeFileSync(data.hostPath, wavBytes())
+        return { status: 'ok' }
+      },
+      'voice.say': { status: 'ok' },
+    }),
+    speechToText: { resolve: ({ audio }) => ({ audio }), transcribe: async () => 'привет' },
+    sessionController: {
+      resolveAgent: async () => ({ agent: { followup: () => {} } }),
+      create: async () => {
+        const id = `session-${created.length + 1}`
+        created.push(id)
+        return { sessionId: id }
+      },
+    },
+  })
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+
+  await loop.handle({ node: 'phone', nodeName: 'phone', mode: 'ptt' })
+  await loop.handle({ node: 'phone', nodeName: 'phone', mode: 'ptt' })
+
+  assert.deepEqual(created, ['session-1'], 'a session is created once, not per take')
+})
+
+test('an answer to the previous question is not spoken for a new take', async (t) => {
+  const spoken = []
+  const { loop, dir } = makeLoop({
+    nodes: stubNodes({
+      'voice.record': () => ({ status: 'ok', payload: { path: '/dev/y.wav' } }),
+      'files.copyFromDevice': ({ data }) => {
+        writeFileSync(data.hostPath, wavBytes())
+        return { status: 'ok' }
+      },
+      'voice.say': ({ data }) => {
+        spoken.push(data.text)
+        return { status: 'ok' }
+      },
+    }),
+    speechToText: { resolve: ({ audio }) => ({ audio }), transcribe: async () => 'вопрос' },
+  })
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+
+  await loop.handle({ node: 'phone', nodeName: 'phone', mode: 'ptt' })
+
+  // The previous turn, still finishing, must be ignored.
+  await loop.observeSessionEvent({ id: 'session-new' }, { type: 'turn/end', data: { turn: 7, reason: 'completed' } })
+  assert.deepEqual(spoken, [])
+
+  // The awaited turn is the first one that opens after delivery.
+  await loop.observeSessionEvent({ id: 'session-new' }, { type: 'turn/start', data: { turn: 8 } })
+  await loop.observeSessionEvent({ id: 'session-new' }, {
+    type: 'assistant/message',
+    data: { message: { content: [{ type: 'text', text: '--- # say\nответ' }] } },
+  })
+  await loop.observeSessionEvent({ id: 'session-new' }, { type: 'turn/end', data: { turn: 8, reason: 'completed' } })
+
+  assert.deepEqual(spoken, ['ответ'])
+})

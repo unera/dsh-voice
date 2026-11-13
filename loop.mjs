@@ -292,7 +292,10 @@ export function createVoiceLoop ({
     if (reason !== 'completed') return
     const waiting = awaiting.get(sessionId)
     if (!waiting) return
-    if (waiting.turn !== null && event.data?.turn !== waiting.turn) return
+    // Before the awaited turn opens, any end belongs to work that started
+    // earlier — the previous question — and must not consume this wait.
+    if (waiting.turn === null) return
+    if (event.data?.turn !== waiting.turn) return
     const text = drafts.get(sessionId) ?? ''
     const target = awaiting.get(sessionId)
     awaiting.delete(sessionId)
