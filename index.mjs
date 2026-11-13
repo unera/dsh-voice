@@ -235,6 +235,14 @@ function startLoop (ctx, config) {
   const log = config.logger
   const nodes = config.nodes ?? service(ctx, 'nodes')
   if (!nodes?.call) return undefined
+  // One line so a boot can be read afterwards: without it "no log" meant both
+  // "the loop is up" and "the loop never started", and telling them apart cost
+  // a restart each time.
+  log.info?.('[dsh-voice] the voice loop is up', {
+    speechToText: Boolean(service(ctx, 'speechToText')),
+    textToSpeech: Boolean(service(ctx, 'textToSpeech')),
+    sessions: Boolean(service(ctx, 'sessions')),
+  })
   let createUserMessage = null
   const loop = createVoiceLoop({
     nodes,
