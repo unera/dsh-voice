@@ -13,6 +13,7 @@
     "index.mjs",
     "markup.mjs",
     "loop.mjs",
+    "trace.mjs",
     "README.md",
     "LICENSE",
     "cordis.patch.yml",
