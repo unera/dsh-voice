@@ -1,6 +1,6 @@
 {
   "name": "@dr-co/dsh-voice",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Voice markup for DeepSeek Harness: an input marker lifted at agent/pre-step, and the reply contract for spoken answers.",
   "type": "module",
   "main": "./index.mjs",

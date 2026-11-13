@@ -9,6 +9,27 @@ This package synthesizes nothing and sends nothing. A Host that wants audio
 installs a text-to-speech provider and a layer that reads `splitReply()`; this
 package only makes the turn *legible* as spoken.
 
+## The voice loop
+
+A device cannot push a recording: the transfer endpoint accepts only an answer to a
+`copyFromDevice` command. So the phone says *"I want to talk"* (`POST /v1/events` with
+`{"voice":{"want":"record"}}`, no text, no session), and the host does the asking.
+
+For one exchange the loop:
+
+1. `nodes.call(node, 'voice', 'record', {mode, maxSeconds: 30, timeout: 45})` — wait for the take;
+2. `nodes.call(node, 'files', 'copyFromDevice', {path, hostPath})` — pull it into `<DSH_HOME>/cache/voice`;
+3. `nodes.call(node, 'shell', 'exec', {command: 'rm -f <device path>'})` — the device copy is litter once it is here;
+4. `speechToText.resolve(...)` + `transcribe(...)` — the WAV is already the canonical 16 kHz mono PCM16;
+5. an empty transcript is answered out loud (`voice.say`) and never reaches a session;
+6. otherwise the text goes into the session as a user message with `source: {kind: 'dsh-nodes', voice: true}`;
+7. the turn is watched: on a completed turn the last assistant text is cut with `splitReply`,
+   only the `# say` part is spoken, and the phone says it through `voice.say`.
+
+The audio is synthesized on the host as well — the file is produced and dropped, so the
+moment `voice.play` exists nothing on this side has to change. Recordings and rendered
+speech are removed after each exchange.
+
 ## The format
 
 A channel that received speech writes its transcript as a service block, because

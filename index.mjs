@@ -16,7 +16,10 @@
 // to the layer above, which reads the same markup through `splitReply`.
 import { randomUUID } from 'node:crypto'
 
+import { join } from 'node:path'
+
 import { readVoiceMarkup } from './markup.mjs'
+import { createVoiceLoop } from './loop.mjs'
 
 export const name = 'dsh-voice'
 
@@ -157,12 +160,93 @@ export function install (ctx, { logger } = {}) {
 }
 
 /**
+ * Read one service without declaring it in `inject`.
+ *
+ * `inject` is a hard promise: a plugin that names a service it cannot have does not load at
+ * all. The voice loop needs four of them, and a Host may legitimately have none (no nodes,
+ * no recognizer) — so they are read defensively and the loop degrades instead of refusing.
+ */
+function service (ctx, name) {
+  try {
+    const viaGet = typeof ctx.get === 'function' ? ctx.get(name) : undefined
+    if (viaGet) return viaGet
+  } catch {}
+  try {
+    return ctx[name] ?? null
+  } catch {
+    return null
+  }
+}
+
+/** Where recordings and rendered speech live on the host. */
+function cacheDirectory (config) {
+  if (typeof config?.cacheDir === 'string' && config.cacheDir.trim()) return config.cacheDir.trim()
+  const home = process.env.DSH_HOME ?? '.dsh'
+  return join(home, 'cache', 'voice')
+}
+
+/**
+ * Start the loop and wire it to the events the node plugin emits.
+ *
+ * @param ctx - owning Host context.
+ * @param config - `cacheDir`, `logger`.
+ * @returns a disposer.
+ */
+export function installLoop (ctx, config = {}) {
+  if (typeof ctx?.on !== 'function') return undefined
+  const log = config.logger ?? (typeof ctx.logger === 'function' ? ctx.logger('dsh-voice') : console)
+  const nodes = service(ctx, 'nodes')
+  if (!nodes?.call) {
+    log.warn?.('[dsh-voice] the nodes service is absent: the voice loop stays off')
+    return undefined
+  }
+  let createUserMessage = null
+  const loop = createVoiceLoop({
+    nodes,
+    speechToText: service(ctx, 'speechToText'),
+    textToSpeech: service(ctx, 'textToSpeech'),
+    sessions: service(ctx, 'sessions'),
+    sessionController: service(ctx, 'sessionController'),
+    cacheDir: cacheDirectory(config),
+    log,
+    on: (name, handler) => ctx.on(name, handler, { global: true }),
+    // The message constructor lives in the LLM package, which a plugin may import lazily:
+    // without it the loop still builds a correct message by hand.
+    createUserMessage: (input) => {
+      if (!createUserMessage) return null
+      return createUserMessage(input)
+    },
+  })
+  void (async () => {
+    try {
+      const mod = await import('@deepseek-ai/dsh-llm')
+      if (typeof mod?.createUserMessage === 'function') createUserMessage = mod.createUserMessage
+    } catch {}
+  })()
+
+  const disposeWant = ctx.on('dsh-nodes/voice-want', (want) => {
+    void loop.handle(want).catch((error) => {
+      log.warn?.('[dsh-voice] voice exchange failed:', error?.message ?? error)
+    })
+  }, { global: true })
+
+  ctx.effect(() => () => {
+    try {
+      disposeWant?.()
+    } catch {}
+    loop.dispose()
+  })
+  return loop
+}
+
+/**
  * Plugin entry point.
  * @param ctx - owning Host context.
- * @param config - no options yet; the row exists so a profile can name it.
+ * @param config - `cacheDir` for recordings, `logger`.
  */
 export function apply (ctx, config = {}) {
-  return install(ctx, config)
+  install(ctx, config)
+  installLoop(ctx, config)
 }
 
 export default Object.freeze({ name, apply, install })
