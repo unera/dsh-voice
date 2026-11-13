@@ -155,12 +155,14 @@ test('a recording that times out says so instead of waiting forever', async () =
   assert.equal(nodes.calls.filter((call) => call.method === 'say').length, 1)
 })
 
-test('a second press while one exchange runs is refused, not queued twice', async () => {
+test('a second press while one exchange runs is queued, never dropped', async () => {
   let release
   const gate = new Promise((resolve) => { release = resolve })
+  let calls = 0
   const nodes = stubNodes({
     'voice.record': async () => {
-      await gate
+      calls += 1
+      if (calls === 1) await gate
       return { status: 'timeout', code: 'voice_timeout' }
     },
     'voice.say': { status: 'ok' },
@@ -168,10 +170,14 @@ test('a second press while one exchange runs is refused, not queued twice', asyn
   const { loop } = makeLoop({ nodes })
 
   const first = loop.handle({ node: 19, nodeName: 'A059P', mode: 'ptt' })
-  const second = await loop.handle({ node: 19, nodeName: 'A059P', mode: 'ptt' })
-  assert.equal(second.status, 'busy')
+  const second = loop.handle({ node: 19, nodeName: 'A059P', mode: 'ptt' })
+  // The second press must not be refused: a dropped press is a lost take, and the
+  // person then hears the previous answer only after speaking again.
   release()
-  await first
+  const [one, two] = await Promise.all([first, second])
+  assert.equal(calls, 2, 'both presses reached the device')
+  assert.notEqual(one.status, 'queued')
+  assert.notEqual(two.status, 'queued')
 })
 
 test('a turn without a spoken part stays silent', async () => {

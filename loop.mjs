@@ -114,6 +114,8 @@ export function createVoiceLoop ({
   const bindings = loadBindings(cacheDir, log)
   /** Serialise binding writes: two exchanges may finish at once. */
   let saving = Promise.resolve()
+  /** node → tail of its exchange queue: one press, one answer, in order. */
+  const queues = new Map()
   /** session id → { node, mode } for the turns whose answer must be spoken. */
   const awaiting = new Map()
   /** assistant text collected for the turn being awaited, keyed by session id. */
@@ -255,7 +257,28 @@ export function createVoiceLoop ({
    */
   async function handle (want) {
     const nodeName = want?.nodeName ?? String(want?.node ?? '')
-    if (active.has(nodeName)) return { status: 'busy' }
+    // A press is a promise: it must end in an answer, even while the previous
+    // exchange is still waiting for the model. Refusing it as "busy" used to drop
+    // the press, park its take, and then answer the previous question only when
+    // the *next* press asked for a recording — the words arrived one message late
+    // and the delay grew with every press.
+    const chain = queues.get(nodeName) ?? Promise.resolve()
+    const mine = chain.then(async () => await exchange(want, nodeName)).catch((error) => {
+      log.warn?.('[dsh-voice] voice exchange failed:', error?.message ?? error)
+      return { status: 'failed' }
+    })
+    queues.set(nodeName, mine.then(() => {}).catch(() => {}))
+    return await mine
+  }
+
+  /**
+   * Run one exchange, now that the queue reached it.
+   *
+   * @param want - the device event that asked for it.
+   * @param nodeName - the node to talk to.
+   * @returns a short outcome for the log.
+   */
+  async function exchange (want, nodeName) {
     active.set(nodeName, { sessionId: want?.sessionId ?? bindings.get(nodeName) ?? null })
     mkdirSync(cacheDir, { recursive: true })
     const record = await nodes.call(nodeName, 'voice', 'record', {
