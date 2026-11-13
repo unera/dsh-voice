@@ -9,6 +9,7 @@
 // no device, no model, no speech service.
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
+import { randomUUID } from 'node:crypto'
 
 import { splitReply } from './markup.mjs'
 
@@ -105,6 +106,7 @@ export function createVoiceLoop ({
   log = console,
   createUserMessage = null,
   on = null,
+  emit = null,
 }) {
   /** One entry per node that is currently being talked to. */
   const active = new Map()
@@ -181,8 +183,43 @@ export function createVoiceLoop ({
     return resolved.agent
   }
 
+  /**
+   * Tell the Host who is talking and through what, before the Session exists.
+   *
+   * `dsh-assistants` keeps the pairing of a session with its transport, bot and
+   * chat from this very event: without it a voice session is `unknown`, so rules
+   * like "transport=telegram -> user UNera" never match it and only the defaults
+   * apply — the assistant was attached, the person was not.
+   *
+   * The device id goes into `botId` on purpose: rules can then name one phone and
+   * leave the others alone.
+   *
+   * @param sessionId - the id the session is about to be created with.
+   * @param node - the node id, the same number the admin calls a device.
+   * @param nodeName - the human name of that device.
+   */
+  function announceBinding (sessionId, node, nodeName) {
+    if (typeof emit !== 'function') return
+    try {
+      emit('dsh-im/session-pre-bind', Object.freeze({
+        sessionId,
+        transport: 'nodes',
+        channel: 'nodes',
+        botId: `nodes_${node}`,
+        conversationKey: `nodes:${node}`,
+        chatType: 'direct',
+        chatId: String(node),
+        threadId: null,
+        senderId: null,
+        senderName: nodeName ?? null,
+      }))
+    } catch (error) {
+      log.warn?.('[dsh-voice] could not announce the binding:', error?.message ?? error)
+    }
+  }
+
   /** Which session this node talks to: the one it was told, the bound one, or a new one. */
-  async function sessionFor (nodeName, requested) {
+  async function sessionFor (nodeName, requested, nodeId = null) {
     if (requested) {
       bind(nodeName, requested)
       return requested
@@ -190,7 +227,12 @@ export function createVoiceLoop ({
     const bound = bindings.get(nodeName)
     if (bound) return bound
     if (!sessionController?.create) throw new Error('нет сессии для голоса и нечем создать новую')
-    const created = await sessionController.create({})
+    const sessionId = `session-${randomUUID()}`
+    // The announcement comes first and names the id the session will have: the
+    // Host resolves identity synchronously while the prompt is assembled, so a
+    // binding written afterwards would be too late for the first turn.
+    announceBinding(sessionId, nodeId, nodeName)
+    const created = await sessionController.create({ sessionId })
     if (!created?.sessionId) throw new Error('не удалось создать сессию под голос')
     log.info?.('[dsh-voice] created a session for voice', { session: created.sessionId, node: nodeName })
     bind(nodeName, created.sessionId)
@@ -252,7 +294,7 @@ export function createVoiceLoop ({
       await say(nodeName, NOT_HEARD)
       return { status: 'empty' }
     }
-    const sessionId = await sessionFor(nodeName, want?.sessionId ?? null)
+    const sessionId = await sessionFor(nodeName, want?.sessionId ?? null, want?.node ?? null)
     active.set(nodeName, { sessionId })
     // The wait is registered before the message is delivered: a turn that starts
     // and ends quickly otherwise finishes before anyone is awaiting it, and the

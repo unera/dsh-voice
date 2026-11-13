@@ -253,6 +253,9 @@ function startLoop (ctx, config) {
     cacheDir: cacheDirectory(config),
     log,
     on: (name, handler) => ctx.on(name, handler, { global: true }),
+    // The loop announces the binding of a fresh session before creating it, the
+    // way a messenger does, so dsh-assistants knows the transport and the device.
+    emit: (name, payload) => ctx.emit(name, payload),
     // The message constructor lives in the LLM package, which a plugin may import lazily:
     // without it the loop still builds a correct message by hand.
     createUserMessage: (input) => {
