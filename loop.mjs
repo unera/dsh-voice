@@ -12,8 +12,15 @@ import { basename, join } from 'node:path'
 
 import { splitReply } from './markup.mjs'
 
-/** How long the device may take to hand over a recording, in seconds. */
-const RECORD_TIMEOUT_SECONDS = 45
+/**
+ * How long the device may take to hand over a recording, in seconds.
+ *
+ * A press means "I am talking now", so the take arrives within seconds. The
+ * previous 45s was the whole command timeout: every exchange whose take had
+ * already been consumed waited it out, and the phone's command queue piled up
+ * behind it, so answers arrived three or four questions late.
+ */
+const RECORD_TIMEOUT_SECONDS = 12
 /** What we say when the recording produced no words. */
 const NOT_HEARD = 'Не расслышал, повтори пожалуйста.'
 
@@ -217,7 +224,7 @@ export function createVoiceLoop ({
     if (record?.status !== 'ok' || !record?.payload?.path) {
       active.delete(nodeName)
       log.info?.('[dsh-voice] no recording', { node: nodeName, code: record?.code ?? record?.status })
-      if (record?.code === 'voice_timeout') await say(nodeName, 'Не услышал, попробуй ещё раз.')
+      if (record?.code === 'voice_timeout') await say(nodeName, 'Не услышал попробуй ещё раз.')
       return { status: 'no-recording', code: record?.code ?? null }
     }
     const devicePath = record.payload.path
@@ -322,7 +329,9 @@ export function createVoiceLoop ({
     let audioPath = null
     if (textToSpeech?.resolve && textToSpeech?.synthesize) {
       try {
-        const spec = textToSpeech.resolve({ text, format: 'wav' })
+        // The provider speaks at its own rate: Silero refuses a tempo it cannot
+        // honour, and a tempo belongs to the playback step, not to synthesis.
+        const spec = textToSpeech.resolve({ text, speed: 1, format: 'wav' })
         const speech = await textToSpeech.synthesize(spec, new AbortController().signal)
         audioPath = join(cacheDir, `say-${Date.now()}.wav`)
         writeFileSync(audioPath, speech.audio)
