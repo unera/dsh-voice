@@ -241,7 +241,10 @@ test('nothing is left on disk after an exchange', async () => {
         nodes,
         speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'раз' }) },
         sessions: { flush: async () => {} },
-        sessionController: { resolveAgent: async () => ({ agent: { followup: () => {} } }) },
+        sessionController: {
+      resolveAgent: async () => ({ agent: { followup: () => {} } }),
+      create: async () => ({ sessionId: 'session-upload' }),
+    },
         cacheDir: dir,
         log: { info: () => {}, warn: () => {}, debug: () => {} },
       })
@@ -318,4 +321,89 @@ test('an answer to the previous question is not spoken for a new take', async (t
   await loop.observeSessionEvent({ id: 'session-new' }, { type: 'turn/end', data: { turn: 8, reason: 'completed' } })
 
   assert.deepEqual(spoken, ['ответ'])
+})
+
+test('an uploaded recording is answered without asking the device for anything', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-upload-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const take = join(dir, 'incoming-id1.wav')
+  writeFileSync(take, wavBytes())
+
+  const nodes = stubNodes({ 'voice.say': { status: 'ok' } })
+  const loop = createVoiceLoop({
+    nodes,
+    speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'какая сегодня погода' }) },
+    sessions: { flush: async () => {} },
+    sessionController: {
+      resolveAgent: async () => ({ agent: { followup: () => {} } }),
+      create: async () => ({ sessionId: 'session-upload' }),
+    },
+    cacheDir: join(dir, 'cache'),
+    log: { info: () => {}, warn: () => {}, debug: () => {} },
+  })
+
+  const outcome = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'id-1', path: take, bytes: 44, seconds: 1.2 })
+  assert.equal(outcome.status, 'delivered')
+  assert.equal(outcome.text, 'какая сегодня погода')
+  // the whole point of the new protocol: no record, no copy — the file was already here
+  const methods = nodes.calls.map((call) => `${call.api}.${call.method}`)
+  assert.deepEqual(methods, [], 'nothing may be asked of the device before the answer')
+  assert.equal(existsSync(take), false, 'the recording is removed once it is used')
+})
+
+test('a repeated recording id does not become a second turn', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-upload-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodes = stubNodes({ 'voice.say': { status: 'ok' } })
+  const delivered = []
+  const loop = createVoiceLoop({
+    nodes,
+    speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'раз' }) },
+    sessions: { flush: async () => {} },
+    sessionController: {
+      resolveAgent: async () => ({ agent: { followup: (message) => delivered.push(message) } }),
+      create: async () => ({ sessionId: 'session-upload' }),
+    },
+    cacheDir: join(dir, 'cache'),
+    log: { info: () => {}, warn: () => {}, debug: () => {} },
+  })
+
+  const makeTake = (name) => {
+    const path = join(dir, name)
+    writeFileSync(path, wavBytes())
+    return path
+  }
+
+  const first = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'same', path: makeTake('a.wav') })
+  const second = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'same', path: makeTake('b.wav') })
+
+  assert.equal(first.status, 'delivered')
+  assert.equal(second.status, 'already')
+  assert.equal(delivered.length, 1, 'one id means one turn')
+})
+
+test('an empty transcript from an upload is answered out loud and closes the exchange', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-upload-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const take = join(dir, 'silence.wav')
+  writeFileSync(take, wavBytes())
+
+  const nodes = stubNodes({ 'voice.say': { status: 'ok' } })
+  const delivered = []
+  const loop = createVoiceLoop({
+    nodes,
+    speechToText: { resolve: (r) => r, transcribe: async () => ({ text: '' }) },
+    sessions: { flush: async () => {} },
+    sessionController: { resolveAgent: async () => ({ agent: { followup: (m) => delivered.push(m) } }) },
+    cacheDir: join(dir, 'cache'),
+    log: { info: () => {}, warn: () => {}, debug: () => {} },
+  })
+
+  const outcome = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'silent', path: take })
+  assert.equal(outcome.status, 'empty')
+  assert.equal(delivered.length, 0)
+  const said = nodes.calls.filter((call) => call.method === 'say')
+  assert.equal(said.length, 1)
+  assert.match(said[0].data.text, /Не расслышал/)
+  assert.equal(existsSync(take), false)
 })

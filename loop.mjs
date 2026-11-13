@@ -131,6 +131,10 @@ export function createVoiceLoop ({
     }
   }
 
+  /** Recording ids already handled: a retry must not become a second answer. */
+  const seen = new Map()
+  const SEEN_LIMIT = 200
+
   /** Everything that has to disappear after one exchange. */
   function cleanup (paths) {
     for (const path of paths) {
@@ -338,6 +342,89 @@ export function createVoiceLoop ({
   }
 
   /**
+   * Remember one recording id, and say whether it is new.
+   *
+   * A device that retries must not be answered twice: the id is the identity of one
+   * exchange, not of one request. Old ids are dropped in insertion order, so the map cannot
+   * grow for the lifetime of the host.
+   *
+   * @param id - the recording id from the device.
+   * @returns true the first time this id is seen.
+   */
+  function rememberId (id) {
+    if (seen.has(id)) return false
+    seen.set(id, Date.now())
+    while (seen.size > SEEN_LIMIT) seen.delete(seen.keys().next().value)
+    return true
+  }
+
+  /**
+   * Handle a recording the device pushed itself: no command, the file is already here.
+   *
+   * @param event - `{node, nodeName, id, path, bytes, seconds}` from `dsh-nodes/voice`.
+   * @returns a short outcome: `delivered`, `already`, `empty`, `no-file`.
+   */
+  async function handleUpload (event) {
+    const id = String(event?.id ?? '')
+    const path = typeof event?.path === 'string' ? event.path : ''
+    if (!path) return { status: 'no-file' }
+    if (id && !rememberId(id)) {
+      log.info?.('[dsh-voice] the same recording arrived again, ignoring', { id })
+      return { status: 'already', id }
+    }
+    const nodeName = event?.nodeName ?? String(event?.node ?? '')
+    // The same per-node order as a press: two takes cannot overtake each other, and the
+    // second waits instead of being dropped.
+    const chain = queues.get(nodeName) ?? Promise.resolve()
+    const mine = chain
+      .then(async () => await exchangeFromFile(event, nodeName))
+      .catch((error) => {
+        log.warn?.('[dsh-voice] uploaded exchange failed:', error?.message ?? error)
+        return { status: 'failed' }
+      })
+    queues.set(nodeName, mine.then(() => {}).catch(() => {}))
+    return await mine
+  }
+
+  /**
+   * Transcribe a file that is already on disk and answer it.
+   *
+   * @param event - the upload event.
+   * @param nodeName - the node to speak to.
+   * @returns a short outcome for the log.
+   */
+  async function exchangeFromFile (event, nodeName) {
+    let text = ''
+    try {
+      const transcript = await transcribe(event.path)
+      text = String(typeof transcript === 'string' ? transcript : transcript?.text ?? '').trim()
+    } catch (error) {
+      log.warn?.('[dsh-voice] transcription failed:', error?.message ?? error)
+    }
+    if (!text) {
+      cleanup([event.path])
+      await say(nodeName, NOT_HEARD)
+      return { status: 'empty', id: event?.id ?? null }
+    }
+    const sessionId = await sessionFor(nodeName, event?.sessionId ?? null, event?.node ?? null)
+    active.set(nodeName, { sessionId })
+    awaiting.set(sessionId, { node: nodeName, mode: event?.mode ?? 'upload', turn: null })
+    try {
+      await deliver({ sessionId, text, node: nodeName, mode: 'upload' })
+    } catch (error) {
+      awaiting.delete(sessionId)
+      active.delete(nodeName)
+      cleanup([event.path])
+      log.warn?.('[dsh-voice] delivery failed:', error?.message ?? error)
+      await say(nodeName, 'Не смог передать запрос.')
+      return { status: 'no-session' }
+    }
+    // The recording has done its job: keeping it would only grow the cache.
+    cleanup([event.path])
+    return { status: 'delivered', session: sessionId, text, id: event?.id ?? null }
+  }
+
+  /**
    * Feed every session event here; the answer is spoken when its turn completes.
    *
    * @param session - the session the event belongs to (`session.id`).
@@ -420,6 +507,7 @@ export function createVoiceLoop ({
 
   return {
     handle,
+    handleUpload,
     observeSessionEvent,
     awaiting,
     dispose () {

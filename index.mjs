@@ -270,15 +270,27 @@ function startLoop (ctx, config) {
     } catch {}
   })()
 
+  // The old path: the device asks the host to record for it. Kept while the clients
+  // migrate — the phone cannot be updated in the same minute as the server.
   const disposeWant = ctx.on('dsh-nodes/voice-want', (want) => {
     void loop.handle(want).catch((error) => {
       log.warn?.('[dsh-voice] voice exchange failed:', error?.message ?? error)
     })
   }, { global: true })
 
+  // The new path: the device pushed the recording itself, so the file is already on disk.
+  const disposeVoice = ctx.on('dsh-nodes/voice', (event) => {
+    void loop.handleUpload(event).catch((error) => {
+      log.warn?.('[dsh-voice] uploaded recording failed:', error?.message ?? error)
+    })
+  }, { global: true })
+
   ctx.effect(() => () => {
     try {
       disposeWant?.()
+    } catch {}
+    try {
+      disposeVoice?.()
     } catch {}
     loop.dispose()
   })

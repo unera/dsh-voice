@@ -9,6 +9,17 @@ This package synthesizes nothing and sends nothing. A Host that wants audio
 installs a text-to-speech provider and a layer that reads `splitReply()`; this
 package only makes the turn *legible* as spoken.
 
+## Two ways a recording arrives
+
+| path | who starts it | what the loop calls |
+|---|---|---|
+| push (new) | the device records and uploads | nothing — the file is already at `event.path` |
+| pull (old, still supported) | the host asks after `voice.want` | `voice.record` → `files.copyFromDevice` |
+
+`dsh-nodes/voice` carries `{node, nodeName, id, path, bytes, seconds}`. The `id` is the
+identity of one exchange: a retry with the same id is answered `already` and produces no
+second turn. The recording is deleted once it is used, whether it produced words or not.
+
 ## The voice loop
 
 A device cannot push a recording: the transfer endpoint accepts only an answer to a
