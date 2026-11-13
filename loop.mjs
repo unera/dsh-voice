@@ -17,6 +17,48 @@ const RECORD_TIMEOUT_SECONDS = 45
 /** What we say when the recording produced no words. */
 const NOT_HEARD = 'Не расслышал, повтори пожалуйста.'
 
+/** File that remembers which session a node talks to, next to the recordings. */
+const BINDINGS_FILE = 'sessions.json'
+
+/**
+ * Read the node → session bindings.
+ *
+ * A missing or broken file is not an error: the loop then creates a session on
+ * the next take, which is exactly what a fresh install does anyway.
+ *
+ * @param cacheDir - directory shared with the recordings.
+ * @param log - logger for a file that could not be parsed.
+ * @returns a map of node name to session id.
+ */
+export function loadBindings (cacheDir, log = console) {
+  const file = join(cacheDir, BINDINGS_FILE)
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8'))
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return new Map(Object.entries(parsed).filter(([, value]) => typeof value === 'string' && value))
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') log.warn?.('[dsh-voice] bindings file is unusable, starting empty:', error?.message ?? error)
+  }
+  return new Map()
+}
+
+/**
+ * Write the bindings back; the directory is created when it is missing.
+ *
+ * @param cacheDir - directory shared with the recordings.
+ * @param bindings - the map to persist.
+ * @param log - logger for a write that failed.
+ */
+export function saveBindings (cacheDir, bindings, log = console) {
+  try {
+    mkdirSync(cacheDir, { recursive: true })
+    writeFileSync(join(cacheDir, BINDINGS_FILE), JSON.stringify(Object.fromEntries(bindings), null, 2))
+  } catch (error) {
+    log.warn?.('[dsh-voice] could not save bindings:', error?.message ?? error)
+  }
+}
+
 /** Read the text out of one assistant message event, or null when it carries none. */
 export function assistantTextOf (event) {
   if (event?.type !== 'assistant/message') return null
@@ -59,6 +101,10 @@ export function createVoiceLoop ({
 }) {
   /** One entry per node that is currently being talked to. */
   const active = new Map()
+  /** node → session id, kept across exchanges and restarts (`sessions.json`). */
+  const bindings = loadBindings(cacheDir, log)
+  /** Serialise binding writes: two exchanges may finish at once. */
+  let saving = Promise.resolve()
   /** session id → { node, mode } for the turns whose answer must be spoken. */
   const awaiting = new Map()
   /** assistant text collected for the turn being awaited, keyed by session id. */
@@ -130,14 +176,26 @@ export function createVoiceLoop ({
 
   /** Which session this node talks to: the one it was told, the bound one, or a new one. */
   async function sessionFor (nodeName, requested) {
-    if (requested) return requested
-    const bound = active.get(nodeName)?.sessionId
+    if (requested) {
+      bind(nodeName, requested)
+      return requested
+    }
+    const bound = bindings.get(nodeName)
     if (bound) return bound
     if (!sessionController?.create) throw new Error('нет сессии для голоса и нечем создать новую')
     const created = await sessionController.create({})
     if (!created?.sessionId) throw new Error('не удалось создать сессию под голос')
     log.info?.('[dsh-voice] created a session for voice', { session: created.sessionId, node: nodeName })
+    bind(nodeName, created.sessionId)
     return created.sessionId
+  }
+
+  /** Remember that this node talks to this session, now and after a restart. */
+  function bind (nodeName, sessionId) {
+    if (!nodeName || !sessionId) return
+    if (bindings.get(nodeName) === sessionId) return
+    bindings.set(nodeName, sessionId)
+    saving = saving.then(() => saveBindings(cacheDir, bindings, log)).catch(() => {})
   }
 
   /**
@@ -149,7 +207,7 @@ export function createVoiceLoop ({
   async function handle (want) {
     const nodeName = want?.nodeName ?? String(want?.node ?? '')
     if (active.has(nodeName)) return { status: 'busy' }
-    active.set(nodeName, { sessionId: want?.sessionId ?? null })
+    active.set(nodeName, { sessionId: want?.sessionId ?? bindings.get(nodeName) ?? null })
     mkdirSync(cacheDir, { recursive: true })
     const record = await nodes.call(nodeName, 'voice', 'record', {
       mode: want?.mode ?? 'ptt',
@@ -189,16 +247,20 @@ export function createVoiceLoop ({
     }
     const sessionId = await sessionFor(nodeName, want?.sessionId ?? null)
     active.set(nodeName, { sessionId })
+    // The wait is registered before the message is delivered: a turn that starts
+    // and ends quickly otherwise finishes before anyone is awaiting it, and the
+    // answer to the *previous* question is what gets spoken.
+    awaiting.set(sessionId, { node: nodeName, mode: want?.mode ?? 'ptt', turn: null })
     try {
       await deliver({ sessionId, text, node: nodeName, mode: want?.mode ?? 'ptt' })
     } catch (error) {
       active.delete(nodeName)
       cleanup([localPath])
+      awaiting.delete(sessionId)
       log.warn?.('[dsh-voice] delivery failed:', error?.message ?? error)
       await say(nodeName, 'Не смог передать запрос.')
       return { status: 'no-session' }
     }
-    awaiting.set(sessionId, { node: nodeName, mode: want?.mode ?? 'ptt' })
     cleanup([localPath])
     return { status: 'delivered', session: sessionId, text }
   }
@@ -214,6 +276,10 @@ export function createVoiceLoop ({
     if (!sessionId || !awaiting.has(sessionId)) return
     if (event?.type === 'turn/start') {
       drafts.delete(sessionId)
+      const waiting = awaiting.get(sessionId)
+      // The first turn that opens after the delivery is the one to answer; a
+      // later turn belongs to whoever writes into the session next.
+      if (waiting && waiting.turn === null) waiting.turn = event.data?.turn ?? null
       return
     }
     const assistant = assistantTextOf(event)
@@ -224,6 +290,9 @@ export function createVoiceLoop ({
     if (event?.type !== 'turn/end') return
     const reason = event.data?.reason?.kind ?? event.data?.reason
     if (reason !== 'completed') return
+    const waiting = awaiting.get(sessionId)
+    if (!waiting) return
+    if (waiting.turn !== null && event.data?.turn !== waiting.turn) return
     const text = drafts.get(sessionId) ?? ''
     const target = awaiting.get(sessionId)
     awaiting.delete(sessionId)
