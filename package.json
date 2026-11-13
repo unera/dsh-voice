@@ -15,7 +15,8 @@
     "loop.mjs",
     "README.md",
     "LICENSE",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "docs"
   ],
   "license": "MIT",
   "scripts": {
