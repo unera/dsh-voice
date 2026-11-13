@@ -89,7 +89,7 @@ test('a successful exchange records, transcribes, delivers and speaks the spoken
   assert.equal(outcome.session, 'session-1')
 
   const methods = nodes.calls.map((call) => `${call.api}.${call.method}`)
-  assert.deepEqual(methods, ['voice.record', 'files.copyFromDevice', 'shell.exec'])
+  assert.deepEqual(methods, ['voice.record', 'files.copyFromDevice', 'shell.exec', 'voice.chat'])
   assert.equal(nodes.calls[0].data.mode, 'ptt')
   assert.ok(nodes.calls[0].data.maxSeconds > 0)
 
@@ -347,7 +347,7 @@ test('an uploaded recording is answered without asking the device for anything',
   assert.equal(outcome.text, 'какая сегодня погода')
   // the whole point of the new protocol: no record, no copy — the file was already here
   const methods = nodes.calls.map((call) => `${call.api}.${call.method}`)
-  assert.deepEqual(methods, [], 'nothing may be asked of the device before the answer')
+  assert.deepEqual(methods, ['voice.chat'], 'only the screen line — no record, no copy')
   assert.equal(existsSync(take), false, 'the recording is removed once it is used')
 })
 
@@ -448,7 +448,12 @@ test('one exchange writes every stage it reached and exactly one closing line', 
   await loop.observeSessionEvent({ id: 'session-trace' }, { type: 'turn/end', data: { turn: 1, reason: 'completed' } })
 
   const stages = lines.filter((line) => line.includes('stage=')).map((line) => /stage=(\S+)/.exec(line)[1])
-  assert.deepEqual(stages, ['received', 'transcribed', 'delivered', 'turn-start', 'turn-end', 'split', 'synthesized', 'spoken'])
+  // The two screen pushes are side commands: they may land between any two stages, so the
+  // assertion is on the backbone plus their presence, not on one brittle total order.
+  assert.deepEqual(stages.filter((stage) => !stage.startsWith('chat-')),
+    ['received', 'transcribed', 'delivered', 'turn-start', 'turn-end', 'split', 'synthesized', 'spoken'])
+  assert.ok(stages.includes('chat-user'), 'the transcript reaches the screen')
+  assert.ok(stages.includes('chat-assistant'), 'the answer reaches the screen')
   for (const line of lines.filter((item) => item.includes('stage='))) {
     assert.match(line, /^\[dsh-voice] exchange trace-1 node=A059P stage=/)
     assert.match(line, / ms=\d+/)
@@ -562,7 +567,10 @@ test('synth=device never touches the synthesizer', async (t) => {
 
   await drive(loop, { id: 'device-1', dir, synth: 'device' })
   assert.equal(synthesized, 0, 'the device engine speaks, the host does not synthesize')
-  assert.deepEqual(nodes.calls.map((call) => call.method), ['say'])
+  assert.deepEqual(
+    nodes.calls.map((call) => call.method).filter((method) => method !== 'chat'),
+    ['say'],
+  )
 })
 
 test('synth=host synthesizes, converts and plays the file', async (t) => {
@@ -648,4 +656,72 @@ test('speaking does not hold the next exchange', async (t) => {
   assert.equal(second.status, 'delivered')
   assert.equal(nodes.calls.filter((call) => call.method === 'say').length, 1, 'the second answer is not sent while the first speaks')
   spokenResolve?.({ status: 'ok' })
+})
+
+test('the transcript reaches the screen with the exchange id and role user', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-chat-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const take = join(dir, 'take.wav')
+  writeFileSync(take, wavBytes())
+
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' }, 'voice.say': { status: 'ok' } })
+  const loop = bareLoop({ dir, nodes, synthService: null })
+
+  await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'chat-1', path: take })
+  const chats = nodes.calls.filter((call) => call.method === 'chat')
+  assert.equal(chats.length, 1)
+  assert.deepEqual(chats[0].data, { role: 'user', text: 'привет', id: 'chat-1' })
+})
+
+test('the answer reaches the screen: # screen when present, # say when not', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-chat-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' }, 'voice.say': { status: 'ok' } })
+  const loop = bareLoop({ dir, nodes, synthService: null })
+
+  await drive(loop, {
+    id: 'screen-1',
+    dir,
+    synth: 'device',
+    answer: '--- # say\nСвет включил.\n--- # screen\nДатчик: 21:14, лампа горела 40 минут.',
+  })
+  const assistant = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
+  assert.equal(assistant.length, 1)
+  assert.equal(assistant[0].data.text, 'Датчик: 21:14, лампа горела 40 минут.')
+  assert.equal(assistant[0].data.id, 'screen-1')
+
+  const second = stubNodes({ 'voice.chat': { status: 'ok' }, 'voice.say': { status: 'ok' } })
+  const loop2 = bareLoop({ dir, nodes: second, synthService: null })
+  await drive(loop2, { id: 'noscreen-1', dir, synth: 'device', answer: '--- # say\nТолько голос.' })
+  const only = second.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
+  assert.equal(only.length, 1)
+  assert.equal(only[0].data.text, 'Только голос.')
+})
+
+test('a failing screen push does not break the exchange or the speech', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-chat-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  let synthesized = 0
+  const nodes = {
+    calls: [],
+    call (node, api, method, data) {
+      this.calls.push({ node, api, method, data })
+      if (method === 'chat') return Promise.reject(new Error('screen is off'))
+      if (method === 'play') return Promise.resolve({ status: 'ok' })
+      return Promise.resolve({ status: 'ok' })
+    },
+  }
+  const loop = bareLoop({
+    dir,
+    nodes,
+    synthService: {
+      resolve: (r) => r,
+      synthesize: async () => { synthesized += 1; return { audio: wavBytes(), seconds: 1 } },
+    },
+  })
+
+  const outcome = await drive(loop, { id: 'broken-screen', dir, synth: 'host' })
+  assert.equal(outcome.status, 'delivered')
+  assert.equal(synthesized, 1, 'the answer is still synthesized and played')
+  assert.equal(nodes.calls.filter((call) => call.method === 'play').length, 1)
 })

@@ -140,6 +140,30 @@ export function createVoiceLoop ({
   const seen = new Map()
   const SEEN_LIMIT = 200
 
+  /**
+   * Show one line on the device screen.
+   *
+   * This is a side command: it never joins the exchange queue, and its failure never costs the
+   * answer. A phone whose screen is off, a build without `voice.chat`, a full queue — all of it is
+   * a log line, and the turn goes on.
+   *
+   * @param args - node, role, text, the exchange id, and the trace to stamp.
+   */
+  function pushChat ({ node, role, text, id = null, trace = null }) {
+    const body = String(text ?? '').trim()
+    if (!body) return
+    const stage = role === 'user' ? 'chat-user' : 'chat-assistant'
+    try {
+      const pending = nodes.call(node, 'voice', 'chat', { role, text: body, ...id ? { id } : {} })
+      if (pending && typeof pending.catch === 'function') {
+        pending.catch((error) => log.warn?.('[dsh-voice] the screen did not take the line:', error?.message ?? error))
+      }
+    } catch (error) {
+      log.warn?.('[dsh-voice] the screen did not take the line:', error?.message ?? error)
+    }
+    trace?.mark(stage)
+  }
+
   /** Everything that has to disappear after one exchange. */
   function cleanup (paths) {
     for (const path of paths) {
@@ -325,6 +349,9 @@ export function createVoiceLoop ({
       log.warn?.('[dsh-voice] transcription failed:', error?.message ?? error)
     }
     trace.mark('transcribed')
+    // The screen shows what the person said before the model sees it: a long silence is
+    // otherwise indistinguishable from a lost recording.
+    if (text) pushChat({ node: nodeName, role: 'user', text, trace })
     if (!text) {
       active.delete(nodeName)
       cleanup([localPath])
@@ -417,6 +444,7 @@ export function createVoiceLoop ({
       log.warn?.('[dsh-voice] transcription failed:', error?.message ?? error)
     }
     trace.mark('transcribed')
+    if (text) pushChat({ node: nodeName, role: 'user', text, id: event?.id ?? null, trace })
     if (!text) {
       cleanup([event.path])
       await say(nodeName, NOT_HEARD)
@@ -486,17 +514,18 @@ export function createVoiceLoop ({
     if (!target) return
     if (target.node) active.delete(target.node)
     target.trace?.mark('turn-end', { reason })
-    const { speak } = splitReply(text)
+    const { speak, screen } = splitReply(text)
     target.trace?.mark('split', { speakChars: speak.trim().length })
-    if (!speak.trim()) {
-      target.trace?.done('silent', { synth: target.synth ?? 'device' })
-      return
-    }
-    try {
-      await speakAnswer({ sessionId, text: speak, node: target.node, trace: target.trace, synth: target.synth })
-    } catch (error) {
-      log.warn?.('[dsh-voice] speech failed:', error?.message ?? error)
-    }
+    // The screen gets the part meant to be read — the `# screen` block when there is one, and the
+    // spoken part otherwise — and it is pushed beside the speech, not before it: a slow screen
+    // must not delay the answer being heard.
+    const forScreen = screen?.trim() ? screen : speak
+    const spoken = (!speak.trim()
+      ? (target.trace?.done('silent', { synth: target.synth ?? 'device' }), Promise.resolve())
+      : speakAnswer({ sessionId, text: speak, node: target.node, trace: target.trace, synth: target.synth })
+        .catch((error) => log.warn?.('[dsh-voice] speech failed:', error?.message ?? error)))
+    pushChat({ node: target.node, role: 'assistant', text: forScreen, id: target.trace?.id ?? null, trace: target.trace })
+    await spoken
   }
 
   /**

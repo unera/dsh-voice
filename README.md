@@ -21,6 +21,20 @@ Neither call is awaited: speaking takes as long as the sentence, and the next pr
 queue behind it. `voice.stop` is what cuts a speech short. When a host synthesis fails the loop
 falls back to the device engine and closes the line with `reason=tts-failed`.
 
+## The screen sees both sides
+
+Two side commands keep the phone's list in step with the conversation:
+
+```
+voice.chat {role: "user",      text: "<transcript>",            id: "<exchange id>"}
+voice.chat {role: "assistant", text: "<# screen or # say>",     id: "<exchange id>"}
+```
+
+Neither joins the exchange queue and neither is awaited: a screen that is off, a build without
+`voice.chat`, a full queue — all of it is one warning line, and the answer still arrives. The
+assistant line carries the `# screen` block when the model wrote one, and the spoken part
+otherwise. Their latency shows up as `chat-user` and `chat-assistant` stages.
+
 ## Where the time goes
 
 Every exchange writes one line per stage it reached, milliseconds counted from the moment the
