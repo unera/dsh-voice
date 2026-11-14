@@ -43,6 +43,8 @@ const DEFAULT_LANGUAGE = 'ru'
  * sentence and went into the session as the person's words.
  */
 const MIN_SECONDS = 0.4
+/** How often one node may warm the model up: entering and leaving a screen is not a reason. */
+const WARMUP_DEBOUNCE_MS = 60_000
 /** What we say when the recording produced no words. */
 const NOT_HEARD = 'Не расслышал, повтори пожалуйста.'
 
@@ -183,6 +185,9 @@ export function createVoiceLoop ({
 
   /** Nodes whose "new session" arrived while an exchange was still running. */
   const resetPending = new Set()
+
+  /** When each node last warmed the synthesizer up, for the debounce. */
+  const warmups = new Map()
 
   /** Recording ids already handled: a retry must not become a second answer. */
   const seen = new Map()
@@ -584,6 +589,55 @@ export function createVoiceLoop ({
   }
 
   /**
+   * Warm the synthesizer up when the person opens the voice screen.
+   *
+   * The model sleeps after ten idle minutes, and the first answer after that pays for the wake-up.
+   * Opening the screen is the earliest honest signal that words are coming.
+   *
+   * Nothing is created here: no session, no exchange, no line on the screen. A node without a
+   * `voice` API is not a partner in this at all, and a press that follows within a minute finds the
+   * work already done.
+   *
+   * @param event - `{node, nodeName}` from `dsh-nodes/voice-warmup`.
+   * @returns `{status}`: `ready`, `skipped`, `failed` or `not-voice`.
+   */
+  async function handleWarmup (event) {
+    const nodeName = event?.nodeName ?? String(event?.node ?? '')
+    if (!nodeName) return { status: 'failed' }
+    const trace = createTrace({ id: `warmup-${nodeName}`, node: nodeName, log })
+    // A device that does not speak is not ours to warm.
+    if (typeof nodes.api === 'function' && !nodes.api(nodeName, 'voice')) {
+      trace.mark('warmup', { result: 'not-voice' })
+      trace.done('not-voice', { language })
+      return { status: 'not-voice' }
+    }
+    const now = Date.now()
+    const last = warmups.get(nodeName) ?? 0
+    if (now - last < WARMUP_DEBOUNCE_MS) {
+      // Entering, leaving and entering again within a minute must not wake the model twice.
+      trace.mark('warmup', { result: 'skipped' })
+      trace.done('skipped', { language })
+      return { status: 'skipped' }
+    }
+    warmups.set(nodeName, now)
+    trace.mark('warmup', { result: 'ready' })
+    if (typeof textToSpeech?.warmup !== 'function') {
+      trace.done('ready', { language, warmup: 'no-service' })
+      return { status: 'ready' }
+    }
+    try {
+      await textToSpeech.warmup()
+      trace.done('ready', { language })
+      return { status: 'ready' }
+    } catch (error) {
+      // A cold model costs a slow first answer; a broken warmup must cost nothing at all.
+      log.warn?.('[dsh-voice] the warmup failed:', error?.message ?? error)
+      trace.done('failed', { language, error: String(error?.message ?? error).slice(0, 80) })
+      return { status: 'failed' }
+    }
+  }
+
+  /**
    * A report about a broken thing on the device, delivered as a fact for the host.
    *
    * It is not a person speaking and not an answer to anything: the message is injected without
@@ -948,6 +1002,7 @@ export function createVoiceLoop ({
     handleUpload,
     handleNewSession,
     handleBugReport,
+    handleWarmup,
     observeSessionEvent,
     awaiting,
     dispose () {

@@ -63,6 +63,19 @@ A wait can no longer stick: any `turn/end` clears it (`cancelled` and `error` cl
 `session/disposed` clears it, and a deadline of three minutes releases the node with
 `reason=timeout`.
 
+## Waking the model before the first word
+
+Opening the voice screen sends `{"type":"voice-warmup"}`, which reaches the loop as
+`dsh-nodes/voice-warmup` and calls `textToSpeech.warmup()` — the synthesizer starts its worker
+while the person is still deciding what to say. Nothing else happens: no session, no exchange, no
+line on the screen, nothing spoken.
+
+The warmup is debounced to one per node per minute — entering, leaving and entering again is not a
+reason to wake the model twice — and only nodes that declare the `voice` API are warmed at all. A
+failure is a warning: a cold model costs a slow first answer, a broken warmup must cost nothing.
+
+The model still sleeps after ten idle minutes (`idleTimeoutMs`, 600000 by default).
+
 ## When the voice degrades
 
 A failed synthesis is not hidden: the answer still goes out, spoken by the device engine, and the

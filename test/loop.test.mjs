@@ -1366,3 +1366,67 @@ test('a bug report reaches the session marked as a fact, not spoken', async (t) 
   // nothing was spoken for it
   assert.equal(nodes.calls.filter((call) => call.method === 'say').length, 0)
 })
+
+/** A loop with a warmup counter and a voice API that may or may not exist. */
+function warmLoop ({ dir, hasVoice = true, warmup = async () => {}, lines = [] }) {
+  let warmed = 0
+  const nodes = {
+    calls: [],
+    call (node, api, method, data) { this.calls.push({ node, api, method, data }); return Promise.resolve({ status: 'ok' }) },
+    api (nodeRef, name) { return hasVoice && name === 'voice' ? { id: 1, name: 'voice' } : null },
+  }
+  const loop = createVoiceLoop({
+    nodes,
+    textToSpeech: { warmup: async () => { warmed += 1; await warmup() }, resolve: (r) => r, synthesize: async () => ({ audio: wavBytes(), seconds: 1 }) },
+    speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
+    sessions: { flush: async () => {} },
+    sessionController: {
+      resolveAgent: async () => ({ agent: { followup: () => {} } }),
+      create: async () => ({ sessionId: 'session-warm' }),
+    },
+    cacheDir: join(dir, 'cache'),
+    log: { info: (line) => lines.push(line), warn: (line) => lines.push(`WARN ${line}`), debug: () => {} },
+  })
+  return { loop, nodes, calls: () => warmed }
+}
+
+test('opening the screen warms the model up once, and a second entry is skipped', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-warm-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const lines = []
+  const { loop, nodes, calls } = warmLoop({ dir, lines })
+
+  const first = await loop.handleWarmup({ node: 19, nodeName: 'A059P' })
+  assert.equal(first.status, 'ready')
+  assert.equal(calls(), 1)
+  assert.equal(loop.awaiting.size, 0, 'a warmup creates no exchange')
+  assert.equal(nodes.calls.filter((call) => call.method !== 'chat').length, 0, 'and nothing is sent to the device')
+  assert.deepEqual(nodes.calls, [], 'no command at all')
+
+  const second = await loop.handleWarmup({ node: 19, nodeName: 'A059P' })
+  assert.equal(second.status, 'skipped')
+  assert.equal(calls(), 1, 'entering and leaving again within a minute does not wake the model twice')
+  assert.ok(lines.some((line) => line.includes('stage=warmup') && line.includes('result=skipped')))
+})
+
+test('a node without a voice API is not warmed at all', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-warm-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const { loop, calls } = warmLoop({ dir, hasVoice: false })
+
+  const outcome = await loop.handleWarmup({ node: 5, nodeName: 'laptop' })
+  assert.equal(outcome.status, 'not-voice')
+  assert.equal(calls(), 0)
+})
+
+test('a broken warmup is a warning, not a failure', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-warm-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const lines = []
+  const { loop } = warmLoop({ dir, lines, warmup: async () => { throw new Error('silero is not there') } })
+
+  const outcome = await loop.handleWarmup({ node: 19, nodeName: 'A059P' })
+  assert.equal(outcome.status, 'failed')
+  assert.ok(lines.some((line) => line.includes('WARN') && line.includes('warmup failed')))
+  assert.ok(lines.some((line) => line.includes('done') && line.includes('reason=failed')))
+})

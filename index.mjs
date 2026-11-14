@@ -293,6 +293,13 @@ function startLoop (ctx, config) {
     })
   }, { global: true })
 
+  // The voice screen opened: warm the model up, quietly.
+  const disposeWarmup = ctx.on('dsh-nodes/voice-warmup', (event) => {
+    void loop.handleWarmup(event).catch((error) => {
+      log.warn?.('[dsh-voice] warmup failed:', error?.message ?? error)
+    })
+  }, { global: true })
+
   // A report about the app: delivered as a fact, never spoken.
   const disposeBugReport = ctx.on('dsh-nodes/bug-report', (report) => {
     void loop.handleBugReport(report).catch((error) => {
@@ -322,6 +329,9 @@ function startLoop (ctx, config) {
     } catch {}
     try {
       disposeBugReport?.()
+    } catch {}
+    try {
+      disposeWarmup?.()
     } catch {}
     loop.dispose()
   })
