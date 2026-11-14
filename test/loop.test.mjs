@@ -1009,3 +1009,83 @@ test('host audio is synthesized from speak, not from the screen text', async (t)
   assert.match(answered[0].data.text, /\| магазин \| цена \|/)
   assert.match(answered[0].data.audio, /\.ogg$/)
 })
+
+test('a new-session event drops the binding, so the next take starts a new conversation', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-new-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  let created = 0
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
+  const lines = []
+  const loop = createVoiceLoop({
+    nodes,
+    speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
+    sessions: { flush: async () => {} },
+    sessionController: {
+      resolveAgent: async () => ({ agent: { followup: () => {} } }),
+      create: async () => { created += 1; return { sessionId: `session-${created}` } },
+    },
+    cacheDir: join(dir, 'cache'),
+    log: { info: (line) => lines.push(line), warn: () => {}, debug: () => {} },
+  })
+
+  const take = () => { const p = join(dir, `t-${Math.random().toString(36).slice(2, 6)}.wav`); writeFileSync(p, wavBytes()); return p }
+  const first = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'n1', path: take(), seconds: 1.2 })
+  assert.equal(first.session, 'session-1')
+  // finish the exchange: a reset while it runs is deferred, which the next test covers
+  await loop.observeSessionEvent({ id: first.session }, { type: 'turn/start', data: { turn: 1 } })
+  await loop.observeSessionEvent({ id: first.session }, {
+    type: 'assistant/message',
+    data: { turn: 1, message: { content: [{ type: 'text', text: '--- # say\nответ' }] } },
+  })
+  await loop.observeSessionEvent({ id: first.session }, { type: 'turn/end', data: { turn: 1, reason: 'completed' } })
+
+  const reset = loop.handleNewSession({ node: 19, nodeName: 'A059P' })
+  assert.equal(reset.status, 'ok')
+  assert.ok(lines.some((line) => line.includes('stage=new-session')), 'the reset leaves a trace')
+
+  const second = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'n2', path: take(), seconds: 1.2 })
+  assert.equal(created, 2, 'a fresh session was created')
+  assert.equal(second.session, 'session-2')
+})
+
+test('a reset during a running exchange waits for it to finish', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-new-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  let created = 0
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
+  const lines = []
+  const loop = createVoiceLoop({
+    nodes,
+    speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
+    sessions: { flush: async () => {} },
+    sessionController: {
+      resolveAgent: async () => ({ agent: { followup: () => {} } }),
+      create: async () => { created += 1; return { sessionId: `session-${created}` } },
+    },
+    cacheDir: join(dir, 'cache'),
+    log: { info: (line) => lines.push(line), warn: () => {}, debug: () => {} },
+  })
+
+  const take = () => { const p = join(dir, `t-${Math.random().toString(36).slice(2, 6)}.wav`); writeFileSync(p, wavBytes()); return p }
+  const first = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'r1', path: take(), seconds: 1.2 })
+  await loop.observeSessionEvent({ id: first.session }, { type: 'turn/start', data: { turn: 1 } })
+
+  // the person asks for a new session while the answer to what they already said is still coming
+  const reset = loop.handleNewSession({ node: 19, nodeName: 'A059P' })
+  assert.equal(reset.status, 'deferred')
+  assert.equal(created, 1, 'the running exchange keeps its session')
+
+  await loop.observeSessionEvent({ id: first.session }, {
+    type: 'assistant/message',
+    data: { turn: 1, message: { content: [{ type: 'text', text: '--- # say\nответ' }] } },
+  })
+  await loop.observeSessionEvent({ id: first.session }, { type: 'turn/end', data: { turn: 1, reason: 'completed' } })
+
+  // the answer was still delivered to the old session, and only then did the reset apply
+  const answered = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
+  assert.equal(answered.length, 1)
+
+  const second = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'r2', path: take(), seconds: 1.2 })
+  assert.equal(created, 2)
+  assert.equal(second.session, 'session-2')
+})

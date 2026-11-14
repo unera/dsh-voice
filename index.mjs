@@ -291,12 +291,25 @@ function startLoop (ctx, config) {
     })
   }, { global: true })
 
+  // "New session": forget which conversation this device was in. The next input creates a fresh
+  // one; a running exchange is left to finish, because its words are already spoken.
+  const disposeNewSession = ctx.on('dsh-nodes/voice-new-session', (event) => {
+    try {
+      loop.handleNewSession(event)
+    } catch (error) {
+      log.warn?.('[dsh-voice] the reset failed:', error?.message ?? error)
+    }
+  }, { global: true })
+
   ctx.effect(() => () => {
     try {
       disposeWant?.()
     } catch {}
     try {
       disposeVoice?.()
+    } catch {}
+    try {
+      disposeNewSession?.()
     } catch {}
     loop.dispose()
   })

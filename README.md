@@ -75,6 +75,16 @@ event arrived, and exactly one closing line with the deltas:
 server's `receivedAt`); a segment that never happened is absent from the line, not a zero. A
 failed exchange closes with `reason=empty`, `reason=no-session`, `reason=silent` and so on.
 
+## A new conversation on demand
+
+`{"type":"voice","action":"new-session"}` from the device means "forget this conversation". The
+loop drops the node's binding in `sessions.json`, so the next input creates a fresh session, and it
+says nothing — the person started it themselves.
+
+A reset never interrupts a running exchange: if the answer to the sentence they already spoke is
+still being prepared, the binding is dropped when that exchange ends. Losing words someone has
+already said would be worse than a conversation that lives one answer longer.
+
 ## Language and silence
 
 The recognizer is asked for a named language (`language`, `ru` by default), not for whatever the

@@ -178,6 +178,9 @@ export function createVoiceLoop ({
   /** Where a synthesized answer waits for the device to fetch it. */
   const outputDir = join(cacheDir, 'out')
 
+  /** Nodes whose "new session" arrived while an exchange was still running. */
+  const resetPending = new Set()
+
   /** Recording ids already handled: a retry must not become a second answer. */
   const seen = new Map()
   const SEEN_LIMIT = 200
@@ -384,7 +387,7 @@ export function createVoiceLoop ({
       timeout: RECORD_TIMEOUT_SECONDS,
     })
     if (record?.status !== 'ok' || !record?.payload?.path) {
-      active.delete(nodeName)
+      releaseNode(nodeName)
       log.info?.('[dsh-voice] no recording', { node: nodeName, code: record?.code ?? record?.status })
       if (record?.code === 'voice_timeout') await say(nodeName, 'Не услышал попробуй ещё раз.')
       trace.done('no-recording', { code: record?.code ?? null, language })
@@ -396,7 +399,7 @@ export function createVoiceLoop ({
     // The take belongs to the person's words: once it is here, the device copy is litter.
     await nodes.call(nodeName, 'shell', 'exec', { command: `rm -f ${JSON.stringify(devicePath)}` })
     if (copy?.status !== 'ok') {
-      active.delete(nodeName)
+      releaseNode(nodeName)
       cleanup([localPath])
       log.warn?.('[dsh-voice] the recording did not arrive', { node: nodeName, message: copy?.message })
       await say(nodeName, 'Не смог забрать запись.')
@@ -405,7 +408,7 @@ export function createVoiceLoop ({
     }
     const recordedSeconds = Number(record.payload.seconds)
     if (Number.isFinite(recordedSeconds) && recordedSeconds > 0 && recordedSeconds < minSeconds) {
-      active.delete(nodeName)
+      releaseNode(nodeName)
       cleanup([localPath])
       trace.done('too-short', { language, seconds: recordedSeconds })
       return { status: 'too-short', code: 'too-short' }
@@ -422,7 +425,7 @@ export function createVoiceLoop ({
     // otherwise indistinguishable from a lost recording.
     if (text) pushChat({ node: nodeName, role: 'user', text, trace })
     if (!text) {
-      active.delete(nodeName)
+      releaseNode(nodeName)
       cleanup([localPath])
       await say(nodeName, NOT_HEARD)
       trace.done('empty', { language })
@@ -440,7 +443,7 @@ export function createVoiceLoop ({
       await deliver({ sessionId, text, node: nodeName, mode: want?.mode ?? 'ptt' })
       trace.mark('delivered')
     } catch (error) {
-      active.delete(nodeName)
+      releaseNode(nodeName)
       cleanup([localPath])
       awaiting.delete(sessionId)
       log.warn?.('[dsh-voice] delivery failed:', error?.message ?? error)
@@ -542,7 +545,7 @@ export function createVoiceLoop ({
       trace.mark('delivered')
     } catch (error) {
       awaiting.delete(sessionId)
-      active.delete(nodeName)
+      releaseNode(nodeName)
       cleanup([event.path])
       log.warn?.('[dsh-voice] delivery failed:', error?.message ?? error)
       await say(nodeName, 'Не смог передать запрос.')
@@ -676,8 +679,56 @@ export function createVoiceLoop ({
     awaiting.delete(sessionId)
     drafts.delete(sessionId)
     if (entry.timer) clearTimeout(entry.timer)
-    if (entry.node) active.delete(entry.node)
+    if (entry.node) releaseNode(entry.node)
     return entry
+  }
+
+  /**
+   * Free the node and, if a reset was asked for while it was busy, apply it now.
+   *
+   * The reset is deliberately late: the person may press "new session" while the answer to the
+   * sentence they just said is still being prepared, and dropping that exchange would lose words
+   * they have already spoken.
+   *
+   * @param nodeName - the node that is no longer busy.
+   */
+  function releaseNode (nodeName) {
+    active.delete(nodeName)
+    if (!resetPending.delete(nodeName)) return
+    forgetBinding(nodeName)
+    log.info?.('[dsh-voice] the deferred reset is applied', { node: nodeName })
+  }
+
+  /** Drop the node → session binding so the next input starts a new conversation. */
+  function forgetBinding (nodeName) {
+    if (!bindings.has(nodeName)) return false
+    bindings.delete(nodeName)
+    saving = saving.then(() => saveBindings(cacheDir, bindings, log)).catch(() => {})
+    return true
+  }
+
+  /**
+   * "New session" from the device.
+   *
+   * A reset never interrupts a running exchange: the binding is dropped right away when the node is
+   * idle, and deferred to its end when it is not.
+   *
+   * @param event - `{node, nodeName}` from `dsh-nodes/voice-new-session`.
+   * @returns `{status}` for the log.
+   */
+  function handleNewSession (event) {
+    const nodeName = event?.nodeName ?? String(event?.node ?? '')
+    if (!nodeName) return { status: 'no-node' }
+    const trace = createTrace({ id: `new-session-${nodeName}`, node: nodeName, log })
+    trace.mark('new-session')
+    if (active.has(nodeName) || [...awaiting.values()].some((entry) => entry.node === nodeName)) {
+      resetPending.add(nodeName)
+      trace.done('deferred', { language })
+      return { status: 'deferred' }
+    }
+    forgetBinding(nodeName)
+    trace.done('ok', { language })
+    return { status: 'ok' }
   }
 
   /**
@@ -768,6 +819,7 @@ export function createVoiceLoop ({
   return {
     handle,
     handleUpload,
+    handleNewSession,
     observeSessionEvent,
     awaiting,
     dispose () {
