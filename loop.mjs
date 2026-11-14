@@ -24,6 +24,15 @@ import { toVoiceNote } from './audio.mjs'
  * behind it, so answers arrived three or four questions late.
  */
 const RECORD_TIMEOUT_SECONDS = 12
+/** How long a synthesized file waits for the device to fetch it before it is litter. */
+const AUDIO_TTL_MS = 120_000
+/**
+ * How long one exchange may wait for an answer before it is declared stuck.
+ *
+ * Without this a dropped turn held the device forever: the next press queued behind a wait that
+ * nobody would ever end.
+ */
+const EXCHANGE_TIMEOUT_MS = 180_000
 /** What we say when the recording produced no words. */
 const NOT_HEARD = 'Не расслышал, повтори пожалуйста.'
 
@@ -69,6 +78,26 @@ export function saveBindings (cacheDir, bindings, log = console) {
   }
 }
 
+/**
+ * The tool calls this assistant message asks for, in order.
+ *
+ * `assistantTextOf` deliberately ignores them (a message of calls says nothing out loud), but the
+ * screen needs exactly them: while the model works, the only honest thing to show is which tool is
+ * running.
+ *
+ * @param event - one session event.
+ * @returns tool names, possibly an empty list.
+ */
+export function toolCallNamesOf (event) {
+  if (event?.type !== 'assistant/message') return []
+  const content = event.data?.message?.content
+  if (!Array.isArray(content)) return []
+  return content
+    .filter((block) => block?.type === 'tool-call')
+    .map((block) => String(block.name ?? block.toolName ?? '').trim())
+    .filter(Boolean)
+}
+
 /** Read the text out of one assistant message event, or null when it carries none. */
 export function assistantTextOf (event) {
   if (event?.type !== 'assistant/message') return null
@@ -109,6 +138,7 @@ export function createVoiceLoop ({
   createUserMessage = null,
   on = null,
   emit = null,
+  exchangeTimeoutMs = EXCHANGE_TIMEOUT_MS,
 }) {
   /** One entry per node that is currently being talked to. */
   const active = new Map()
@@ -149,12 +179,18 @@ export function createVoiceLoop ({
    *
    * @param args - node, role, text, the exchange id, and the trace to stamp.
    */
-  function pushChat ({ node, role, text, id = null, trace = null }) {
+  function pushChat ({ node, role, text, id = null, trace = null, say = false, audio = null }) {
     const body = String(text ?? '').trim()
     if (!body) return
     const stage = role === 'user' ? 'chat-user' : 'chat-assistant'
     try {
-      const pending = nodes.call(node, 'voice', 'chat', { role, text: body, ...id ? { id } : {} })
+      const pending = nodes.call(node, 'voice', 'chat', {
+        role,
+        text: body,
+        ...id ? { id } : {},
+        ...say ? { say: true } : {},
+        ...audio ? { audio } : {},
+      })
       if (pending && typeof pending.catch === 'function') {
         pending.catch((error) => log.warn?.('[dsh-voice] the screen did not take the line:', error?.message ?? error))
       }
@@ -364,7 +400,9 @@ export function createVoiceLoop ({
     // The wait is registered before the message is delivered: a turn that starts
     // and ends quickly otherwise finishes before anyone is awaiting it, and the
     // answer to the *previous* question is what gets spoken.
-    awaiting.set(sessionId, { node: nodeName, mode: want?.mode ?? 'ptt', turn: null, trace, synth: 'device' })
+    awaiting.set(sessionId, watchForAnswer({
+      sessionId, node: nodeName, mode: want?.mode ?? 'ptt', trace, synth: 'device',
+    }))
     try {
       await deliver({ sessionId, text, node: nodeName, mode: want?.mode ?? 'ptt' })
       trace.mark('delivered')
@@ -455,7 +493,9 @@ export function createVoiceLoop ({
     active.set(nodeName, { sessionId })
     // The wait is registered before the message is delivered: a turn that starts and ends
     // quickly would otherwise finish before anyone awaits it.
-    awaiting.set(sessionId, { node: nodeName, mode: event?.mode ?? 'upload', turn: null, trace, synth: event?.synth ?? 'device' })
+    awaiting.set(sessionId, watchForAnswer({
+      sessionId, node: nodeName, mode: event?.mode ?? 'upload', trace, synth: event?.synth ?? 'device',
+    }))
     try {
       await deliver({ sessionId, text, node: nodeName, mode: 'upload' })
       trace.mark('delivered')
@@ -493,14 +533,22 @@ export function createVoiceLoop ({
       }
       return
     }
-    const assistant = assistantTextOf(event)
-    if (assistant) {
-      drafts.set(sessionId, assistant.text)
+    if (event?.type === 'assistant/message') {
+      const assistant = assistantTextOf(event)
+      if (assistant) drafts.set(sessionId, assistant.text)
+      // One `activity` per tool call, in order: the flag on the screen must move while the
+      // answer is being built, and each step names the tool that is running.
+      const waiting = awaiting.get(sessionId)
+      if (waiting) {
+        for (const name of toolCallNamesOf(event)) {
+          waiting.activity = (waiting.activity ?? 0) + 1
+          pushActivity({ node: waiting.node, n: waiting.activity, name, id: waiting.trace?.id ?? null, trace: waiting.trace })
+        }
+      }
       return
     }
     if (event?.type !== 'turn/end') return
-    const reason = event.data?.reason?.kind ?? event.data?.reason
-    if (reason !== 'completed') return
+    const reason = rawReasonOf(event)
     const waiting = awaiting.get(sessionId)
     if (!waiting) return
     // Before the awaited turn opens, any end belongs to work that started
@@ -508,87 +556,31 @@ export function createVoiceLoop ({
     if (waiting.turn === null) return
     if (event.data?.turn !== waiting.turn) return
     const text = drafts.get(sessionId) ?? ''
-    const target = awaiting.get(sessionId)
-    awaiting.delete(sessionId)
-    drafts.delete(sessionId)
+    const target = finishAwaiting(sessionId)
     if (!target) return
-    if (target.node) active.delete(target.node)
     target.trace?.mark('turn-end', { reason })
+    if (reason !== 'completed') {
+      // A cancelled or failed turn is closed, not spoken: there is no answer to read, and a
+      // stale wait would hold the device until the next press.
+      target.trace?.done(reason, { synth: target.synth ?? 'device' })
+      return
+    }
     const { speak, screen } = splitReply(text)
     target.trace?.mark('split', { speakChars: speak.trim().length })
-    // The screen gets the part meant to be read — the `# screen` block when there is one, and the
-    // spoken part otherwise — and it is pushed beside the speech, not before it: a slow screen
-    // must not delay the answer being heard.
-    const forScreen = screen?.trim() ? screen : speak
-    const spoken = (!speak.trim()
-      ? (target.trace?.done('silent', { synth: target.synth ?? 'device' }), Promise.resolve())
-      : speakAnswer({ sessionId, text: speak, node: target.node, trace: target.trace, synth: target.synth })
-        .catch((error) => log.warn?.('[dsh-voice] speech failed:', error?.message ?? error)))
-    pushChat({ node: target.node, role: 'assistant', text: forScreen, id: target.trace?.id ?? null, trace: target.trace })
-    await spoken
-  }
-
-  /**
-   * Turn the spoken part into audio and make the device say it.
-   *
-   * The audio is synthesized here even though the device currently speaks the text with its
-   * own engine: that keeps the synthesis path exercised, and the moment `voice.play` exists
-   * the file is already there. Until then the text is what the phone actually plays.
-   */
-  async function speakAnswer ({ sessionId, text, node, trace = null, synth = 'device' }) {
-    const mode = synth === 'host' ? 'host' : 'device'
-    // `device`: the phone reads the text with its own engine and the host does no synthesis at
-    // all. It used to synthesize a file and delete it immediately — nine seconds of work per
-    // reply for a sound nobody heard.
-    if (mode === 'device') return await dispatch({ node, text, trace, synth: mode })
-    try {
-      const speech = await synthesize(text)
-      const wavPath = join(cacheDir, `say-${Date.now()}.wav`)
-      writeFileSync(wavPath, speech.audio)
-      trace?.mark('synthesized', { seconds: Number(speech.seconds?.toFixed?.(2) ?? speech.seconds) })
-      const ogg = join(outputDir, `${trace?.id ?? Date.now()}.ogg`)
-      mkdirSync(outputDir, { recursive: true })
-      try {
-        await toVoiceNote(wavPath, ogg, tempo(), { signal: new AbortController().signal })
-      } finally {
-        cleanup([wavPath])
-      }
-      return await dispatch({ node, path: ogg, seconds: speech.seconds, trace, synth: mode })
-    } catch (error) {
-      // A broken synthesizer must not leave the person without an answer: the device engine is
-      // always there, and the log says which path actually spoke.
-      log.warn?.('[dsh-voice] synthesis failed, falling back to the device engine:', error?.message ?? error)
-      trace?.mark('tts-failed', { error: error?.message?.slice(0, 80) ?? String(error) })
-      return await dispatch({ node, text, trace, synth: 'device', reason: 'tts-failed' })
+    if (!speak.trim()) {
+      target.trace?.done('silent', { synth: target.synth ?? 'device' })
+      return
     }
-  }
-
-  /**
-   * Hand the answer to the device and return immediately.
-   *
-   * Speaking takes as long as the sentence does, and the node queue must not wait for it: the
-   * press that follows is a different exchange. `voice.stop` is what cuts a speech short.
-   *
-   * @param args - text (device engine) or path (host audio), the node, and the trace.
-   * @returns `{spoken}` without waiting for the device to finish talking.
-   */
-  async function dispatch ({ node, text = null, path = null, seconds = null, trace = null, synth, reason = null }) {
-    const method = path ? 'play' : 'say'
-    const data = path ? { path, ...seconds === null ? {} : { seconds } } : { text }
-    const pending = nodes.call(node, 'voice', method, data)
-    if (pending && typeof pending.catch === 'function') {
-      // The outcome is not awaited, but it is never swallowed silently either.
-      pending.catch((error) => log.warn?.('[dsh-voice] the device did not take the answer:', error?.message ?? error))
-    }
-    trace?.mark('spoken', path && Number.isFinite(Number(seconds)) ? { via: method, seconds } : { via: method })
-    if (path && pending && typeof pending.finally === 'function') {
-      // The device fetches the file by the command it is answering; only then is it litter.
-      pending.finally(() => cleanup([path])).catch(() => cleanup([path]))
-    } else if (path) {
-      setTimeout(() => cleanup([path]), 60_000).unref?.()
-    }
-    trace?.done(reason ?? 'ok', { synth })
-    return { spoken: true, method }
+    // The answer travels as one chat message that carries the speech: the device queues it
+    // itself, so nothing here waits for a voice to finish.
+    await answerWith({
+      sessionId,
+      text: screen?.trim() ? screen : speak,
+      node: target.node,
+      trace: target.trace,
+      synth: target.synth,
+      id: target.trace?.id ?? null,
+    })
   }
 
   /** The configured playback tempo, applied to host audio only. */
@@ -605,11 +597,125 @@ export function createVoiceLoop ({
     return await textToSpeech.synthesize(spec, new AbortController().signal)
   }
 
+  /**
+   * Register the expectation of an answer, with a deadline.
+   *
+   * @param entry - what the exchange knows: the session, the node, the trace and the synth mode.
+   * @returns the entry, with its activity counter at zero and a timer armed.
+   */
+  function watchForAnswer (entry) {
+    const record = { ...entry, turn: null, activity: 0 }
+    record.timer = setTimeout(() => {
+      // The turn never came back. Say so, free the node, and let the next press through.
+      const stuck = finishAwaiting(entry.sessionId)
+      if (!stuck) return
+      stuck.trace?.mark('turn-end', { reason: 'timeout' })
+      stuck.trace?.done('timeout', { synth: stuck.synth ?? 'device' })
+      log.warn?.('[dsh-voice] the answer never came, releasing the exchange', { session: entry.sessionId })
+    }, exchangeTimeoutMs)
+    record.timer.unref?.()
+    return record
+  }
+
+  /**
+   * Take the waiting entry off the books, together with its timer and its node slot.
+   *
+   * @param sessionId - the session whose answer is no longer expected.
+   * @returns the entry that was waiting, or null.
+   */
+  function finishAwaiting (sessionId) {
+    const entry = awaiting.get(sessionId)
+    if (!entry) return null
+    awaiting.delete(sessionId)
+    drafts.delete(sessionId)
+    if (entry.timer) clearTimeout(entry.timer)
+    if (entry.node) active.delete(entry.node)
+    return entry
+  }
+
+  /**
+   * The reason of a turn end in either shape DSH may hand it over: a plain string or an object
+   * with a `kind`. A completed turn is the only one that speaks.
+   *
+   * @param event - the `turn/end` event.
+   * @returns a reason string, `unknown` when it carries none.
+   */
+  function rawReasonOf (event) {
+    const reason = event?.data?.reason
+    const value = typeof reason === 'string' ? reason : reason?.kind
+    return typeof value === 'string' && value ? value : 'unknown'
+  }
+
+  /**
+   * Show the progress of one tool call.
+   *
+   * @param args - node, the counter inside the exchange, the tool name, the exchange id, trace.
+   */
+  function pushActivity ({ node, n, name, id = null, trace = null }) {
+    try {
+      const pending = nodes.call(node, 'voice', 'activity', { n, name, ...id ? { id } : {} })
+      if (pending && typeof pending.catch === 'function') {
+        pending.catch((error) => log.warn?.('[dsh-voice] the screen did not take the activity:', error?.message ?? error))
+      }
+    } catch (error) {
+      log.warn?.('[dsh-voice] the screen did not take the activity:', error?.message ?? error)
+    }
+    trace?.mark('activity', { n, name })
+  }
+
+  /**
+   * Send the answer as one chat message, with the audio when the host is the one speaking.
+   *
+   * @param args - session, the text to show, the node, the trace, the synth mode and the id.
+   */
+  async function answerWith ({ sessionId, text, node, trace = null, synth = 'device', id = null }) {
+    let audioPath = null
+    if (synth === 'host') {
+      try {
+        const speech = await synthesize(text)
+        const wavPath = join(cacheDir, `say-${Date.now()}.wav`)
+        writeFileSync(wavPath, speech.audio)
+        trace?.mark('synthesized', { seconds: Number(speech.seconds?.toFixed?.(2) ?? speech.seconds) })
+        mkdirSync(outputDir, { recursive: true })
+        audioPath = join(outputDir, `${id ?? Date.now()}.ogg`)
+        try {
+          await toVoiceNote(wavPath, audioPath, tempo(), { signal: new AbortController().signal })
+        } finally {
+          cleanup([wavPath])
+        }
+      } catch (error) {
+        // The device engine is always there; a broken synthesizer costs the voice, not the answer.
+        log.warn?.('[dsh-voice] synthesis failed, the device will speak:', error?.message ?? error)
+        trace?.mark('tts-failed', { error: error?.message?.slice(0, 80) ?? String(error) })
+        audioPath = null
+      }
+    }
+    pushChat({ node, role: 'assistant', text, id, say: true, audio: audioPath, trace })
+    // The device fetches the file by the command it answers; until then it must stay.
+    if (audioPath) {
+      const settle = (async () => {})()
+      void settle
+      setTimeout(() => cleanup([audioPath]), AUDIO_TTL_MS).unref?.()
+    }
+    trace?.done(synth === 'host' && !audioPath ? 'tts-failed' : 'ok', { synth: audioPath ? 'host' : 'device' })
+    log.info?.('[dsh-voice] answered', { session: sessionId, synth: audioPath ? 'host' : 'device' })
+    return { answered: true }
+  }
+
   if (typeof on === 'function') {
     const dispose = on('session/event', (session, event) => {
       void observeSessionEvent(session, event)
     })
     if (typeof dispose === 'function') disposers.push(dispose)
+    // A session can be closed while an answer is still expected: nothing will arrive then, and
+    // the device must not stay booked.
+    const disposeDisposed = on('session/disposed', (session) => {
+      const sessionId = session?.id ?? session?.sessionId ?? null
+      if (!sessionId) return
+      const gone = finishAwaiting(sessionId)
+      gone?.trace?.done('disposed', { synth: gone.synth ?? 'device' })
+    })
+    if (typeof disposeDisposed === 'function') disposers.push(disposeDisposed)
   }
 
   return {

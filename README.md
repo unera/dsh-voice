@@ -23,17 +23,32 @@ falls back to the device engine and closes the line with `reason=tts-failed`.
 
 ## The screen sees both sides
 
-Two side commands keep the phone's list in step with the conversation:
+The answer no longer travels as a `voice.say`/`voice.play` command: it is one chat message that
+carries the speech, and the device queues it itself.
 
 ```
-voice.chat {role: "user",      text: "<transcript>",            id: "<exchange id>"}
-voice.chat {role: "assistant", text: "<# screen or # say>",     id: "<exchange id>"}
+voice.chat     {role: "user",      text: "<transcript>",         id: "<exchange id>"}
+voice.chat     {role: "assistant", text: "<# screen or # say>",  id: "<exchange id>",
+                say: true, audio?: "<path on the host>"}
+voice.activity {n, name, id}
 ```
 
-Neither joins the exchange queue and neither is awaited: a screen that is off, a build without
-`voice.chat`, a full queue — all of it is one warning line, and the answer still arrives. The
-assistant line carries the `# screen` block when the model wrote one, and the spoken part
-otherwise. Their latency shows up as `chat-user` and `chat-assistant` stages.
+`say: true` means "this line must be heard"; `audio` appears only for `synth=host`, where the
+host synthesized the answer, converted it to OGG/Opus with the configured tempo, and left the
+file for the device to fetch by the `seq` of that command.
+
+While the model works, every tool call in its message becomes one `voice.activity`, numbered from
+one inside the exchange and reset on the next press: `bash`, `web_search`, `nodes_call` — the name
+the model used.
+
+None of these is awaited and none joins the exchange queue: a screen that is off, a build without
+`voice.chat`, a full queue — one warning line, and the answer still arrives. If the synthesis
+fails, the answer still goes out with `say: true` and no audio, and the closing line says
+`reason=tts-failed`.
+
+A wait can no longer stick: any `turn/end` clears it (`cancelled` and `error` close silently),
+`session/disposed` clears it, and a deadline of three minutes releases the node with
+`reason=timeout`.
 
 ## Where the time goes
 

@@ -6,23 +6,25 @@ import { test } from 'node:test'
 
 import { assistantTextOf, createVoiceLoop } from '../loop.mjs'
 
-/** A tiny silent WAV: the recognizer stub never reads it, the loop only needs bytes. */
-function wavBytes () {
+/** A short WAV with real silence in it: ffmpeg has to be able to encode it. */
+function wavBytes (seconds = 0.2, sampleRate = 16000) {
+  const frames = Math.round(seconds * sampleRate)
+  const data = Buffer.alloc(frames * 2)
   const header = Buffer.alloc(44)
   header.write('RIFF', 0, 'ascii')
-  header.writeUInt32LE(36, 4)
+  header.writeUInt32LE(36 + data.length, 4)
   header.write('WAVE', 8, 'ascii')
   header.write('fmt ', 12, 'ascii')
   header.writeUInt32LE(16, 16)
   header.writeUInt16LE(1, 20)
   header.writeUInt16LE(1, 22)
-  header.writeUInt32LE(16000, 24)
-  header.writeUInt32LE(32000, 28)
+  header.writeUInt32LE(sampleRate, 24)
+  header.writeUInt32LE(sampleRate * 2, 28)
   header.writeUInt16LE(2, 32)
   header.writeUInt16LE(16, 34)
   header.write('data', 36, 'ascii')
-  header.writeUInt32LE(0, 40)
-  return header
+  header.writeUInt32LE(data.length, 40)
+  return Buffer.concat([header, data])
 }
 
 /** Record every call, answer with a table of canned outcomes. */
@@ -107,10 +109,11 @@ test('a successful exchange records, transcribes, delivers and speaks the spoken
   })
   await loop.observeSessionEvent({ id: 'session-1' }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
 
-  const said = nodes.calls.filter((call) => call.api === 'voice' && call.method === 'say')
-  assert.equal(said.length, 1)
-  assert.equal(said[0].node, 'A059P')
-  assert.equal(said[0].data.text, 'Свет включил.')
+  const answered = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
+  assert.equal(answered.length, 1)
+  assert.equal(answered[0].node, 'A059P')
+  assert.equal(answered[0].data.text, 'Датчик сработал.', 'the screen part is what the message shows')
+  assert.equal(answered[0].data.say, true, 'the speech travels with the message, not as a command')
 })
 
 test('a silent take is answered out loud and never reaches a session', async (t) => {
@@ -203,7 +206,8 @@ test('a turn without a spoken part stays silent', async () => {
   })
   await loop.observeSessionEvent({ id: 'session-1' }, { type: 'turn/end', data: { turn: 1, reason: 'completed' } })
 
-  assert.equal(nodes.calls.filter((call) => call.method === 'say').length, 0)
+  const answered = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
+  assert.equal(answered.length, 0)
   assert.equal(loop.awaiting.size, 0, 'the expectation is cleared even when nothing is said')
 })
 
@@ -297,8 +301,8 @@ test('an answer to the previous question is not spoken for a new take', async (t
         writeFileSync(data.hostPath, wavBytes())
         return { status: 'ok' }
       },
-      'voice.say': ({ data }) => {
-        spoken.push(data.text)
+      'voice.chat': ({ data }) => {
+        if (data.role === 'assistant' && data.say) spoken.push(data.text)
         return { status: 'ok' }
       },
     }),
@@ -451,7 +455,7 @@ test('one exchange writes every stage it reached and exactly one closing line', 
   // The two screen pushes are side commands: they may land between any two stages, so the
   // assertion is on the backbone plus their presence, not on one brittle total order.
   assert.deepEqual(stages.filter((stage) => !stage.startsWith('chat-')),
-    ['received', 'transcribed', 'delivered', 'turn-start', 'turn-end', 'split', 'synthesized', 'spoken'])
+    ['received', 'transcribed', 'delivered', 'turn-start', 'turn-end', 'split', 'synthesized'])
   assert.ok(stages.includes('chat-user'), 'the transcript reaches the screen')
   assert.ok(stages.includes('chat-assistant'), 'the answer reaches the screen')
   for (const line of lines.filter((item) => item.includes('stage='))) {
@@ -463,7 +467,7 @@ test('one exchange writes every stage it reached and exactly one closing line', 
   assert.equal(doneLines.length, 1, 'exactly one closing line per exchange')
   const done = doneLines[0]
   assert.match(done, /^\[dsh-voice] exchange trace-1 node=A059P done total=\d+ms /)
-  for (const segment of ['record: 1200', 'upload: 200', 'stt:', 'model:', 'tts:', 'play:']) {
+  for (const segment of ['record: 1200', 'upload: 200', 'stt:', 'model:', 'tts:']) {
     assert.ok(done.includes(segment), `done must carry ${segment}: ${done}`)
   }
 })
@@ -536,8 +540,10 @@ async function drive (loop, { id, dir, synth, answer = '--- # say\nготово'
   return outcome
 }
 
-function bareLoop ({ dir, synthService, nodes, lines = [] }) {
+function bareLoop ({ dir, synthService, nodes, lines = [], exchangeTimeoutMs = undefined, on = undefined }) {
   return createVoiceLoop({
+    ...(exchangeTimeoutMs === undefined ? {} : { exchangeTimeoutMs }),
+    ...(on === undefined ? {} : { on }),
     nodes,
     speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
     textToSpeech: synthService,
@@ -567,10 +573,10 @@ test('synth=device never touches the synthesizer', async (t) => {
 
   await drive(loop, { id: 'device-1', dir, synth: 'device' })
   assert.equal(synthesized, 0, 'the device engine speaks, the host does not synthesize')
-  assert.deepEqual(
-    nodes.calls.map((call) => call.method).filter((method) => method !== 'chat'),
-    ['say'],
-  )
+  const answered = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
+  assert.equal(answered.length, 1)
+  assert.equal(answered[0].data.say, true)
+  assert.equal(answered[0].data.audio, undefined, 'no audio is produced on the device path')
 })
 
 test('synth=host synthesizes, converts and plays the file', async (t) => {
@@ -591,11 +597,11 @@ test('synth=host synthesizes, converts and plays the file', async (t) => {
 
   await drive(loop, { id: 'host-1', dir, synth: 'host' })
   assert.equal(synthesized, 1)
-  const play = nodes.calls.filter((call) => call.method === 'play')
-  assert.equal(play.length, 1)
-  assert.match(play[0].data.path, /\/cache\/out\/host-1\.ogg$/)
-  assert.equal(play[0].data.seconds, 1.5)
-  assert.equal(nodes.calls.filter((call) => call.method === 'say').length, 0)
+  const answered = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
+  assert.equal(answered.length, 1)
+  assert.equal(answered[0].data.say, true)
+  assert.match(answered[0].data.audio, /\/cache\/out\/host-1\.ogg$/)
+  assert.deepEqual(nodes.calls.map((call) => call.method).filter((method) => method === 'play' || method === 'say'), [])
 
   const done = lines.find((line) => line.includes(' done '))
   assert.match(done, /synth=host/)
@@ -618,22 +624,27 @@ test('a broken synthesizer falls back to the device engine with reason=tts-faile
   })
 
   await drive(loop, { id: 'broken-1', dir, synth: 'host' })
-  assert.equal(nodes.calls.filter((call) => call.method).at(-1).method, 'say')
+  const answered = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
+  assert.equal(answered.length, 1)
+  assert.equal(answered[0].data.say, true)
+  assert.equal(answered[0].data.audio, undefined, 'no audio was produced, so the device engine speaks')
   const done = lines.find((line) => line.includes(' done '))
   assert.match(done, /reason=tts-failed/)
   assert.doesNotMatch(done, /tts:/, 'no synthesis happened, so there is no tts segment')
 })
 
-test('speaking does not hold the next exchange', async (t) => {
+test('an unanswered answer does not hold the next exchange', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-synth-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
-  let spokenResolve = null
+  let chatResolve = null
   const nodes = {
     calls: [],
     call (node, api, method, data) {
       this.calls.push({ node, api, method, data })
-      // the device reports back only when the sentence is finished — which never happens here
-      if (method === 'say') return new Promise((resolve) => { spokenResolve = resolve })
+      // the device confirms the message only after it has spoken it — which never happens here
+      if (method === 'chat' && data?.role === 'assistant') {
+        return new Promise((resolve) => { chatResolve = resolve })
+      }
       return Promise.resolve({ status: 'ok' })
     },
   }
@@ -643,9 +654,8 @@ test('speaking does not hold the next exchange', async (t) => {
     synthService: { resolve: (r) => r, synthesize: async () => ({ audio: wavBytes(), seconds: 1 }) },
   })
 
-  const first = drive(loop, { id: 'slow-1', dir, synth: 'device' })
-  await first
-  // the first `say` is still pending; a second exchange must not queue behind it
+  await drive(loop, { id: 'slow-1', dir, synth: 'device' })
+  // the first answer is still being spoken; the next press must not queue behind it
   const second = await loop.handleUpload({
     node: 19,
     nodeName: 'A059P',
@@ -654,8 +664,12 @@ test('speaking does not hold the next exchange', async (t) => {
     synth: 'device',
   })
   assert.equal(second.status, 'delivered')
-  assert.equal(nodes.calls.filter((call) => call.method === 'say').length, 1, 'the second answer is not sent while the first speaks')
-  spokenResolve?.({ status: 'ok' })
+  assert.equal(
+    nodes.calls.filter((call) => call.method === 'chat' && call.data?.role === 'assistant').length,
+    1,
+    'the second answer is not sent while the first is still being spoken',
+  )
+  chatResolve?.({ status: 'ok' })
 })
 
 test('the transcript reaches the screen with the exchange id and role user', async (t) => {
@@ -722,6 +736,100 @@ test('a failing screen push does not break the exchange or the speech', async (t
 
   const outcome = await drive(loop, { id: 'broken-screen', dir, synth: 'host' })
   assert.equal(outcome.status, 'delivered')
-  assert.equal(synthesized, 1, 'the answer is still synthesized and played')
-  assert.equal(nodes.calls.filter((call) => call.method === 'play').length, 1)
+  assert.equal(synthesized, 1, 'the answer is still synthesized')
+  const answered = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
+  assert.equal(answered.length, 1)
+  assert.match(answered[0].data.audio, /\.ogg$/, 'the audio is offered even though the screen refused')
+})
+
+/** One assistant message that asks for several tools, in order. */
+function toolCalls (...names) {
+  return {
+    type: 'assistant/message',
+    data: { turn: 1, message: { content: names.map((name) => ({ type: 'tool-call', name })) } },
+  }
+}
+
+test('the cadence counts tool calls from one and starts over on a new exchange', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-cadence-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
+  const lines = []
+  const loop = bareLoop({ dir, nodes, lines, synthService: null })
+
+  const first = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'cad-1', path: (() => { const p = join(dir, 'a.wav'); writeFileSync(p, wavBytes()); return p })() })
+  await loop.observeSessionEvent({ id: first.session }, { type: 'turn/start', data: { turn: 1 } })
+  await loop.observeSessionEvent({ id: first.session }, toolCalls('bash', 'web_search', 'nodes_call'))
+  await loop.observeSessionEvent({ id: first.session }, {
+    type: 'assistant/message',
+    data: { turn: 1, message: { content: [{ type: 'text', text: '--- # say\nготово' }] } },
+  })
+  await loop.observeSessionEvent({ id: first.session }, { type: 'turn/end', data: { turn: 1, reason: 'completed' } })
+
+  const activity = nodes.calls.filter((call) => call.method === 'activity').map((call) => call.data)
+  assert.deepEqual(activity, [
+    { n: 1, name: 'bash', id: 'cad-1' },
+    { n: 2, name: 'web_search', id: 'cad-1' },
+    { n: 3, name: 'nodes_call', id: 'cad-1' },
+  ])
+  assert.equal(lines.filter((line) => line.includes('stage=activity')).length, 3)
+
+  // a second press starts the counter again
+  const second = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'cad-2', path: (() => { const p = join(dir, 'b.wav'); writeFileSync(p, wavBytes()); return p })() })
+  await loop.observeSessionEvent({ id: second.session }, { type: 'turn/start', data: { turn: 2 } })
+  await loop.observeSessionEvent({ id: second.session }, toolCalls('bash'))
+  const secondActivity = nodes.calls.filter((call) => call.method === 'activity').at(-1).data
+  assert.deepEqual(secondActivity, { n: 1, name: 'bash', id: 'cad-2' })
+})
+
+test('a cancelled turn closes the wait and says nothing', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-cancel-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
+  const lines = []
+  const loop = bareLoop({ dir, nodes, lines, synthService: null })
+
+  const outcome = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'cancel-1', path: (() => { const p = join(dir, 'a.wav'); writeFileSync(p, wavBytes()); return p })() })
+  await loop.observeSessionEvent({ id: outcome.session }, { type: 'turn/start', data: { turn: 1 } })
+  await loop.observeSessionEvent({ id: outcome.session }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'cancelled' } } })
+
+  assert.equal(loop.awaiting.size, 0, 'the wait is gone')
+  assert.equal(nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant').length, 0, 'nothing is spoken')
+  const done = lines.find((line) => line.includes(' done '))
+  assert.match(done, /reason=cancelled/)
+})
+
+test('a disposed session releases the wait', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-disposed-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const handlers = new Map()
+  const on = (name, handler) => {
+    handlers.set(name, handler)
+    return () => handlers.delete(name)
+  }
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
+  const lines = []
+  const loop = bareLoop({ dir, nodes, lines, synthService: null, on })
+
+  const outcome = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'gone-1', path: (() => { const p = join(dir, 'a.wav'); writeFileSync(p, wavBytes()); return p })() })
+  await loop.observeSessionEvent({ id: outcome.session }, { type: 'turn/start', data: { turn: 1 } })
+  assert.equal(loop.awaiting.size, 1)
+
+  handlers.get('session/disposed')({ id: outcome.session })
+  assert.equal(loop.awaiting.size, 0)
+  assert.match(lines.find((line) => line.includes(' done ')), /reason=disposed/)
+})
+
+test('an answer that never comes is released by the deadline', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-timeout-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
+  const lines = []
+  const loop = bareLoop({ dir, nodes, lines, synthService: null, exchangeTimeoutMs: 40 })
+
+  await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'stuck-1', path: (() => { const p = join(dir, 'a.wav'); writeFileSync(p, wavBytes()); return p })() })
+  assert.equal(loop.awaiting.size, 1)
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  assert.equal(loop.awaiting.size, 0, 'the stuck exchange is released')
+  assert.match(lines.find((line) => line.includes(' done ')), /reason=timeout/)
 })
