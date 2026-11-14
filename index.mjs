@@ -293,6 +293,13 @@ function startLoop (ctx, config) {
     })
   }, { global: true })
 
+  // A report about the app: delivered as a fact, never spoken.
+  const disposeBugReport = ctx.on('dsh-nodes/bug-report', (report) => {
+    void loop.handleBugReport(report).catch((error) => {
+      log.warn?.('[dsh-voice] bug report failed:', error?.message ?? error)
+    })
+  }, { global: true })
+
   // "New session": forget which conversation this device was in. The next input creates a fresh
   // one; a running exchange is left to finish, because its words are already spoken.
   const disposeNewSession = ctx.on('dsh-nodes/voice-new-session', (event) => {
@@ -312,6 +319,9 @@ function startLoop (ctx, config) {
     } catch {}
     try {
       disposeNewSession?.()
+    } catch {}
+    try {
+      disposeBugReport?.()
     } catch {}
     loop.dispose()
   })

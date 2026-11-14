@@ -197,7 +197,7 @@ export function createVoiceLoop ({
    *
    * @param args - node, role, text, the exchange id, and the trace to stamp.
    */
-  function pushChat ({ node, role, text, speak = null, id = null, trace = null, say = null, audio = null, who = null }) {
+  function pushChat ({ node, role, text, speak = null, id = null, trace = null, say = null, audio = null, who = null, degraded = null }) {
     const body = String(text ?? '').trim()
     if (!body) return
     const stage = role === 'user' ? 'chat-user' : 'chat-assistant'
@@ -211,6 +211,7 @@ export function createVoiceLoop ({
         ...audio ? { audio } : {},
         // The screen draws the assistant's name and icon beside the line.
         ...role === 'assistant' && who?.name ? { who } : {},
+        ...degraded ? { degraded } : {},
       })
       if (pending && typeof pending.catch === 'function') {
         pending.catch((error) => log.warn?.('[dsh-voice] the screen did not take the line:', error?.message ?? error))
@@ -583,6 +584,57 @@ export function createVoiceLoop ({
   }
 
   /**
+   * A report about a broken thing on the device, delivered as a fact for the host.
+   *
+   * It is not a person speaking and not an answer to anything: the message is injected without
+   * waking an idle session (when the runner allows it) and marked with `source.bugReport`, so both
+   * the model and a later reader can tell it from a human turn. Nothing is spoken.
+   *
+   * @param report - `{node, nodeName, id, kind, text, app}` from `dsh-nodes/bug-report`.
+   * @returns `{status}` for the log.
+   */
+  async function handleBugReport (report) {
+    const nodeName = report?.nodeName ?? String(report?.node ?? '')
+    const sessionId = bindings.get(nodeName) ?? null
+    if (!sessionId) {
+      log.info?.('[dsh-voice] a bug report arrived for a node with no session', { node: nodeName, kind: report?.kind ?? null })
+      return { status: 'no-session' }
+    }
+    const lines = [
+      'отчёт с устройства: ' + (report?.kind === 'tts-failed' ? 'синтез речи не удался' : (report?.kind || 'неизвестная деградация')),
+      report?.id ? `обмен: ${report.id}` : null,
+      report?.app ? `приложение: ${report.app}` : null,
+      report?.text ? `ошибка: ${report.text}` : null,
+    ].filter(Boolean)
+    try {
+      const resolved = await sessionController.resolveAgent(sessionId)
+      if (!resolved || resolved.error || !resolved.agent) throw new Error(`сессия ${sessionId} недоступна`)
+      const built = typeof createUserMessage === 'function'
+        ? createUserMessage({
+          content: [{ type: 'text', text: lines.join('\n') }],
+          source: { kind: 'dsh-nodes', bugReport: true, device: nodeName, exchange: report?.id ?? null },
+        })
+        : null
+      const message = built ?? {
+        id: `bug-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        role: 'user',
+        content: [{ type: 'text', text: lines.join('\n') }],
+        source: { kind: 'dsh-nodes', bugReport: true, device: nodeName, exchange: report?.id ?? null },
+      }
+      // `inject` never wakes an idle driver, which is exactly what a fact needs; a runner without
+      // it still records the message through the ordinary path.
+      if (typeof resolved.agent.inject === 'function') resolved.agent.inject(message)
+      else resolved.agent.followup(message)
+      Promise.resolve(sessions?.flush?.(resolved.agent.session)).catch(() => {})
+      log.info?.('[dsh-voice] bug report delivered', { session: sessionId, kind: report?.kind ?? null })
+      return { status: 'delivered' }
+    } catch (error) {
+      log.warn?.('[dsh-voice] could not deliver the bug report:', error?.message ?? error)
+      return { status: 'failed' }
+    }
+  }
+
+  /**
    * Feed every session event here; the answer is spoken when its turn completes.
    *
    * @param session - the session the event belongs to (`session.id`).
@@ -797,6 +849,9 @@ export function createVoiceLoop ({
     const hostAudio = synth === 'host' && Boolean(spoken)
     let audioPath = null
     let audioSeconds = null
+    // The device shows the degradation to the person: a silent fallback that looks like success is
+    // worse than a slightly ugly line.
+    let degraded = null
     // Audio is rendered from what must be heard, never from what must be read.
     if (hostAudio) {
       try {
@@ -816,17 +871,18 @@ export function createVoiceLoop ({
         // The device engine is always there; a broken synthesizer costs the voice, not the answer.
         log.warn?.('[dsh-voice] synthesis failed, the device will speak:', error?.message ?? error)
         trace?.mark('tts-failed', { error: error?.message?.slice(0, 80) ?? String(error) })
+        degraded = { kind: 'tts-failed', message: String(error?.message ?? error).slice(0, 200) }
         audioPath = null
       }
     }
     if (audioPath) {
       // One command carries both halves: the line to show and the file to play. The device
       // downloads it by this command's `seq` — the only live ticket there is — and answers at once.
-      await answerCommand({ node, id, text, speak: spoken, who, audioPath, seconds: audioSeconds, trace })
+      await answerCommand({ node, id, text, speak: spoken, who, audioPath, seconds: audioSeconds, degraded, trace })
     } else {
       // No audio: the line goes to the screen and the device engine reads it, if there is anything
       // to read at all.
-      pushChat({ node, role: 'assistant', text, speak: spoken, id, say: Boolean(spoken), audio: null, who, trace })
+      pushChat({ node, role: 'assistant', text, speak: spoken, id, say: Boolean(spoken), audio: null, who, degraded, trace })
     }
     trace?.done(hostAudio && !audioPath ? 'tts-failed' : 'ok',
       { synth: audioPath ? 'host' : 'device', language })
@@ -843,13 +899,14 @@ export function createVoiceLoop ({
    *
    * @param args - node, exchange id, what to show, what to say, the persona, the file and its length.
    */
-  async function answerCommand ({ node, id, text, speak, who, audioPath, seconds, trace = null }) {
+  async function answerCommand ({ node, id, text, speak, who, audioPath, seconds, degraded = null, trace = null }) {
     const pending = nodes.call(node, 'voice', 'answer', {
       ...id ? { id } : {},
       text,
       ...speak ? { speak } : {},
       ...who?.name ? { who } : {},
       ...Number.isFinite(Number(seconds)) ? { seconds: Number(seconds) } : {},
+      ...degraded ? { degraded } : {},
       path: audioPath,
     })
     const guard = setTimeout(() => cleanup([audioPath]), AUDIO_TTL_MS)
@@ -890,6 +947,7 @@ export function createVoiceLoop ({
     handle,
     handleUpload,
     handleNewSession,
+    handleBugReport,
     observeSessionEvent,
     awaiting,
     dispose () {

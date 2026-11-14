@@ -63,6 +63,31 @@ A wait can no longer stick: any `turn/end` clears it (`cancelled` and `error` cl
 `session/disposed` clears it, and a deadline of three minutes releases the node with
 `reason=timeout`.
 
+## When the voice degrades
+
+A failed synthesis is not hidden: the answer still goes out, spoken by the device engine, and the
+message carries
+
+```json
+"degraded": { "kind": "tts-failed", "message": "silero provider has been stopped" }
+```
+
+so the screen can show it. The closing trace line says `reason=tts-failed` as before.
+
+The device can also report a degradation itself:
+`{"type":"bug-report","id":"ex-1","kind":"tts-failed","text":"…","app":"0.10.41"}` reaches
+`dsh-nodes/bug-report`, and the loop injects it into the node's session as a fact:
+
+```
+отчёт с устройства: синтез речи не удался
+обмен: ex-1
+приложение: 0.10.41
+ошибка: silero provider has been stopped
+```
+
+with `source: {kind: 'dsh-nodes', bugReport: true}`. It is injected rather than followed up, so an
+idle session is not woken, and nothing is spoken — it is a fact for the host, not a person talking.
+
 ## Where the time goes
 
 Every exchange writes one line per stage it reached, milliseconds counted from the moment the

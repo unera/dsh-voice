@@ -1272,3 +1272,97 @@ test('device mode never issues play', async (t) => {
   const answered = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
   assert.equal(answered[0].data.say, true)
 })
+
+test('a failed synthesis is visible to the person as degraded', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-degraded-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
+  const loop = createVoiceLoop({
+    nodes,
+    speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
+    textToSpeech: {
+      resolve: (r) => r,
+      synthesize: async () => { throw new Error('silero provider has been stopped') },
+    },
+    sessions: { flush: async () => {} },
+    sessionController: {
+      resolveAgent: async () => ({ agent: { followup: () => {} } }),
+      create: async () => ({ sessionId: 'session-degraded' }),
+    },
+    cacheDir: join(dir, 'cache'),
+    log: { info: () => {}, warn: () => {}, debug: () => {} },
+  })
+
+  await drive(loop, { id: 'degraded-1', dir, synth: 'host' })
+  const answered = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
+  assert.equal(answered.length, 1, 'the answer still goes out, spoken by the device')
+  assert.deepEqual(answered[0].data.degraded, {
+    kind: 'tts-failed',
+    message: 'silero provider has been stopped',
+  })
+})
+
+test('a healthy answer carries no degraded field', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-degraded-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
+  const loop = bareLoop({ dir, nodes, synthService: null })
+
+  await drive(loop, { id: 'ok-1', dir, synth: 'device' })
+  const answered = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
+  assert.equal(answered[0].data.degraded, undefined)
+})
+
+test('a bug report reaches the session marked as a fact, not spoken', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-bug-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const delivered = []
+  let injected = 0
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
+  const loop = createVoiceLoop({
+    nodes,
+    speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
+    sessions: { flush: async () => {} },
+    sessionController: {
+      resolveAgent: async () => ({
+        agent: {
+          followup: (message) => delivered.push(message),
+          inject: (message) => { injected += 1; delivered.push(message) },
+        },
+      }),
+      create: async () => ({ sessionId: 'session-bug' }),
+    },
+    cacheDir: join(dir, 'cache'),
+    log: { info: () => {}, warn: () => {}, debug: () => {} },
+  })
+
+  // bind the node to a session first: a report has nowhere to go without one
+  await loop.handleUpload({
+    node: 19,
+    nodeName: 'A059P',
+    id: 'bind-1',
+    path: (() => { const p = join(dir, 'a.wav'); writeFileSync(p, wavBytes()); return p })(),
+    seconds: 1.2,
+  })
+
+  const outcome = await loop.handleBugReport({
+    node: 19,
+    nodeName: 'A059P',
+    id: 'ex-1',
+    kind: 'tts-failed',
+    text: 'silero provider has been stopped',
+    app: '0.10.41',
+  })
+  assert.equal(outcome.status, 'delivered')
+  assert.equal(injected, 1, 'the fact is injected, so an idle session is not woken')
+
+  const report = delivered.at(-1)
+  assert.equal(report.source.bugReport, true)
+  assert.equal(report.source.kind, 'dsh-nodes')
+  assert.match(report.content[0].text, /отчёт с устройства: синтез речи не удался/)
+  assert.match(report.content[0].text, /обмен: ex-1/)
+  assert.match(report.content[0].text, /приложение: 0\.10\.41/)
+  assert.match(report.content[0].text, /ошибка: silero provider has been stopped/)
+  // nothing was spoken for it
+  assert.equal(nodes.calls.filter((call) => call.method === 'say').length, 0)
+})
