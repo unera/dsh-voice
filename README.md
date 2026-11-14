@@ -29,9 +29,9 @@ carries the speech, and the device queues it itself.
 ```
 voice.chat     {role: "user",      text: "<transcript>",         id: "<exchange id>"}
 voice.chat     {role: "assistant", text: "<# screen or # say>",  id: "<exchange id>",
-                speak: "<the # say part>", say: true,
-                audio?: "<path on the host>",
+                speak: "<the # say part>", say: true|false,
                 who?: {name: "Кеша", icon: "🦜"}}
+voice.play     {path: "…/cache/voice/out/<id>.ogg", seconds}      ← only for synth=host
 voice.activity {n, name, id}
 ```
 
@@ -41,10 +41,13 @@ line.
 
 `text` is what to show, `speak` is what to say: the screen may want the `# screen` block while the
 voice must say exactly the `# say` part. Reading the screen text aloud was how a command dump got
-spoken instead of the answer. `say: true` means "there are words to say" and is absent when `# say`
-is empty — the line is then shown and stays silent. `audio` appears only for `synth=host`, where the
-host synthesized the answer, converted it to OGG/Opus with the configured tempo, and left the
-file for the device to fetch by the `seq` of that command.
+spoken instead of the answer. `say: true` means "the device engine should read this"; it is `false`
+on the host path (the speech travels separately) and when `# say` is empty.
+
+`synth=host` needs two messages, because a chat message closes the moment the device shows it and a
+file can only be downloaded while its own command is open (`/v1/download-file` needs an issued,
+unsettled `seq`). So the line goes to the feed, and the audio goes as `voice.play` — the live
+ticket the device downloads by. The file is removed once `play` answers, with a two-minute guard.
 
 While the model works, every tool call in its message becomes one `voice.activity`, numbered from
 one inside the exchange and reset on the next press: `bash`, `web_search`, `nodes_call` — the name
