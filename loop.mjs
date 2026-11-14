@@ -819,20 +819,15 @@ export function createVoiceLoop ({
         audioPath = null
       }
     }
-    // The text goes to the screen on its own: with host audio the file needs a live command to be
-    // downloaded by, and a chat message closes immediately. So the speech is a second command.
-    pushChat({
-      node,
-      role: 'assistant',
-      text,
-      speak: spoken,
-      id,
-      say: Boolean(spoken) && !audioPath,
-      audio: null,
-      who,
-      trace,
-    })
-    if (audioPath) await playAudio({ node, path: audioPath, seconds: audioSeconds, trace })
+    if (audioPath) {
+      // One command carries both halves: the line to show and the file to play. The device
+      // downloads it by this command's `seq` — the only live ticket there is — and answers at once.
+      await answerCommand({ node, id, text, speak: spoken, who, audioPath, seconds: audioSeconds, trace })
+    } else {
+      // No audio: the line goes to the screen and the device engine reads it, if there is anything
+      // to read at all.
+      pushChat({ node, role: 'assistant', text, speak: spoken, id, say: Boolean(spoken), audio: null, who, trace })
+    }
     trace?.done(hostAudio && !audioPath ? 'tts-failed' : 'ok',
       { synth: audioPath ? 'host' : 'device', language })
     log.info?.('[dsh-voice] answered', { session: sessionId, synth: audioPath ? 'host' : 'device', speakChars: spoken.length })
@@ -840,33 +835,38 @@ export function createVoiceLoop ({
   }
 
   /**
-   * Hand one audio file to the device as its own command.
+   * Hand the answer to the device as one command that carries the line and the audio.
    *
-   * `voice.play` answers `pending` and stays open while the device downloads the file by that
-   * command's `seq` — a closed command cannot authorize a transfer. The file therefore lives until
-   * the command settles, and the timer is only a guard against a device that never answers.
+   * `voice.answer` stays open while the device downloads the file by its `seq` and then answers
+   * `{"status":"ok","payload":{"queued":true}}`; the file is removed once that answer arrives, with
+   * a timer as the guard against a device that never replies.
    *
-   * @param args - the node, the file path, its duration and the trace.
+   * @param args - node, exchange id, what to show, what to say, the persona, the file and its length.
    */
-  async function playAudio ({ node, path, seconds = null, trace = null }) {
-    if (!path) return null
-    const pending = nodes.call(node, 'voice', 'play', {
-      path,
+  async function answerCommand ({ node, id, text, speak, who, audioPath, seconds, trace = null }) {
+    const pending = nodes.call(node, 'voice', 'answer', {
+      ...id ? { id } : {},
+      text,
+      ...speak ? { speak } : {},
+      ...who?.name ? { who } : {},
       ...Number.isFinite(Number(seconds)) ? { seconds: Number(seconds) } : {},
+      path: audioPath,
     })
-    const guard = setTimeout(() => cleanup([path]), AUDIO_TTL_MS)
+    const guard = setTimeout(() => cleanup([audioPath]), AUDIO_TTL_MS)
     guard.unref?.()
     try {
       const outcome = await pending
-      if (outcome?.status !== 'ok') log.warn?.('[dsh-voice] the device did not take the audio:', outcome?.message ?? outcome?.code)
+      if (outcome?.status !== 'ok') {
+        log.warn?.('[dsh-voice] the device did not take the answer:', outcome?.message ?? outcome?.code)
+      }
+      trace?.mark('answered', { via: 'voice.answer' })
       return outcome
     } catch (error) {
-      log.warn?.('[dsh-voice] the audio command failed:', error?.message ?? error)
+      log.warn?.('[dsh-voice] the answer command failed:', error?.message ?? error)
       return null
     } finally {
-      // The device has fetched what it needed by now; keeping the file would only grow the cache.
       clearTimeout(guard)
-      cleanup([path])
+      cleanup([audioPath])
     }
   }
 

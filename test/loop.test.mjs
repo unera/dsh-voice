@@ -455,9 +455,10 @@ test('one exchange writes every stage it reached and exactly one closing line', 
   // The two screen pushes are side commands: they may land between any two stages, so the
   // assertion is on the backbone plus their presence, not on one brittle total order.
   assert.deepEqual(stages.filter((stage) => !stage.startsWith('chat-')),
-    ['received', 'stt-request', 'transcribed', 'delivered', 'turn-start', 'turn-end', 'split', 'synthesized'])
+    ['received', 'stt-request', 'transcribed', 'delivered', 'turn-start', 'turn-end', 'split', 'synthesized', 'answered'])
   assert.ok(stages.includes('chat-user'), 'the transcript reaches the screen')
-  assert.ok(stages.includes('chat-assistant'), 'the answer reaches the screen')
+  // On the host path the answer is one command that carries both halves: no separate chat line.
+  assert.ok(stages.includes('answered'), 'the answer command was sent')
   for (const line of lines.filter((item) => item.includes('stage='))) {
     assert.match(line, /^\[dsh-voice] exchange trace-1 node=A059P stage=/)
     assert.match(line, / ms=\d+/)
@@ -597,14 +598,16 @@ test('synth=host synthesizes, converts and plays the file', async (t) => {
 
   await drive(loop, { id: 'host-1', dir, synth: 'host' })
   assert.equal(synthesized, 1)
-  const answered = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
-  assert.equal(answered.length, 1)
-  assert.equal(answered[0].data.say, false, 'the text is shown, the device engine stays silent')
-  assert.equal(answered[0].data.audio, undefined, 'a chat message cannot carry a file: it closes at once')
-  const play = nodes.calls.filter((call) => call.method === 'play')
-  assert.equal(play.length, 1, 'the audio travels as its own command')
-  assert.match(play[0].data.path, /\/cache\/out\/host-1\.ogg$/)
-  assert.equal(play[0].data.seconds, 1.5)
+  const chats = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
+  assert.equal(chats.length, 0, 'one command carries both halves: no separate chat line')
+  const answers = nodes.calls.filter((call) => call.method === 'answer')
+  assert.equal(answers.length, 1, 'exactly one answer command')
+  const args = answers[0].data
+  assert.equal(args.id, 'host-1')
+  assert.equal(args.text, 'готово')
+  assert.equal(args.speak, 'готово')
+  assert.match(args.path, /\/cache\/out\/host-1\.ogg$/)
+  assert.equal(args.seconds, 1.5)
 
   const done = lines.find((line) => line.includes(' done '))
   assert.match(done, /synth=host/)
@@ -740,11 +743,9 @@ test('a failing screen push does not break the exchange or the speech', async (t
   const outcome = await drive(loop, { id: 'broken-screen', dir, synth: 'host' })
   assert.equal(outcome.status, 'delivered')
   assert.equal(synthesized, 1, 'the answer is still synthesized')
-  const answered = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
-  assert.equal(answered.length, 1)
-  const play = nodes.calls.filter((call) => call.method === 'play')
-  assert.equal(play.length, 1, 'the audio is offered even though the screen refused')
-  assert.match(play[0].data.path, /\.ogg$/)
+  const answers = nodes.calls.filter((call) => call.method === 'answer')
+  assert.equal(answers.length, 1, 'the audio is offered even though the screen refused chat')
+  assert.match(answers[0].data.path, /\.ogg$/)
 })
 
 /** One assistant message that asks for several tools, in order. */
@@ -1009,12 +1010,11 @@ test('host audio is synthesized from speak, not from the screen text', async (t)
     answer: '--- # say\nТри магазина дороже.\n--- # screen\n| магазин | цена |\n| a | 100 |',
   })
   assert.deepEqual(spoken, ['Три магазина дороже.'], 'the engine reads the spoken part only')
-  const answered = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
-  assert.equal(answered[0].data.speak, 'Три магазина дороже.')
-  assert.match(answered[0].data.text, /\| магазин \| цена \|/)
-  const play = nodes.calls.filter((call) => call.method === 'play')
-  assert.equal(play.length, 1)
-  assert.match(play[0].data.path, /\.ogg$/)
+  const answers = nodes.calls.filter((call) => call.method === 'answer')
+  assert.equal(answers.length, 1)
+  assert.equal(answers[0].data.speak, 'Три магазина дороже.')
+  assert.match(answers[0].data.text, /\| магазин \| цена \|/)
+  assert.match(answers[0].data.path, /\.ogg$/)
 })
 
 test('a new-session event drops the binding, so the next take starts a new conversation', async (t) => {
@@ -1213,21 +1213,21 @@ test('a broken assistants service does not cost the answer', async (t) => {
   assert.equal(answered[0].data.who, undefined)
 })
 
-test('the audio file lives until play answers, and is gone afterwards', async (t) => {
+test('the audio file lives until the answer command settles, and is gone afterwards', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-play-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   let seenPath = null
   let existedDuring = null
-  let resolvePlay = null
+  let resolveAnswer = null
   const nodes = {
     calls: [],
     call (node, api, method, data) {
       this.calls.push({ node, api, method, data })
-      if (method === 'play') {
+      if (method === 'answer') {
         seenPath = data.path
         existedDuring = existsSync(data.path)
         // the device downloads the file while this command is open
-        return new Promise((resolve) => { resolvePlay = () => resolve({ status: 'ok' }) })
+        return new Promise((resolve) => { resolveAnswer = () => resolve({ status: 'ok', payload: { queued: true } }) })
       }
       return Promise.resolve({ status: 'ok' })
     },
@@ -1250,16 +1250,15 @@ test('the audio file lives until play answers, and is gone afterwards', async (t
   })
 
   const exchange = drive(loop, { id: 'play-1', dir, synth: 'host' })
-  // wait for the command to be issued: synthesis plus ffmpeg take a moment
-  for (let i = 0; i < 60 && resolvePlay === null; i += 1) {
+  for (let i = 0; i < 60 && resolveAnswer === null; i += 1) {
     await new Promise((resolve) => setTimeout(resolve, 50))
   }
-  assert.ok(resolvePlay, 'the play command was issued')
+  assert.ok(resolveAnswer, 'the answer command was issued')
   assert.equal(existedDuring, true, 'the file exists while the device is fetching it')
   assert.equal(existsSync(seenPath), true)
-  resolvePlay?.()
+  resolveAnswer()
   await exchange
-  assert.equal(existsSync(seenPath), false, 'and it is removed once play answered')
+  assert.equal(existsSync(seenPath), false, 'and it is removed once the command answered')
 })
 
 test('device mode never issues play', async (t) => {

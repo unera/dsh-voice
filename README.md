@@ -14,7 +14,7 @@ package only makes the turn *legible* as spoken.
 `synth=device` (default) means the phone reads the text with its own engine — the host does no
 synthesis at all. `synth=host` means the answer must sound like our voice: the host synthesizes,
 converts the provider's WAV to OGG/Opus with the configured tempo, and hands the file to
-`voice.play`; the device fetches it by the command it answers, and the file is removed once it
+`voice.answer`; the device fetches it by the command it answers, and the file is removed once it
 has.
 
 Neither call is awaited: speaking takes as long as the sentence, and the next press must not
@@ -31,7 +31,7 @@ voice.chat     {role: "user",      text: "<transcript>",         id: "<exchange 
 voice.chat     {role: "assistant", text: "<# screen or # say>",  id: "<exchange id>",
                 speak: "<the # say part>", say: true|false,
                 who?: {name: "Кеша", icon: "🦜"}}
-voice.play     {path: "…/cache/voice/out/<id>.ogg", seconds}      ← only for synth=host
+voice.answer   {id, text, speak, who, seconds, path}               ← only for synth=host
 voice.activity {n, name, id}
 ```
 
@@ -44,10 +44,11 @@ voice must say exactly the `# say` part. Reading the screen text aloud was how a
 spoken instead of the answer. `say: true` means "the device engine should read this"; it is `false`
 on the host path (the speech travels separately) and when `# say` is empty.
 
-`synth=host` needs two messages, because a chat message closes the moment the device shows it and a
-file can only be downloaded while its own command is open (`/v1/download-file` needs an issued,
-unsettled `seq`). So the line goes to the feed, and the audio goes as `voice.play` — the live
-ticket the device downloads by. The file is removed once `play` answers, with a two-minute guard.
+`synth=host` sends one command that carries both halves: `voice.answer {id, text, speak, who,
+seconds, path}`. The device downloads the OGG by that command's own `seq` — a chat message closes
+the moment it is shown, and `/v1/download-file` needs an issued, unsettled command — then answers
+`{"status":"ok","payload":{"queued":true}}` and plays from its own queue. The host waits for
+nothing but that acknowledgement, and removes the file after it, with a two-minute guard.
 
 While the model works, every tool call in its message becomes one `voice.activity`, numbered from
 one inside the exchange and reset on the next press: `bash`, `web_search`, `nodes_call` — the name
