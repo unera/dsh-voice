@@ -191,7 +191,7 @@ export function createVoiceLoop ({
    *
    * @param args - node, role, text, the exchange id, and the trace to stamp.
    */
-  function pushChat ({ node, role, text, id = null, trace = null, say = false, audio = null }) {
+  function pushChat ({ node, role, text, speak = null, id = null, trace = null, say = false, audio = null }) {
     const body = String(text ?? '').trim()
     if (!body) return
     const stage = role === 'user' ? 'chat-user' : 'chat-assistant'
@@ -199,6 +199,7 @@ export function createVoiceLoop ({
       const pending = nodes.call(node, 'voice', 'chat', {
         role,
         text: body,
+        ...speak === null ? {} : { speak: String(speak) },
         ...id ? { id } : {},
         ...say ? { say: true } : {},
         ...audio ? { audio } : {},
@@ -209,7 +210,9 @@ export function createVoiceLoop ({
     } catch (error) {
       log.warn?.('[dsh-voice] the screen did not take the line:', error?.message ?? error)
     }
-    trace?.mark(stage)
+    // Two sizes side by side: a short `speak` next to a long `text` is normal (the screen shows
+    // details), a `speak` that does not come from the model's words is what this stage exposes.
+    trace?.mark(stage, role === 'assistant' ? { speakChars: String(speak ?? '').length, textChars: body.length } : {})
   }
 
   /** Everything that has to disappear after one exchange. */
@@ -604,8 +607,13 @@ export function createVoiceLoop ({
       return
     }
     const { speak, screen } = splitReply(text)
-    target.trace?.mark('split', { speakChars: speak.trim().length })
-    if (!speak.trim()) {
+    const spoken = speak.trim()
+    // What to show and what to say are two different things: the screen may want the `# screen`
+    // block, while the voice must say exactly what the model wrote for saying. Handing the screen
+    // text to a speech engine was how a command dump got read aloud instead of the answer.
+    const forScreen = screen?.trim() ? screen : spoken
+    target.trace?.mark('split', { speakChars: spoken.length, textChars: forScreen.length })
+    if (!spoken && !forScreen) {
       target.trace?.done('silent', { synth: target.synth ?? 'device', language })
       return
     }
@@ -613,7 +621,8 @@ export function createVoiceLoop ({
     // itself, so nothing here waits for a voice to finish.
     await answerWith({
       sessionId,
-      text: screen?.trim() ? screen : speak,
+      text: forScreen,
+      speak: spoken,
       node: target.node,
       trace: target.trace,
       synth: target.synth,
@@ -706,11 +715,13 @@ export function createVoiceLoop ({
    *
    * @param args - session, the text to show, the node, the trace, the synth mode and the id.
    */
-  async function answerWith ({ sessionId, text, node, trace = null, synth = 'device', id = null }) {
+  async function answerWith ({ sessionId, text, speak = '', node, trace = null, synth = 'device', id = null }) {
+    const spoken = String(speak ?? '').trim()
     let audioPath = null
-    if (synth === 'host') {
+    // Audio is rendered from what must be heard, never from what must be read.
+    if (synth === 'host' && spoken) {
       try {
-        const speech = await synthesize(text)
+        const speech = await synthesize(spoken)
         const wavPath = join(cacheDir, `say-${Date.now()}.wav`)
         writeFileSync(wavPath, speech.audio)
         trace?.mark('synthesized', { seconds: Number(speech.seconds?.toFixed?.(2) ?? speech.seconds) })
@@ -728,15 +739,13 @@ export function createVoiceLoop ({
         audioPath = null
       }
     }
-    pushChat({ node, role: 'assistant', text, id, say: true, audio: audioPath, trace })
+    // `say` only when there are words to say: an empty `# say` means the answer is silent.
+    pushChat({ node, role: 'assistant', text, speak: spoken, id, say: Boolean(spoken), audio: audioPath, trace })
     // The device fetches the file by the command it answers; until then it must stay.
-    if (audioPath) {
-      const settle = (async () => {})()
-      void settle
-      setTimeout(() => cleanup([audioPath]), AUDIO_TTL_MS).unref?.()
-    }
-    trace?.done(synth === 'host' && !audioPath ? 'tts-failed' : 'ok', { synth: audioPath ? 'host' : 'device', language })
-    log.info?.('[dsh-voice] answered', { session: sessionId, synth: audioPath ? 'host' : 'device' })
+    if (audioPath) setTimeout(() => cleanup([audioPath]), AUDIO_TTL_MS).unref?.()
+    trace?.done(synth === 'host' && spoken && !audioPath ? 'tts-failed' : 'ok',
+      { synth: audioPath ? 'host' : 'device', language })
+    log.info?.('[dsh-voice] answered', { session: sessionId, synth: audioPath ? 'host' : 'device', speakChars: spoken.length })
     return { answered: true }
   }
 

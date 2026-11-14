@@ -33,7 +33,10 @@ voice.chat     {role: "assistant", text: "<# screen or # say>",  id: "<exchange 
 voice.activity {n, name, id}
 ```
 
-`say: true` means "this line must be heard"; `audio` appears only for `synth=host`, where the
+`text` is what to show, `speak` is what to say: the screen may want the `# screen` block while the
+voice must say exactly the `# say` part. Reading the screen text aloud was how a command dump got
+spoken instead of the answer. `say: true` means "there are words to say" and is absent when `# say`
+is empty — the line is then shown and stays silent. `audio` appears only for `synth=host`, where the
 host synthesized the answer, converted it to OGG/Opus with the configured tempo, and left the
 file for the device to fetch by the `seq` of that command.
 

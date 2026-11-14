@@ -83,7 +83,18 @@ export function splitVoiceMarkers(text) {
     body = []
   }
 
-  for (const line of lines) {
+  for (const raw of lines) {
+    // A model that glues the marker to the sentence before it — `…процентов.--- # screen`
+    // — meant the same thing as a marker on its own line. Split it out before the
+    // line rules run, but never inside a code fence, where such text is content.
+    let line = raw
+    if (!inFence) {
+      const glued = /^(.+?)(---[ \t]*#[ \t]*[a-z]+\b.*)$/i.exec(raw)
+      if (glued && !MARKER_LINE.test(raw)) {
+        plainLines.push(glued[1])
+        line = glued[2]
+      }
+    }
     // A fence is opened and closed by the same marker; while it is open every
     // line is content, including something that looks like our marker.
     if (/^\s*```/.test(line)) inFence = !inFence

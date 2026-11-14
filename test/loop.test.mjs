@@ -937,3 +937,75 @@ test('a language the provider refuses falls back instead of losing the recording
   assert.deepEqual(asked, ['ru', null], 'the second attempt lets the service choose')
   assert.ok(warnings.some((line) => line.includes('does not take the configured language')), 'the fallback is not silent')
 })
+
+test('the message carries what to show and, separately, what to say', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-split-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
+  const lines = []
+  const loop = bareLoop({ dir, nodes, lines, synthService: null })
+
+  await drive(loop, {
+    id: 'split-1',
+    dir,
+    synth: 'device',
+    answer: '--- # say\nСвет включил.\n--- # screen\nbash: 3 files changed, 12 insertions',
+  })
+  const answered = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
+  assert.equal(answered.length, 1)
+  assert.equal(answered[0].data.text, 'bash: 3 files changed, 12 insertions')
+  assert.equal(answered[0].data.speak, 'Свет включил.')
+  assert.equal(answered[0].data.say, true)
+
+  const stage = lines.find((line) => line.includes('stage=chat-assistant'))
+  assert.match(stage, /speakChars=13/)
+  assert.match(stage, /textChars=36/)
+})
+
+test('an empty # say means the answer is shown but not spoken', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-split-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
+  const loop = bareLoop({ dir, nodes, synthService: null })
+
+  await drive(loop, { id: 'silent-say', dir, synth: 'device', answer: '--- # screen\nТолько текст на экране.' })
+  const answered = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
+  assert.equal(answered.length, 1, 'the screen still gets its line')
+  assert.equal(answered[0].data.text, 'Только текст на экране.')
+  assert.equal(answered[0].data.say, undefined, 'no say:true without words to say')
+})
+
+test('host audio is synthesized from speak, not from the screen text', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-split-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const spoken = []
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
+  const loop = createVoiceLoop({
+    nodes,
+    speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'сравни' }) },
+    textToSpeech: {
+      snapshot: () => ({ selection: { speed: 1 } }),
+      resolve: (r) => r,
+      synthesize: async (spec) => { spoken.push(spec.text); return { audio: wavBytes(), seconds: 1 } },
+    },
+    sessions: { flush: async () => {} },
+    sessionController: {
+      resolveAgent: async () => ({ agent: { followup: () => {} } }),
+      create: async () => ({ sessionId: 'session-tts-split' }),
+    },
+    cacheDir: join(dir, 'cache'),
+    log: { info: () => {}, warn: () => {}, debug: () => {} },
+  })
+
+  await drive(loop, {
+    id: 'tts-split',
+    dir,
+    synth: 'host',
+    answer: '--- # say\nТри магазина дороже.\n--- # screen\n| магазин | цена |\n| a | 100 |',
+  })
+  assert.deepEqual(spoken, ['Три магазина дороже.'], 'the engine reads the spoken part only')
+  const answered = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
+  assert.equal(answered[0].data.speak, 'Три магазина дороже.')
+  assert.match(answered[0].data.text, /\| магазин \| цена \|/)
+  assert.match(answered[0].data.audio, /\.ogg$/)
+})
