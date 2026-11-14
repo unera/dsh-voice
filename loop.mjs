@@ -146,6 +146,9 @@ export function createVoiceLoop ({
   cacheDir,
   log = console,
   createUserMessage = null,
+  // Who is talking: the assistants service names the persona for a session. Optional — a Host
+  // without that plugin simply shows no name.
+  assistants = null,
   on = null,
   emit = null,
   exchangeTimeoutMs = EXCHANGE_TIMEOUT_MS,
@@ -194,7 +197,7 @@ export function createVoiceLoop ({
    *
    * @param args - node, role, text, the exchange id, and the trace to stamp.
    */
-  function pushChat ({ node, role, text, speak = null, id = null, trace = null, say = false, audio = null }) {
+  function pushChat ({ node, role, text, speak = null, id = null, trace = null, say = false, audio = null, who = null }) {
     const body = String(text ?? '').trim()
     if (!body) return
     const stage = role === 'user' ? 'chat-user' : 'chat-assistant'
@@ -206,6 +209,8 @@ export function createVoiceLoop ({
         ...id ? { id } : {},
         ...say ? { say: true } : {},
         ...audio ? { audio } : {},
+        // The screen draws the assistant's name and icon beside the line.
+        ...role === 'assistant' && who?.name ? { who } : {},
       })
       if (pending && typeof pending.catch === 'function') {
         pending.catch((error) => log.warn?.('[dsh-voice] the screen did not take the line:', error?.message ?? error))
@@ -216,6 +221,24 @@ export function createVoiceLoop ({
     // Two sizes side by side: a short `speak` next to a long `text` is normal (the screen shows
     // details), a `speak` that does not come from the model's words is what this stage exposes.
     trace?.mark(stage, role === 'assistant' ? { speakChars: String(speak ?? '').length, textChars: body.length } : {})
+  }
+
+  /**
+   * The assistant's name for this session, asked at most once per exchange.
+   *
+   * @param sessionId - the session whose persona to read.
+   * @returns `{name, icon}` or null when nobody is assigned or the service is absent.
+   */
+  function whoFor (sessionId) {
+    if (!assistants?.personaOf || !sessionId) return null
+    try {
+      const persona = assistants.personaOf(sessionId)?.assistant
+      if (!persona?.name) return null
+      return persona.icon ? { name: persona.name, icon: persona.icon } : { name: persona.name }
+    } catch (error) {
+      log.warn?.('[dsh-voice] could not read the assistant name:', error?.message ?? error)
+      return null
+    }
   }
 
   /** Everything that has to disappear after one exchange. */
@@ -438,6 +461,7 @@ export function createVoiceLoop ({
     // answer to the *previous* question is what gets spoken.
     awaiting.set(sessionId, watchForAnswer({
       sessionId, node: nodeName, mode: want?.mode ?? 'ptt', trace, synth: 'device',
+      who: whoFor(sessionId),
     }))
     try {
       await deliver({ sessionId, text, node: nodeName, mode: want?.mode ?? 'ptt' })
@@ -539,6 +563,7 @@ export function createVoiceLoop ({
     // quickly would otherwise finish before anyone awaits it.
     awaiting.set(sessionId, watchForAnswer({
       sessionId, node: nodeName, mode: event?.mode ?? 'upload', trace, synth: event?.synth ?? 'device',
+      who: whoFor(sessionId),
     }))
     try {
       await deliver({ sessionId, text, node: nodeName, mode: 'upload' })
@@ -629,6 +654,7 @@ export function createVoiceLoop ({
       node: target.node,
       trace: target.trace,
       synth: target.synth,
+      who: target.who ?? null,
       id: target.trace?.id ?? null,
     })
   }
@@ -766,7 +792,7 @@ export function createVoiceLoop ({
    *
    * @param args - session, the text to show, the node, the trace, the synth mode and the id.
    */
-  async function answerWith ({ sessionId, text, speak = '', node, trace = null, synth = 'device', id = null }) {
+  async function answerWith ({ sessionId, text, speak = '', node, trace = null, synth = 'device', who = null, id = null }) {
     const spoken = String(speak ?? '').trim()
     let audioPath = null
     // Audio is rendered from what must be heard, never from what must be read.
@@ -791,7 +817,7 @@ export function createVoiceLoop ({
       }
     }
     // `say` only when there are words to say: an empty `# say` means the answer is silent.
-    pushChat({ node, role: 'assistant', text, speak: spoken, id, say: Boolean(spoken), audio: audioPath, trace })
+    pushChat({ node, role: 'assistant', text, speak: spoken, id, say: Boolean(spoken), audio: audioPath, who, trace })
     // The device fetches the file by the command it answers; until then it must stay.
     if (audioPath) setTimeout(() => cleanup([audioPath]), AUDIO_TTL_MS).unref?.()
     trace?.done(synth === 'host' && spoken && !audioPath ? 'tts-failed' : 'ok',

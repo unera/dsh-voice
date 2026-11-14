@@ -1089,3 +1089,119 @@ test('a reset during a running exchange waits for it to finish', async (t) => {
   assert.equal(created, 2)
   assert.equal(second.session, 'session-2')
 })
+
+/** A loop whose only extra is the assistants service and a counter of its calls. */
+function loopWithAssistants ({ dir, persona, calls = [] }) {
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
+  return {
+    nodes,
+    loop: createVoiceLoop({
+      nodes,
+      assistants: {
+        personaOf (sessionId) {
+          calls.push(sessionId)
+          return typeof persona === 'function' ? persona(sessionId) : persona
+        },
+      },
+      speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
+      sessions: { flush: async () => {} },
+      sessionController: {
+        resolveAgent: async () => ({ agent: { followup: () => {} } }),
+        create: async () => ({ sessionId: 'session-who' }),
+      },
+      cacheDir: join(dir, 'cache'),
+      log: { info: () => {}, warn: () => {}, debug: () => {} },
+    }),
+  }
+}
+
+test('the assistant name and icon travel with the answer, asked once per exchange', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-who-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const asked = []
+  const { nodes, loop } = loopWithAssistants({
+    dir,
+    calls: asked,
+    persona: { assistant: { id: 'a-kesha', name: 'Кеша', icon: '🦜' }, user: null, transport: 'nodes' },
+  })
+
+  await drive(loop, { id: 'who-1', dir, synth: 'device' })
+  const answered = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
+  assert.equal(answered.length, 1)
+  assert.deepEqual(answered[0].data.who, { name: 'Кеша', icon: '🦜' })
+
+  const userLine = nodes.calls.find((call) => call.method === 'chat' && call.data.role === 'user')
+  assert.equal(userLine.data.who, undefined, 'the person needs no label')
+  assert.equal(asked.length, 1, 'one lookup per exchange, not per message')
+})
+
+test('an assistant without an icon sends only the name', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-who-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const { nodes, loop } = loopWithAssistants({
+    dir,
+    persona: { assistant: { id: 'a-plain', name: 'Плейн', icon: '' }, user: null, transport: 'nodes' },
+  })
+
+  await drive(loop, { id: 'who-2', dir, synth: 'device' })
+  const answered = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
+  assert.deepEqual(answered[0].data.who, { name: 'Плейн' })
+})
+
+test('without the assistants service there is no who at all', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-who-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
+  const loop = createVoiceLoop({
+    nodes,
+    speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
+    sessions: { flush: async () => {} },
+    sessionController: {
+      resolveAgent: async () => ({ agent: { followup: () => {} } }),
+      create: async () => ({ sessionId: 'session-no-service' }),
+    },
+    cacheDir: join(dir, 'cache'),
+    log: { info: () => {}, warn: () => {}, debug: () => {} },
+  })
+
+  await drive(loop, { id: 'who-3', dir, synth: 'device' })
+  const answered = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
+  assert.equal(answered.length, 1)
+  assert.equal(answered[0].data.who, undefined, 'a Host without the service still answers')
+})
+
+test('an assistant that is not assigned leaves who out', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-who-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const { nodes, loop } = loopWithAssistants({
+    dir,
+    persona: { assistant: null, user: null, transport: 'nodes' },
+  })
+  await drive(loop, { id: 'who-4', dir, synth: 'device' })
+  const answered = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
+  assert.equal(answered.length, 1)
+  assert.equal(answered[0].data.who, undefined)
+})
+
+test('a broken assistants service does not cost the answer', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-who-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
+  const loop = createVoiceLoop({
+    nodes,
+    assistants: { personaOf: () => { throw new Error('rules are broken') } },
+    speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
+    sessions: { flush: async () => {} },
+    sessionController: {
+      resolveAgent: async () => ({ agent: { followup: () => {} } }),
+      create: async () => ({ sessionId: 'session-broken-who' }),
+    },
+    cacheDir: join(dir, 'cache'),
+    log: { info: () => {}, warn: () => {}, debug: () => {} },
+  })
+
+  await drive(loop, { id: 'who-5', dir, synth: 'device' })
+  const answered = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
+  assert.equal(answered.length, 1)
+  assert.equal(answered[0].data.who, undefined)
+})

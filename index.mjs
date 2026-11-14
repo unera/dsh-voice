@@ -250,6 +250,8 @@ function startLoop (ctx, config) {
     nodes,
     speechToText: service(ctx, 'speechToText'),
     textToSpeech: service(ctx, 'textToSpeech'),
+    // Optional: names the assistant on the device screen. Absent on a Host without it.
+    assistants: service(ctx, 'assistants'),
     sessions: service(ctx, 'sessions'),
     sessionController: service(ctx, 'sessionController'),
     cacheDir: cacheDirectory(config),

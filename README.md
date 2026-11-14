@@ -29,9 +29,15 @@ carries the speech, and the device queues it itself.
 ```
 voice.chat     {role: "user",      text: "<transcript>",         id: "<exchange id>"}
 voice.chat     {role: "assistant", text: "<# screen or # say>",  id: "<exchange id>",
-                say: true, audio?: "<path on the host>"}
+                speak: "<the # say part>", say: true,
+                audio?: "<path on the host>",
+                who?: {name: "Кеша", icon: "🦜"}}
 voice.activity {n, name, id}
 ```
+
+`who` is the assistant's name and icon from the `assistants` service, read once per exchange; it is
+absent when that plugin is not installed or nobody is assigned, and never set on the person's own
+line.
 
 `text` is what to show, `speak` is what to say: the screen may want the `# screen` block while the
 voice must say exactly the `# say` part. Reading the screen text aloud was how a command dump got
