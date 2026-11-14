@@ -197,7 +197,7 @@ export function createVoiceLoop ({
    *
    * @param args - node, role, text, the exchange id, and the trace to stamp.
    */
-  function pushChat ({ node, role, text, speak = null, id = null, trace = null, say = false, audio = null, who = null }) {
+  function pushChat ({ node, role, text, speak = null, id = null, trace = null, say = null, audio = null, who = null }) {
     const body = String(text ?? '').trim()
     if (!body) return
     const stage = role === 'user' ? 'chat-user' : 'chat-assistant'
@@ -207,7 +207,7 @@ export function createVoiceLoop ({
         text: body,
         ...speak === null ? {} : { speak: String(speak) },
         ...id ? { id } : {},
-        ...say ? { say: true } : {},
+        ...typeof say === 'boolean' ? { say } : {},
         ...audio ? { audio } : {},
         // The screen draws the assistant's name and icon beside the line.
         ...role === 'assistant' && who?.name ? { who } : {},
@@ -794,14 +794,17 @@ export function createVoiceLoop ({
    */
   async function answerWith ({ sessionId, text, speak = '', node, trace = null, synth = 'device', who = null, id = null }) {
     const spoken = String(speak ?? '').trim()
+    const hostAudio = synth === 'host' && Boolean(spoken)
     let audioPath = null
+    let audioSeconds = null
     // Audio is rendered from what must be heard, never from what must be read.
-    if (synth === 'host' && spoken) {
+    if (hostAudio) {
       try {
         const speech = await synthesize(spoken)
+        audioSeconds = Number(speech.seconds?.toFixed?.(2) ?? speech.seconds)
         const wavPath = join(cacheDir, `say-${Date.now()}.wav`)
         writeFileSync(wavPath, speech.audio)
-        trace?.mark('synthesized', { seconds: Number(speech.seconds?.toFixed?.(2) ?? speech.seconds) })
+        trace?.mark('synthesized', { seconds: audioSeconds })
         mkdirSync(outputDir, { recursive: true })
         audioPath = join(outputDir, `${id ?? Date.now()}.ogg`)
         try {
@@ -816,14 +819,55 @@ export function createVoiceLoop ({
         audioPath = null
       }
     }
-    // `say` only when there are words to say: an empty `# say` means the answer is silent.
-    pushChat({ node, role: 'assistant', text, speak: spoken, id, say: Boolean(spoken), audio: audioPath, who, trace })
-    // The device fetches the file by the command it answers; until then it must stay.
-    if (audioPath) setTimeout(() => cleanup([audioPath]), AUDIO_TTL_MS).unref?.()
-    trace?.done(synth === 'host' && spoken && !audioPath ? 'tts-failed' : 'ok',
+    // The text goes to the screen on its own: with host audio the file needs a live command to be
+    // downloaded by, and a chat message closes immediately. So the speech is a second command.
+    pushChat({
+      node,
+      role: 'assistant',
+      text,
+      speak: spoken,
+      id,
+      say: Boolean(spoken) && !audioPath,
+      audio: null,
+      who,
+      trace,
+    })
+    if (audioPath) await playAudio({ node, path: audioPath, seconds: audioSeconds, trace })
+    trace?.done(hostAudio && !audioPath ? 'tts-failed' : 'ok',
       { synth: audioPath ? 'host' : 'device', language })
     log.info?.('[dsh-voice] answered', { session: sessionId, synth: audioPath ? 'host' : 'device', speakChars: spoken.length })
     return { answered: true }
+  }
+
+  /**
+   * Hand one audio file to the device as its own command.
+   *
+   * `voice.play` answers `pending` and stays open while the device downloads the file by that
+   * command's `seq` — a closed command cannot authorize a transfer. The file therefore lives until
+   * the command settles, and the timer is only a guard against a device that never answers.
+   *
+   * @param args - the node, the file path, its duration and the trace.
+   */
+  async function playAudio ({ node, path, seconds = null, trace = null }) {
+    if (!path) return null
+    const pending = nodes.call(node, 'voice', 'play', {
+      path,
+      ...Number.isFinite(Number(seconds)) ? { seconds: Number(seconds) } : {},
+    })
+    const guard = setTimeout(() => cleanup([path]), AUDIO_TTL_MS)
+    guard.unref?.()
+    try {
+      const outcome = await pending
+      if (outcome?.status !== 'ok') log.warn?.('[dsh-voice] the device did not take the audio:', outcome?.message ?? outcome?.code)
+      return outcome
+    } catch (error) {
+      log.warn?.('[dsh-voice] the audio command failed:', error?.message ?? error)
+      return null
+    } finally {
+      // The device has fetched what it needed by now; keeping the file would only grow the cache.
+      clearTimeout(guard)
+      cleanup([path])
+    }
   }
 
   if (typeof on === 'function') {
