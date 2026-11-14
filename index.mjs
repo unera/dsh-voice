@@ -252,6 +252,10 @@ function startLoop (ctx, config) {
     sessionController: service(ctx, 'sessionController'),
     cacheDir: cacheDirectory(config),
     log,
+    // Named, not inherited from the host default: `auto` lets a short noisy take drift into
+    // another language, and the transcript then reaches the session as the person's own words.
+    language: typeof config.language === 'string' && config.language.trim() ? config.language.trim() : 'ru',
+    ...typeof config.minSeconds === 'number' && config.minSeconds > 0 ? { minSeconds: config.minSeconds } : {},
     on: (name, handler) => ctx.on(name, handler, { global: true }),
     // The loop announces the binding of a fresh session before creating it, the
     // way a messenger does, so dsh-assistants knows the transport and the device.

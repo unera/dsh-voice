@@ -123,7 +123,7 @@ test('a silent take is answered out loud and never reaches a session', async (t)
   writeFileSync(take, wavBytes())
 
   const nodes = stubNodes({
-    'voice.record': { status: 'ok', payload: { path: '/device/a.wav', seconds: 0.2 } },
+    'voice.record': { status: 'ok', payload: { path: '/device/a.wav', seconds: 1.4 } },
     'files.copyFromDevice': async ({ data }) => {
       writeFileSync(data.hostPath, wavBytes())
       return { status: 'ok' }
@@ -455,7 +455,7 @@ test('one exchange writes every stage it reached and exactly one closing line', 
   // The two screen pushes are side commands: they may land between any two stages, so the
   // assertion is on the backbone plus their presence, not on one brittle total order.
   assert.deepEqual(stages.filter((stage) => !stage.startsWith('chat-')),
-    ['received', 'transcribed', 'delivered', 'turn-start', 'turn-end', 'split', 'synthesized'])
+    ['received', 'stt-request', 'transcribed', 'delivered', 'turn-start', 'turn-end', 'split', 'synthesized'])
   assert.ok(stages.includes('chat-user'), 'the transcript reaches the screen')
   assert.ok(stages.includes('chat-assistant'), 'the answer reaches the screen')
   for (const line of lines.filter((item) => item.includes('stage='))) {
@@ -832,4 +832,108 @@ test('an answer that never comes is released by the deadline', async (t) => {
   await new Promise((resolve) => setTimeout(resolve, 80))
   assert.equal(loop.awaiting.size, 0, 'the stuck exchange is released')
   assert.match(lines.find((line) => line.includes(' done ')), /reason=timeout/)
+})
+
+test('a recording shorter than the threshold never reaches the recognizer', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-short-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const take = join(dir, 'click.wav')
+  writeFileSync(take, wavBytes())
+
+  let transcribed = 0
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
+  const lines = []
+  const loop = createVoiceLoop({
+    nodes,
+    speechToText: { resolve: (r) => r, transcribe: async () => { transcribed += 1; return { text: '良いです。' } } },
+    sessions: { flush: async () => {} },
+    sessionController: {
+      resolveAgent: async () => ({ agent: { followup: () => {} } }),
+      create: async () => ({ sessionId: 'session-short' }),
+    },
+    cacheDir: join(dir, 'cache'),
+    minSeconds: 0.4,
+    log: { info: (line) => lines.push(line), warn: () => {}, debug: () => {} },
+  })
+
+  const outcome = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'click-1', path: take, seconds: 0.216 })
+  assert.equal(outcome.status, 'too-short')
+  assert.equal(transcribed, 0, 'a button click is not speech')
+  assert.equal(existsSync(take), false, 'the file is removed')
+  assert.equal(nodes.calls.filter((call) => call.method === 'chat').length, 0, 'nothing is shown')
+  assert.equal(nodes.calls.filter((call) => call.method === 'say').length, 0, 'and nothing is said')
+  assert.match(lines.find((line) => line.includes(' done ')), /reason=too-short/)
+})
+
+test('the configured language is what the recognizer is asked for', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-lang-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const take = join(dir, 'take.wav')
+  writeFileSync(take, wavBytes())
+
+  const asked = []
+  const lines = []
+  const loop = createVoiceLoop({
+    nodes: stubNodes({ 'voice.chat': { status: 'ok' } }),
+    speechToText: {
+      resolve: (request) => { asked.push(request.language); return { ...request, provider: { info: { id: 'openai-transcribe' } } } },
+      transcribe: async () => ({ text: 'привет' }),
+    },
+    sessions: { flush: async () => {} },
+    sessionController: {
+      resolveAgent: async () => ({ agent: { followup: () => {} } }),
+      create: async () => ({ sessionId: 'session-lang' }),
+    },
+    cacheDir: join(dir, 'cache'),
+    language: 'ru',
+    log: { info: (line) => lines.push(line), warn: () => {}, debug: () => {} },
+  })
+
+  const outcome = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'lang-1', path: take, seconds: 1.2 })
+  // finish the turn: the closing line is written when the answer is dispatched
+  await loop.observeSessionEvent({ id: outcome.session }, { type: 'turn/start', data: { turn: 1 } })
+  await loop.observeSessionEvent({ id: outcome.session }, {
+    type: 'assistant/message',
+    data: { turn: 1, message: { content: [{ type: 'text', text: '--- # say\nготово' }] } },
+  })
+  await loop.observeSessionEvent({ id: outcome.session }, { type: 'turn/end', data: { turn: 1, reason: 'completed' } })
+  assert.deepEqual(asked, ['ru'])
+  const sttRequest = lines.find((line) => line.includes('stage=stt-request'))
+  assert.match(sttRequest, /provider=openai-transcribe/)
+  assert.match(sttRequest, /language=ru/)
+  assert.match(lines.find((line) => line.includes(' done ')), /language=ru/)
+})
+
+test('a language the provider refuses falls back instead of losing the recording', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-lang-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const take = join(dir, 'take.wav')
+  writeFileSync(take, wavBytes())
+
+  const asked = []
+  const warnings = []
+  const loop = createVoiceLoop({
+    nodes: stubNodes({ 'voice.chat': { status: 'ok' } }),
+    speechToText: {
+      resolve: (request) => {
+        asked.push(request.language ?? null)
+        if (request.language === 'ru') throw new Error('provider does not support ru')
+        return request
+      },
+      transcribe: async () => ({ text: 'привет' }),
+    },
+    sessions: { flush: async () => {} },
+    sessionController: {
+      resolveAgent: async () => ({ agent: { followup: () => {} } }),
+      create: async () => ({ sessionId: 'session-fallback' }),
+    },
+    cacheDir: join(dir, 'cache'),
+    language: 'ru',
+    log: { info: () => {}, warn: (line) => warnings.push(line), debug: () => {} },
+  })
+
+  const outcome = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'fallback-1', path: take, seconds: 1.2 })
+  assert.equal(outcome.status, 'delivered')
+  assert.deepEqual(asked, ['ru', null], 'the second attempt lets the service choose')
+  assert.ok(warnings.some((line) => line.includes('does not take the configured language')), 'the fallback is not silent')
 })

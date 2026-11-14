@@ -33,6 +33,16 @@ const AUDIO_TTL_MS = 120_000
  * nobody would ever end.
  */
 const EXCHANGE_TIMEOUT_MS = 180_000
+/** The language we ask the recognizer for, unless the host says otherwise. */
+const DEFAULT_LANGUAGE = 'ru'
+/**
+ * Below this a recording is a button click, not speech.
+ *
+ * A 0.2-second take has almost no signal in it, and a recognizer asked to decode noise happily
+ * answers in whatever language its model drifts to — that is how a cough became a Japanese
+ * sentence and went into the session as the person's words.
+ */
+const MIN_SECONDS = 0.4
 /** What we say when the recording produced no words. */
 const NOT_HEARD = 'Не расслышал, повтори пожалуйста.'
 
@@ -139,6 +149,8 @@ export function createVoiceLoop ({
   on = null,
   emit = null,
   exchangeTimeoutMs = EXCHANGE_TIMEOUT_MS,
+  language = DEFAULT_LANGUAGE,
+  minSeconds = MIN_SECONDS,
 }) {
   /** One entry per node that is currently being talked to. */
   const active = new Map()
@@ -217,10 +229,21 @@ export function createVoiceLoop ({
   }
 
   /** Ask the device how much of the words it heard. */
-  async function transcribe (audioPath) {
+  async function transcribe (audioPath, trace = null) {
     if (!speechToText) throw Object.assign(new Error('speech recognition is not installed'), { code: 'no_speech' })
     const audio = readFileSync(audioPath)
-    const spec = speechToText.resolve({ audio })
+    // The language is named, not inherited: a Host default of `auto` lets a short noisy take drift
+    // into any language the model likes, and the person's words are then translated by accident.
+    let spec = null
+    try {
+      spec = speechToText.resolve({ audio, language })
+    } catch (error) {
+      // A provider that does not take this language is not an emergency: say so and let the
+      // service pick its own default rather than losing the recording.
+      log.warn?.('[dsh-voice] the recognizer does not take the configured language:', error?.message ?? error)
+      spec = speechToText.resolve({ audio })
+    }
+    trace?.mark('stt-request', { provider: spec?.provider?.info?.id ?? 'default', language })
     return await speechToText.transcribe(spec, new AbortController().signal)
   }
 
@@ -361,7 +384,7 @@ export function createVoiceLoop ({
       active.delete(nodeName)
       log.info?.('[dsh-voice] no recording', { node: nodeName, code: record?.code ?? record?.status })
       if (record?.code === 'voice_timeout') await say(nodeName, 'Не услышал попробуй ещё раз.')
-      trace.done('no-recording', { code: record?.code ?? null })
+      trace.done('no-recording', { code: record?.code ?? null, language })
       return { status: 'no-recording', code: record?.code ?? null }
     }
     const devicePath = record.payload.path
@@ -374,12 +397,19 @@ export function createVoiceLoop ({
       cleanup([localPath])
       log.warn?.('[dsh-voice] the recording did not arrive', { node: nodeName, message: copy?.message })
       await say(nodeName, 'Не смог забрать запись.')
-      trace.done('no-copy')
+      trace.done('no-copy', { language })
       return { status: 'no-copy' }
+    }
+    const recordedSeconds = Number(record.payload.seconds)
+    if (Number.isFinite(recordedSeconds) && recordedSeconds > 0 && recordedSeconds < minSeconds) {
+      active.delete(nodeName)
+      cleanup([localPath])
+      trace.done('too-short', { language, seconds: recordedSeconds })
+      return { status: 'too-short', code: 'too-short' }
     }
     let text = ''
     try {
-      const transcript = await transcribe(localPath)
+      const transcript = await transcribe(localPath, trace)
       text = String(typeof transcript === 'string' ? transcript : transcript?.text ?? '').trim()
     } catch (error) {
       log.warn?.('[dsh-voice] transcription failed:', error?.message ?? error)
@@ -392,7 +422,7 @@ export function createVoiceLoop ({
       active.delete(nodeName)
       cleanup([localPath])
       await say(nodeName, NOT_HEARD)
-      trace.done('empty')
+      trace.done('empty', { language })
       return { status: 'empty' }
     }
     const sessionId = await sessionFor(nodeName, want?.sessionId ?? null, want?.node ?? null)
@@ -412,7 +442,7 @@ export function createVoiceLoop ({
       awaiting.delete(sessionId)
       log.warn?.('[dsh-voice] delivery failed:', error?.message ?? error)
       await say(nodeName, 'Не смог передать запрос.')
-      trace.done('no-session')
+      trace.done('no-session', { language })
       return { status: 'no-session' }
     }
     cleanup([localPath])
@@ -474,9 +504,17 @@ export function createVoiceLoop ({
   async function exchangeFromFile (event, nodeName) {
     const trace = createTrace({ id: event?.id ?? null, node: nodeName, at: event?.at ?? null, log })
     trace.mark('received')
+    const seconds = Number(event?.seconds)
+    if (Number.isFinite(seconds) && seconds > 0 && seconds < minSeconds) {
+      // Nothing worth recognizing: the file goes, the session stays untouched, and the device is
+      // told nothing — the person knows they only brushed the button.
+      cleanup([event.path])
+      trace.done('too-short', { language, seconds })
+      return { status: 'too-short', id: event?.id ?? null, seconds }
+    }
     let text = ''
     try {
-      const transcript = await transcribe(event.path)
+      const transcript = await transcribe(event.path, trace)
       text = String(typeof transcript === 'string' ? transcript : transcript?.text ?? '').trim()
     } catch (error) {
       log.warn?.('[dsh-voice] transcription failed:', error?.message ?? error)
@@ -486,7 +524,7 @@ export function createVoiceLoop ({
     if (!text) {
       cleanup([event.path])
       await say(nodeName, NOT_HEARD)
-      trace.done('empty')
+      trace.done('empty', { language })
       return { status: 'empty', id: event?.id ?? null }
     }
     const sessionId = await sessionFor(nodeName, event?.sessionId ?? null, event?.node ?? null)
@@ -505,7 +543,7 @@ export function createVoiceLoop ({
       cleanup([event.path])
       log.warn?.('[dsh-voice] delivery failed:', error?.message ?? error)
       await say(nodeName, 'Не смог передать запрос.')
-      trace.done('no-session')
+      trace.done('no-session', { language })
       return { status: 'no-session' }
     }
     // The recording has done its job: keeping it would only grow the cache.
@@ -562,13 +600,13 @@ export function createVoiceLoop ({
     if (reason !== 'completed') {
       // A cancelled or failed turn is closed, not spoken: there is no answer to read, and a
       // stale wait would hold the device until the next press.
-      target.trace?.done(reason, { synth: target.synth ?? 'device' })
+      target.trace?.done(reason, { synth: target.synth ?? 'device', language })
       return
     }
     const { speak, screen } = splitReply(text)
     target.trace?.mark('split', { speakChars: speak.trim().length })
     if (!speak.trim()) {
-      target.trace?.done('silent', { synth: target.synth ?? 'device' })
+      target.trace?.done('silent', { synth: target.synth ?? 'device', language })
       return
     }
     // The answer travels as one chat message that carries the speech: the device queues it
@@ -610,7 +648,7 @@ export function createVoiceLoop ({
       const stuck = finishAwaiting(entry.sessionId)
       if (!stuck) return
       stuck.trace?.mark('turn-end', { reason: 'timeout' })
-      stuck.trace?.done('timeout', { synth: stuck.synth ?? 'device' })
+      stuck.trace?.done('timeout', { synth: stuck.synth ?? 'device', language })
       log.warn?.('[dsh-voice] the answer never came, releasing the exchange', { session: entry.sessionId })
     }, exchangeTimeoutMs)
     record.timer.unref?.()
@@ -697,7 +735,7 @@ export function createVoiceLoop ({
       void settle
       setTimeout(() => cleanup([audioPath]), AUDIO_TTL_MS).unref?.()
     }
-    trace?.done(synth === 'host' && !audioPath ? 'tts-failed' : 'ok', { synth: audioPath ? 'host' : 'device' })
+    trace?.done(synth === 'host' && !audioPath ? 'tts-failed' : 'ok', { synth: audioPath ? 'host' : 'device', language })
     log.info?.('[dsh-voice] answered', { session: sessionId, synth: audioPath ? 'host' : 'device' })
     return { answered: true }
   }
@@ -713,7 +751,7 @@ export function createVoiceLoop ({
       const sessionId = session?.id ?? session?.sessionId ?? null
       if (!sessionId) return
       const gone = finishAwaiting(sessionId)
-      gone?.trace?.done('disposed', { synth: gone.synth ?? 'device' })
+      gone?.trace?.done('disposed', { synth: gone.synth ?? 'device', language })
     })
     if (typeof disposeDisposed === 'function') disposers.push(disposeDisposed)
   }

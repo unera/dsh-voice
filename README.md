@@ -72,6 +72,20 @@ event arrived, and exactly one closing line with the deltas:
 server's `receivedAt`); a segment that never happened is absent from the line, not a zero. A
 failed exchange closes with `reason=empty`, `reason=no-session`, `reason=silent` and so on.
 
+## Language and silence
+
+The recognizer is asked for a named language (`language`, `ru` by default), not for whatever the
+host default happens to be: a Host left on `auto` decodes a 0.2-second cough into whatever its
+model drifts to — a Japanese sentence once reached a session as the person's own words. A provider
+that refuses the language is a warning and a fallback to the service default, never a lost
+recording.
+
+A take shorter than `minSeconds` (0.4 by default) is not speech at all: the file is removed, the
+session is untouched, the device is told nothing, and the closing line says `reason=too-short`.
+
+Both facts are visible in the trace: `stage=stt-request provider=… language=…`, and `language=…`
+in the closing line.
+
 ## Two ways a recording arrives
 
 | path | who starts it | what the loop calls |
