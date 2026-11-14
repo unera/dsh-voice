@@ -106,3 +106,10 @@ test('readVoiceMarkup keeps text that follows the transcript', () => {
   const read = readVoiceMarkup('--- # voice\nвключи свет\n--- # screen\nв кухне\n')
   assert.equal(read.text, 'включи свет\n\nв кухне')
 })
+
+test('a marker glued to the sentence before it still splits', () => {
+  const reply = splitReply('Пятьдесят семь процентов.--- # screen\n```\n/dev/sda1 40G\n```')
+  assert.equal(reply.speak, 'Пятьдесят семь процентов.')
+  assert.match(reply.screen, /\/dev\/sda1/)
+  assert.doesNotMatch(reply.speak, /---/)
+})
