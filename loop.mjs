@@ -43,6 +43,19 @@ const DEFAULT_LANGUAGE = 'ru'
  * sentence and went into the session as the person's words.
  */
 const MIN_SECONDS = 0.4
+/**
+ * Quote one path for a POSIX shell.
+ *
+ * `JSON.stringify` is not shell quoting: it escapes for JSON, and a path containing `$(…)` or a
+ * backtick would still be executed by `sh -c`.
+ *
+ * @param value - the path to quote.
+ * @returns the path inside single quotes, safe to paste into a command.
+ */
+export function shellQuote (value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`
+}
+
 /** How often one node may warm the model up: entering and leaving a screen is not a reason. */
 const WARMUP_DEBOUNCE_MS = 60_000
 /** What we say when the recording produced no words. */
@@ -426,7 +439,7 @@ export function createVoiceLoop ({
     const localPath = join(cacheDir, `take-${Date.now()}-${basename(devicePath)}`)
     const copy = await nodes.call(nodeName, 'files', 'copyFromDevice', { path: devicePath, hostPath: localPath })
     // The take belongs to the person's words: once it is here, the device copy is litter.
-    await nodes.call(nodeName, 'shell', 'exec', { command: `rm -f ${JSON.stringify(devicePath)}` })
+    await nodes.call(nodeName, 'shell', 'exec', { command: `rm -f -- ${shellQuote(devicePath)}` })
     if (copy?.status !== 'ok') {
       releaseNode(nodeName)
       cleanup([localPath])
@@ -512,16 +525,27 @@ export function createVoiceLoop ({
     const id = String(event?.id ?? '')
     const path = typeof event?.path === 'string' ? event.path : ''
     if (!path) return { status: 'no-file' }
-    if (id && !rememberId(id)) {
-      log.info?.('[dsh-voice] the same recording arrived again, ignoring', { id })
+    const nodeName = event?.nodeName ?? String(event?.node ?? '')
+    // Two devices may well produce the same id: the key is the pair, not the id alone.
+    const key = `${nodeName}:${id}`
+    if (id && seen.has(key)) {
+      // A retry of something already answered. The server has just written a fresh file for it,
+      // and leaving that behind would grow the cache with every repeat.
+      cleanup([path])
+      log.info?.('[dsh-voice] the same recording arrived again, ignoring', { id, node: nodeName })
       return { status: 'already', id }
     }
-    const nodeName = event?.nodeName ?? String(event?.node ?? '')
     // The same per-node order as a press: two takes cannot overtake each other, and the
     // second waits instead of being dropped.
     const chain = queues.get(nodeName) ?? Promise.resolve()
     const mine = chain
-      .then(async () => await exchangeFromFile(event, nodeName))
+      .then(async () => {
+        const outcome = await exchangeFromFile(event, nodeName)
+        // Only a delivered turn owns the id. A failure — recognition, delivery, an empty take —
+        // must leave the retry path open: the client re-sends the same id on purpose.
+        if (id && outcome?.status === 'delivered') rememberId(key)
+        return outcome
+      })
       .catch((error) => {
         log.warn?.('[dsh-voice] uploaded exchange failed:', error?.message ?? error)
         return { status: 'failed' }
@@ -932,11 +956,11 @@ export function createVoiceLoop ({
     if (audioPath) {
       // One command carries both halves: the line to show and the file to play. The device
       // downloads it by this command's `seq` — the only live ticket there is — and answers at once.
-      await answerCommand({ node, id, text, speak: spoken, who, audioPath, seconds: audioSeconds, degraded, trace })
+      await answerCommand({ node, id, text, speak: spoken, who, audioPath, seconds: audioSeconds, trace })
     } else {
       // No audio: the line goes to the screen and the device engine reads it, if there is anything
       // to read at all.
-      pushChat({ node, role: 'assistant', text, speak: spoken, id, say: Boolean(spoken), audio: null, who, degraded, trace })
+      pushChat({ node, role: 'assistant', text, speak: spoken, id, say: Boolean(spoken), who, degraded, trace })
     }
     trace?.done(hostAudio && !audioPath ? 'tts-failed' : 'ok',
       { synth: audioPath ? 'host' : 'device', language })
@@ -953,14 +977,15 @@ export function createVoiceLoop ({
    *
    * @param args - node, exchange id, what to show, what to say, the persona, the file and its length.
    */
-  async function answerCommand ({ node, id, text, speak, who, audioPath, seconds, degraded = null, trace = null }) {
+  async function answerCommand ({ node, id, text, speak, who, audioPath, seconds, trace = null }) {
     const pending = nodes.call(node, 'voice', 'answer', {
       ...id ? { id } : {},
       text,
       ...speak ? { speak } : {},
       ...who?.name ? { who } : {},
       ...Number.isFinite(Number(seconds)) ? { seconds: Number(seconds) } : {},
-      ...degraded ? { degraded } : {},
+      // The path travels even though the device does not read it: the download route resolves the
+      // file from `command.args.path`, and the command is the ticket.
       path: audioPath,
     })
     const guard = setTimeout(() => cleanup([audioPath]), AUDIO_TTL_MS)

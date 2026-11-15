@@ -1430,3 +1430,84 @@ test('a broken warmup is a warning, not a failure', async (t) => {
   assert.ok(lines.some((line) => line.includes('WARN') && line.includes('warmup failed')))
   assert.ok(lines.some((line) => line.includes('done') && line.includes('reason=failed')))
 })
+
+test('a repeat of an answered id leaves no file behind', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-dup-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
+  const loop = bareLoop({ dir, nodes, synthService: null })
+
+  const take = () => { const p = join(dir, `t-${Math.random().toString(36).slice(2, 6)}.wav`); writeFileSync(p, wavBytes()); return p }
+  const first = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'dup-1', path: take(), seconds: 1.2 })
+  assert.equal(first.status, 'delivered')
+
+  const secondPath = take()
+  const second = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'dup-1', path: secondPath, seconds: 1.2 })
+  assert.equal(second.status, 'already')
+  assert.equal(existsSync(secondPath), false, 'the freshly written file is removed, not leaked')
+})
+
+test('a failed exchange leaves the id free for a retry', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-retry-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  let transcribeCalls = 0
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
+  const loop = createVoiceLoop({
+    nodes,
+    speechToText: {
+      resolve: (r) => r,
+      transcribe: async () => {
+        transcribeCalls += 1
+        if (transcribeCalls === 1) throw new Error('the recognizer is down')
+        return { text: 'со второго раза' }
+      },
+    },
+    sessions: { flush: async () => {} },
+    sessionController: {
+      resolveAgent: async () => ({ agent: { followup: () => {} } }),
+      create: async () => ({ sessionId: 'session-retry' }),
+    },
+    cacheDir: join(dir, 'cache'),
+    log: { info: () => {}, warn: () => {}, debug: () => {} },
+  })
+
+  const take = () => { const p = join(dir, `t-${Math.random().toString(36).slice(2, 6)}.wav`); writeFileSync(p, wavBytes()); return p }
+  // the first attempt recognizes nothing, so the take never becomes a turn
+  const first = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'retry-1', path: take(), seconds: 1.2 })
+  assert.equal(first.status, 'empty')
+
+  // the client re-sends the same id on purpose: it must be handled, not swallowed as a duplicate
+  const second = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'retry-1', path: take(), seconds: 1.2 })
+  assert.equal(second.status, 'delivered')
+  assert.equal(second.text, 'со второго раза')
+})
+
+test('two devices with the same id are two different exchanges', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-dup2-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
+  const loop = createVoiceLoop({
+    nodes,
+    speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
+    sessions: { flush: async () => {} },
+    sessionController: {
+      resolveAgent: async () => ({ agent: { followup: () => {} } }),
+      create: async () => ({ sessionId: `session-${Math.random().toString(36).slice(2, 8)}` }),
+    },
+    cacheDir: join(dir, 'cache'),
+    log: { info: () => {}, warn: () => {}, debug: () => {} },
+  })
+
+  const take = () => { const p = join(dir, `t-${Math.random().toString(36).slice(2, 6)}.wav`); writeFileSync(p, wavBytes()); return p }
+  const phone = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'same', path: take(), seconds: 1.2 })
+  const tablet = await loop.handleUpload({ node: 20, nodeName: 'Tablet', id: 'same', path: take(), seconds: 1.2 })
+  assert.equal(phone.status, 'delivered')
+  assert.equal(tablet.status, 'delivered', 'the id is one per device, not one globally')
+})
+
+test('a path with a dollar sign is quoted, not executed', async () => {
+  const { shellQuote } = await import('../loop.mjs')
+  const quoted = shellQuote("/tmp/$(rm -rf /).wav")
+  assert.equal(quoted, "'/tmp/$(rm -rf /).wav'")
+  assert.equal(shellQuote("/tmp/it's.wav"), "'/tmp/it'\\''s.wav'")
+})
