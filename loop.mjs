@@ -7,8 +7,8 @@
 //
 // Every outside world dependency is passed in, so the whole loop can be exercised on stubs:
 // no device, no model, no speech service.
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { basename, join } from 'node:path'
+import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { basename, dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
 import { splitReply } from './markup.mjs'
@@ -43,6 +43,124 @@ const DEFAULT_LANGUAGE = 'ru'
  * sentence and went into the session as the person's words.
  */
 const MIN_SECONDS = 0.4
+/**
+ * What happens to a recording once the exchange is over.
+ *
+ * `last` keeps the newest take of every node, so "what was actually heard" can be listened to
+ * afterwards; `none` is the old behaviour, where the file went as soon as it was used.
+ */
+export const KEEP_LAST = 'last'
+export const KEEP_NONE = 'none'
+/** How long a kept recording lives: a day is enough to go back and listen to it. */
+export const RECORDING_TTL_MS = 24 * 60 * 60 * 1000
+/** The age sweep runs once a boot and then once a day: nothing else has to hold the timer. */
+const SWEEP_INTERVAL_MS = RECORDING_TTL_MS
+/** Where the device uploads land: `<cacheDir>/incoming/<node>/<id>.wav`. */
+const INCOMING_DIR = 'incoming'
+
+/**
+ * Read the `keepRecording` setting.
+ *
+ * Anything other than `none` means `last`: a typo must not silently throw the takes away, and
+ * keeping a recording is the harmless direction for a mistake to lean.
+ *
+ * @param value - the value from the plugin config.
+ * @returns `last` or `none`.
+ */
+export function resolveKeepRecording (value) {
+  return typeof value === 'string' && value.trim().toLowerCase() === KEEP_NONE ? KEEP_NONE : KEEP_LAST
+}
+
+/** Files of one directory, with the mtime the retention rules look at. */
+function filesIn (dir) {
+  let names
+  try {
+    names = readdirSync(dir)
+  } catch {
+    return []
+  }
+  const files = []
+  for (const name of names) {
+    const path = join(dir, name)
+    try {
+      const stat = statSync(path)
+      if (stat.isFile()) files.push({ path, mtimeMs: stat.mtimeMs })
+    } catch {}
+  }
+  return files
+}
+
+/**
+ * Remove every recording of one node directory except the newest one.
+ *
+ * The take that has just been used is passed as `prefer`: it is the last one by construction, and
+ * on an equal mtime (two files written inside the same millisecond) it is the one meant to stay.
+ *
+ * @param dir - the node directory.
+ * @param options - `prefer`, the path that must survive; `log` for a failed unlink.
+ * @returns the path that was kept, or null for an empty or missing directory.
+ */
+export function pruneRecordings (dir, { prefer = null, log = null } = {}) {
+  const files = filesIn(dir)
+  if (files.length === 0) return null
+  let keep = files[0]
+  for (const file of files.slice(1)) {
+    const newer = file.mtimeMs > keep.mtimeMs
+    const sameAndPreferred = file.mtimeMs === keep.mtimeMs && file.path === prefer
+    if (newer || sameAndPreferred) keep = file
+  }
+  for (const file of files) {
+    if (file.path === keep.path) continue
+    try {
+      rmSync(file.path, { force: true })
+    } catch (error) {
+      log?.warn?.('[dsh-voice] could not remove an old recording:', error?.message ?? error)
+    }
+  }
+  return keep.path
+}
+
+/**
+ * Delete recordings older than the retention window, node by node.
+ *
+ * A plain mtime sweep: no bookkeeping file, so a take left behind by a crash is removed by the
+ * same rule as one that was kept on purpose.
+ *
+ * @param cacheDir - the voice cache, whose `incoming/` holds the uploads.
+ * @param options - `now`, `maxAgeMs` and `log`, all for tests and for a quiet failure.
+ * @returns the removed paths.
+ */
+export function sweepRecordings (cacheDir, { now = Date.now(), maxAgeMs = RECORDING_TTL_MS, log = null } = {}) {
+  const root = join(cacheDir, INCOMING_DIR)
+  const removed = []
+  const expire = (file) => {
+    if (now - file.mtimeMs <= maxAgeMs) return
+    try {
+      rmSync(file.path, { force: true })
+      removed.push(file.path)
+    } catch (error) {
+      log?.warn?.('[dsh-voice] could not remove an expired recording:', error?.message ?? error)
+    }
+  }
+  for (const entry of filesIn(root)) expire(entry)
+  let nodes = []
+  try {
+    nodes = readdirSync(root)
+  } catch {
+    return removed
+  }
+  for (const node of nodes) {
+    const dir = join(root, node)
+    try {
+      if (!statSync(dir).isDirectory()) continue
+    } catch {
+      continue
+    }
+    for (const file of filesIn(dir)) expire(file)
+  }
+  return removed
+}
+
 /**
  * Quote one path for a POSIX shell.
  *
@@ -150,6 +268,8 @@ export function assistantTextOf (event) {
  * @param {object} [deps.log] - `{info, warn, debug}`; console-like.
  * @param {Function} [deps.createUserMessage] - DSH message constructor, for `source`.
  * @param {Function} [deps.on] - subscription for session events.
+ * @param {string} [deps.keepRecording] - `last` (default) keeps the newest take of every node,
+ *   `none` removes every take once it is used.
  * @returns `{ handle, observeSessionEvent, pending, dispose }`
  */
 export function createVoiceLoop ({
@@ -169,7 +289,10 @@ export function createVoiceLoop ({
   exchangeTimeoutMs = EXCHANGE_TIMEOUT_MS,
   language = DEFAULT_LANGUAGE,
   minSeconds = MIN_SECONDS,
+  keepRecording = KEEP_LAST,
 }) {
+  /** `last` or `none`, decided once: the config cannot change under a running loop. */
+  const keeping = resolveKeepRecording(keepRecording)
   /** One entry per node that is currently being talked to. */
   const active = new Map()
   /** node → session id, kept across exchanges and restarts (`sessions.json`). */
@@ -268,6 +391,43 @@ export function createVoiceLoop ({
       } catch {}
     }
   }
+
+  /**
+   * Put a used recording away.
+   *
+   * `keepRecording: last` leaves the take in place — the question "what did it actually hear"
+   * can only be answered while the file exists — and removes the node's older ones, so the
+   * directory holds exactly one file. `none` is the old behaviour: the file goes at once.
+   *
+   * @param path - the recording the exchange just used.
+   * @returns the kept path, or null when it was removed.
+   */
+  function discardRecording (path) {
+    if (keeping !== KEEP_LAST) {
+      cleanup([path])
+      return null
+    }
+    try {
+      return pruneRecordings(dirname(path), { prefer: path, log })
+    } catch (error) {
+      log.warn?.('[dsh-voice] could not tidy the recordings:', error?.message ?? error)
+      return path
+    }
+  }
+
+  // A kept recording must not live forever: one sweep at boot, then once a day. The timer is
+  // unref'd, so it never keeps a process alive on its own.
+  const sweep = () => {
+    try {
+      const removed = sweepRecordings(cacheDir, { log })
+      if (removed.length > 0) log.info?.('[dsh-voice] removed expired recordings', { count: removed.length })
+    } catch (error) {
+      log.warn?.('[dsh-voice] the recording sweep failed:', error?.message ?? error)
+    }
+  }
+  sweep()
+  const sweepTimer = setInterval(sweep, SWEEP_INTERVAL_MS)
+  if (typeof sweepTimer?.unref === 'function') sweepTimer.unref()
 
   /** Say something short on the device through its own engine, best effort. */
   async function say (node, text) {
@@ -530,8 +690,9 @@ export function createVoiceLoop ({
     const key = `${nodeName}:${id}`
     if (id && seen.has(key)) {
       // A retry of something already answered. The server has just written a fresh file for it,
-      // and leaving that behind would grow the cache with every repeat.
-      cleanup([path])
+      // and leaving every repeat behind would grow the cache without end: it becomes the node's
+      // one kept recording, and its predecessors go.
+      discardRecording(path)
       log.info?.('[dsh-voice] the same recording arrived again, ignoring', { id, node: nodeName })
       return { status: 'already', id }
     }
@@ -566,9 +727,10 @@ export function createVoiceLoop ({
     trace.mark('received')
     const seconds = Number(event?.seconds)
     if (Number.isFinite(seconds) && seconds > 0 && seconds < minSeconds) {
-      // Nothing worth recognizing: the file goes, the session stays untouched, and the device is
-      // told nothing — the person knows they only brushed the button.
-      cleanup([event.path])
+      // Nothing worth recognizing: the session stays untouched and the device is told nothing —
+      // the person knows they only brushed the button. The take itself is kept like any other,
+      // because a click that was heard as words is exactly what one wants to listen to.
+      discardRecording(event.path)
       trace.done('too-short', { language, seconds })
       return { status: 'too-short', id: event?.id ?? null, seconds }
     }
@@ -582,7 +744,7 @@ export function createVoiceLoop ({
     trace.mark('transcribed')
     if (text) pushChat({ node: nodeName, role: 'user', text, id: event?.id ?? null, trace })
     if (!text) {
-      cleanup([event.path])
+      discardRecording(event.path)
       await say(nodeName, NOT_HEARD)
       trace.done('empty', { language })
       return { status: 'empty', id: event?.id ?? null }
@@ -601,14 +763,15 @@ export function createVoiceLoop ({
     } catch (error) {
       awaiting.delete(sessionId)
       releaseNode(nodeName)
-      cleanup([event.path])
+      discardRecording(event.path)
       log.warn?.('[dsh-voice] delivery failed:', error?.message ?? error)
       await say(nodeName, 'Не смог передать запрос.')
       trace.done('no-session', { language })
       return { status: 'no-session' }
     }
-    // The recording has done its job: keeping it would only grow the cache.
-    cleanup([event.path])
+    // The recording has done its job: the newest take stays (unless keepRecording says `none`),
+    // the node's older ones do not.
+    discardRecording(event.path)
     return { status: 'delivered', session: sessionId, text, id: event?.id ?? null }
   }
 
@@ -1031,6 +1194,7 @@ export function createVoiceLoop ({
     observeSessionEvent,
     awaiting,
     dispose () {
+      clearInterval(sweepTimer)
       stopWatching()
       awaiting.clear()
       drafts.clear()

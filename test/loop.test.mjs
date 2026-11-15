@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
-import { assistantTextOf, createVoiceLoop } from '../loop.mjs'
+import { assistantTextOf, createVoiceLoop, resolveKeepRecording, sweepRecordings } from '../loop.mjs'
 
 /** A short WAV with real silence in it: ffmpeg has to be able to encode it. */
 function wavBytes (seconds = 0.2, sampleRate = 16000) {
@@ -343,6 +343,7 @@ test('an uploaded recording is answered without asking the device for anything',
       create: async () => ({ sessionId: 'session-upload' }),
     },
     cacheDir: join(dir, 'cache'),
+    keepRecording: 'none',
     log: { info: () => {}, warn: () => {}, debug: () => {} },
   })
 
@@ -400,6 +401,7 @@ test('an empty transcript from an upload is answered out loud and closes the exc
     sessions: { flush: async () => {} },
     sessionController: { resolveAgent: async () => ({ agent: { followup: (m) => delivered.push(m) } }) },
     cacheDir: join(dir, 'cache'),
+    keepRecording: 'none',
     log: { info: () => {}, warn: () => {}, debug: () => {} },
   })
 
@@ -541,10 +543,11 @@ async function drive (loop, { id, dir, synth, answer = '--- # say\nготово'
   return outcome
 }
 
-function bareLoop ({ dir, synthService, nodes, lines = [], exchangeTimeoutMs = undefined, on = undefined }) {
+function bareLoop ({ dir, synthService, nodes, lines = [], exchangeTimeoutMs = undefined, on = undefined, keepRecording = undefined }) {
   return createVoiceLoop({
     ...(exchangeTimeoutMs === undefined ? {} : { exchangeTimeoutMs }),
     ...(on === undefined ? {} : { on }),
+    ...(keepRecording === undefined ? {} : { keepRecording }),
     nodes,
     speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
     textToSpeech: synthService,
@@ -859,6 +862,7 @@ test('a recording shorter than the threshold never reaches the recognizer', asyn
     },
     cacheDir: join(dir, 'cache'),
     minSeconds: 0.4,
+    keepRecording: 'none',
     log: { info: (line) => lines.push(line), warn: () => {}, debug: () => {} },
   })
 
@@ -1435,7 +1439,7 @@ test('a repeat of an answered id leaves no file behind', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-dup-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
-  const loop = bareLoop({ dir, nodes, synthService: null })
+  const loop = bareLoop({ dir, nodes, synthService: null, keepRecording: 'none' })
 
   const take = () => { const p = join(dir, `t-${Math.random().toString(36).slice(2, 6)}.wav`); writeFileSync(p, wavBytes()); return p }
   const first = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'dup-1', path: take(), seconds: 1.2 })
@@ -1510,4 +1514,132 @@ test('a path with a dollar sign is quoted, not executed', async () => {
   const quoted = shellQuote("/tmp/$(rm -rf /).wav")
   assert.equal(quoted, "'/tmp/$(rm -rf /).wav'")
   assert.equal(shellQuote("/tmp/it's.wav"), "'/tmp/it'\\''s.wav'")
+})
+
+/** The directory a device uploads into, created on demand. */
+function nodeDirOf (dir, node = 'A059P') {
+  const nodeDir = join(dir, 'cache', 'incoming', node)
+  mkdirSync(nodeDir, { recursive: true })
+  return nodeDir
+}
+
+test('a successful exchange leaves exactly one recording in the node directory', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-keep-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodeDir = nodeDirOf(dir)
+  // A take kept by an earlier exchange: it must go, the fresh one stays.
+  const earlier = join(nodeDir, 'earlier.wav')
+  writeFileSync(earlier, wavBytes())
+  const hourAgo = new Date(Date.now() - 3_600_000)
+  utimesSync(earlier, hourAgo, hourAgo)
+  const take = join(nodeDir, 'id-1.wav')
+  writeFileSync(take, wavBytes())
+
+  const loop = bareLoop({ dir, nodes: stubNodes({ 'voice.chat': { status: 'ok' } }), synthService: null })
+  t.after(() => loop.dispose())
+  const outcome = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'keep-1', path: take, seconds: 1.2 })
+
+  assert.equal(outcome.status, 'delivered')
+  assert.deepEqual(readdirSync(nodeDir), ['id-1.wav'], 'one file, and it is the take that was used')
+})
+
+test('a second exchange replaces the kept recording', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-keep-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodeDir = nodeDirOf(dir)
+
+  const loop = bareLoop({ dir, nodes: stubNodes({ 'voice.chat': { status: 'ok' } }), synthService: null })
+  t.after(() => loop.dispose())
+
+  const first = join(nodeDir, 'id-1.wav')
+  writeFileSync(first, wavBytes())
+  const one = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'keep-1', path: first, seconds: 1.2 })
+  assert.equal(one.status, 'delivered')
+  assert.deepEqual(readdirSync(nodeDir), ['id-1.wav'])
+
+  const second = join(nodeDir, 'id-2.wav')
+  writeFileSync(second, wavBytes())
+  const two = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'keep-2', path: second, seconds: 1.2 })
+  assert.equal(two.status, 'delivered')
+  assert.deepEqual(readdirSync(nodeDir), ['id-2.wav'], 'still one file, and it is the new one')
+})
+
+test('keepRecording: none removes every take, as before', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-keep-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodeDir = nodeDirOf(dir)
+  const earlier = join(nodeDir, 'earlier.wav')
+  writeFileSync(earlier, wavBytes())
+  const take = join(nodeDir, 'id-1.wav')
+  writeFileSync(take, wavBytes())
+
+  const loop = bareLoop({ dir, nodes: stubNodes({ 'voice.chat': { status: 'ok' } }), synthService: null, keepRecording: 'none' })
+  t.after(() => loop.dispose())
+  const outcome = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'none-1', path: take, seconds: 1.2 })
+
+  assert.equal(outcome.status, 'delivered')
+  assert.equal(existsSync(take), false, 'the used take is gone')
+  assert.deepEqual(readdirSync(nodeDir), ['earlier.wav'], 'and nothing touches the older one')
+})
+
+test('a repeated id takes the place of the kept recording and drops the older take', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-keep-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodeDir = nodeDirOf(dir)
+
+  const loop = bareLoop({ dir, nodes: stubNodes({ 'voice.chat': { status: 'ok' } }), synthService: null })
+  t.after(() => loop.dispose())
+
+  const first = join(nodeDir, 'id-1.wav')
+  writeFileSync(first, wavBytes())
+  assert.equal((await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'dup-1', path: first, seconds: 1.2 })).status, 'delivered')
+
+  const again = join(nodeDir, 'id-1-retry.wav')
+  writeFileSync(again, wavBytes())
+  const repeat = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'dup-1', path: again, seconds: 1.2 })
+
+  assert.equal(repeat.status, 'already')
+  assert.deepEqual(readdirSync(nodeDir), ['id-1-retry.wav'], 'the retry is the newest take, the first one goes')
+})
+
+test('the sweep removes a recording older than a day and leaves the fresh one alone', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-sweep-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodeDir = nodeDirOf(dir)
+  const expired = join(nodeDir, 'yesterday.wav')
+  writeFileSync(expired, wavBytes())
+  const dayAndHourAgo = new Date(Date.now() - 25 * 3_600_000)
+  utimesSync(expired, dayAndHourAgo, dayAndHourAgo)
+  const fresh = join(nodeDir, 'today.wav')
+  writeFileSync(fresh, wavBytes())
+
+  const removed = sweepRecordings(join(dir, 'cache'))
+
+  assert.deepEqual(removed, [expired])
+  assert.equal(existsSync(expired), false, 'a take older than 24 hours does not live on')
+  assert.equal(existsSync(fresh), true, 'a fresh take is untouched')
+})
+
+test('the loop sweeps expired recordings when it starts', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-sweep-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodeDir = nodeDirOf(dir)
+  const expired = join(nodeDir, 'yesterday.wav')
+  writeFileSync(expired, wavBytes())
+  const dayAndHourAgo = new Date(Date.now() - 25 * 3_600_000)
+  utimesSync(expired, dayAndHourAgo, dayAndHourAgo)
+
+  const loop = bareLoop({ dir, nodes: stubNodes(), synthService: null })
+  t.after(() => loop.dispose())
+
+  assert.equal(existsSync(expired), false, 'the boot sweep runs without being asked')
+})
+
+test('a broken keepRecording value reads as last, never as none', () => {
+  assert.equal(resolveKeepRecording('none'), 'none')
+  assert.equal(resolveKeepRecording(' NONE '), 'none')
+  assert.equal(resolveKeepRecording('last'), 'last')
+  for (const junk of [undefined, null, '', 'yes', 'true', 0, 1, {}, ['none']]) {
+    assert.equal(resolveKeepRecording(junk), 'last', `junk ${JSON.stringify(junk)} keeps the recording`)
+  }
 })

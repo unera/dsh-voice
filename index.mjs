@@ -19,7 +19,7 @@ import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 
 import { readVoiceMarkup } from './markup.mjs'
-import { createVoiceLoop } from './loop.mjs'
+import { createVoiceLoop, resolveKeepRecording } from './loop.mjs'
 
 export const name = 'dsh-voice'
 
@@ -192,7 +192,7 @@ function cacheDirectory (config) {
  * Start the loop and wire it to the events the node plugin emits.
  *
  * @param ctx - owning Host context.
- * @param config - `cacheDir`, `logger`.
+ * @param config - `cacheDir`, `logger`, `keepRecording`.
  * @returns a disposer.
  */
 export function installLoop (ctx, config = {}) {
@@ -259,6 +259,9 @@ function startLoop (ctx, config) {
     // Named, not inherited from the host default: `auto` lets a short noisy take drift into
     // another language, and the transcript then reaches the session as the person's own words.
     language: typeof config.language === 'string' && config.language.trim() ? config.language.trim() : 'ru',
+    // `last` (default) keeps the newest take of every node so it can be listened to afterwards;
+    // `none` removes it once used. Anything else reads as `last`: a typo must not throw takes away.
+    keepRecording: resolveKeepRecording(config.keepRecording),
     ...typeof config.minSeconds === 'number' && config.minSeconds > 0 ? { minSeconds: config.minSeconds } : {},
     on: (name, handler) => ctx.on(name, handler, { global: true }),
     // The loop announces the binding of a fresh session before creating it, the
@@ -341,7 +344,7 @@ function startLoop (ctx, config) {
 /**
  * Plugin entry point.
  * @param ctx - owning Host context.
- * @param config - `cacheDir` for recordings, `logger`.
+ * @param config - `cacheDir` for recordings, `logger`, `keepRecording`.
  */
 export function apply (ctx, config = {}) {
   install(ctx, config)

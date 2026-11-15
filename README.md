@@ -141,8 +141,10 @@ model drifts to — a Japanese sentence once reached a session as the person's o
 that refuses the language is a warning and a fallback to the service default, never a lost
 recording.
 
-A take shorter than `minSeconds` (0.4 by default) is not speech at all: the file is removed, the
-session is untouched, the device is told nothing, and the closing line says `reason=too-short`.
+A take shorter than `minSeconds` (0.4 by default) is not speech at all: the session is untouched,
+the device is told nothing, and the closing line says `reason=too-short`. The file itself follows
+`keepRecording` like any other take — a click that was heard as words is exactly what one wants to
+listen to.
 
 Both facts are visible in the trace: `stage=stt-request provider=… language=…`, and `language=…`
 in the closing line.
@@ -156,7 +158,20 @@ in the closing line.
 
 `dsh-nodes/voice` carries `{node, nodeName, id, path, bytes, seconds}`. The `id` is the
 identity of one exchange: a retry with the same id is answered `already` and produces no
-second turn. The recording is deleted once it is used, whether it produced words or not.
+second turn.
+
+The upload lands in `<DSH_HOME>/cache/voice/incoming/<node>/<id>.wav`. What is left of it
+afterwards is the `keepRecording` setting:
+
+| value | what stays in `incoming/<node>/` |
+|---|---|
+| `last` (default) | exactly one file — the newest take of that node; its predecessors are removed |
+| `none` | nothing; the take goes as soon as the exchange is over |
+
+Anything that is not `none` reads as `last`: a typo must not throw a recording away. The kept
+take does not live forever — a sweep removes recordings older than 24 hours, once at boot and
+then once a day, by `mtime` alone. So "what did it actually hear" can be listened to the same day,
+and the directory does not grow with every press.
 
 ## The voice loop
 
