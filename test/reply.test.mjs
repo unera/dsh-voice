@@ -157,7 +157,7 @@ test('the prompt section follows the switch and the limit', async (t) => {
   installReply(live, { config })
   const text = live.sections[0].text()
   assert.match(text, /^---$/mu)
-  assert.match(text, /^\.\.\.$/mu)
+  assert.doesNotMatch(text, /^\.\.\.$/mu, 'the format has no closing marker')
   assert.match(text, /120/u)
   assert.match(text, /как есть/u)
 
@@ -192,15 +192,13 @@ test('one marker instead of two is passed through as it is', async (t) => {
   assert.equal(answerInLog(session), answer)
 })
 
-test('a missing closing marker is passed through as it is', async (t) => {
+test('a document with two markers and no closing one is spoken', async (t) => {
   const directory = await cacheDir(t)
   const answer = '---\nГотово, всё поднялось.\n---\nПорт 8080.'
   const { outcome, session, service } = await runTurn({ answer, cacheDir: directory })
 
-  assert.deepEqual([outcome.delivered, outcome.reason, outcome.asIs], [false, 'no-end-marker', true])
-  assert.equal(service.calls.resolve.length, 0)
-  assert.equal(session.appended.length, 0)
-  assert.equal(answerInLog(session), answer)
+  assert.equal(outcome.delivered, true, 'two markers are the whole format now')
+  assert.equal(service.calls.synthesize.length, 1)
 })
 
 test('an empty first part is passed through as it is', async (t) => {

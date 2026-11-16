@@ -5,6 +5,19 @@ All notable changes to this package are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-16
+
+### Changed
+- The closing `...` marker is gone: two markers are the whole document. In YAML a `...`
+  ends a document, which promises another one that never comes, while a third `---` says
+  a new document starts — neither is what the answer means. Anything after the second
+  marker is simply the part without sound.
+
+### Fixed
+- The contract asks for a blank line around each marker: markdown reads the line above
+  `---` as a setext heading, and a rendered Telegram message showed the spoken part
+  arriving as a large heading with the marker swallowed.
+
 ## [0.3.4] - 2026-11-16
 
 ### Fixed

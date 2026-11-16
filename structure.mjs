@@ -8,7 +8,6 @@
 //     текст для голоса
 //     ---
 //     текст без звука
-//     ...
 //
 // The parser is deliberately unforgiving. The old version guessed at intent
 // from the words of the person's message, which only worked for the languages
@@ -29,9 +28,6 @@
 
 /** The line that opens the document and separates its two parts. */
 export const SEPARATOR = '---'
-
-/** The line that closes the document. */
-export const END = '...'
 
 /** Characters the spoken part may have when the configuration names no limit. */
 export const DEFAULT_MAX_CHARS = 600
@@ -73,8 +69,12 @@ function refusal (reason) {
  * 1. the first non-empty line is exactly `---`;
  * 2. exactly one more line after it is exactly `---` (a third one is a
  *    deviation, not a nested document);
- * 3. the last non-empty line is exactly `...`, after that separator;
- * 4. the spoken part and the remaining text are both non-empty after `trim()`.
+ * 3. the spoken part and the remaining text are both non-empty after `trim()`.
+ *
+ * There is no closing marker: YAML's `...` would read as "the document ends here",
+ * which promises a following document that never comes, and a third `---` reads as
+ * "another document starts". Two markers say exactly what is true — spoken part,
+ * then the rest.
  *
  * @param answer - the final answer text of the turn, as the model wrote it.
  * @returns `{ok, reason, spoken, rest}`: the two parts as they will be used —
@@ -99,14 +99,8 @@ export function parseVoiceDocument (answer) {
   if (separators.length > 1) return refusal('extra-marker')
   const separator = separators[0]
 
-  let last = lines.length - 1
-  while (last >= 0 && lines[last].trim() === '') last -= 1
-  if (last === -1 || lines[last] !== END) return refusal('no-end-marker')
-  // `...` above the separator leaves no room for text without sound.
-  if (last <= separator) return refusal('empty-rest')
-
   const spoken = lines.slice(first + 1, separator).join('\n').trim()
-  const rest = lines.slice(separator + 1, last).join('\n').trim()
+  const rest = lines.slice(separator + 1).join('\n').trim()
   if (!spoken) return refusal('empty-spoken')
   if (!rest) return refusal('empty-rest')
 
@@ -129,16 +123,19 @@ export function replyContract ({ maxChars = DEFAULT_MAX_CHARS, enabled = true } 
     : 'Озвучка сейчас выключена: формат остаётся допустимым ответом, но звука не будет, пока её не включат на странице плагина.'
   return `## Ответ голосом
 
-Ответ, который должен прозвучать, оформляется ровно так — тремя маркерами:
+Ответ, который должен прозвучать, оформляется ровно так — двумя маркерами:
 
 ---
+
 текст для голоса
----
-текст без звука
-...
 
-- первая непустая строка — \`---\`; ниже то, что произносят; затем ещё одна строка \`---\`; затем остальной текст; последняя непустая строка — \`...\`;
+---
+
+текст без звука
+
+- первая непустая строка — \`---\`; ниже то, что произносят; затем ещё одна строка \`---\`; затем остальной текст; закрывающего маркера нет;
 - до и после каждого маркера ставь пустую строку: иначе markdown прочитает строку над \`---\` как заголовок, и первая часть ответа станет крупным текстом;
+- ровно два \`---\` на ответ: третий сделает ответ не документом, и звука не будет;
 - первая часть — не длиннее ${maxChars} символов, без markdown, ссылок и блоков кода;
 - обе части непустые; при любом отклонении от формата звука не будет — ответ уйдёт как есть;
 - маркеры остаются в ответе, их видит человек;

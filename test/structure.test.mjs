@@ -9,7 +9,7 @@ import test from 'node:test'
 
 import { DEFAULT_MAX_CHARS, MAX_CHARS_LIMIT, charCount, parseVoiceDocument, replyContract } from '../structure.mjs'
 
-const valid = '---\nГотово, всё поднялось.\n---\nСервис поднят, порт 8080.\n...'
+const valid = '---\n\nГотово, всё поднялось.\n\n---\n\nСервис поднят, порт 8080.'
 
 test('a well-formed document gives both parts, spoken first', () => {
   assert.deepEqual(parseVoiceDocument(valid), {
@@ -35,7 +35,7 @@ test('CRLF line endings are a line ending, not a format deviation', () => {
 })
 
 test('the spoken part keeps its own line breaks and loses only outer space', () => {
-  const parsed = parseVoiceDocument('---\n\n  Первая строка.\n\nВторая строка.  \n\n---\nхвост\n...')
+  const parsed = parseVoiceDocument('---\n\n  Первая строка.\n\nВторая строка.  \n\n---\nхвост')
   assert.equal(parsed.spoken, 'Первая строка.\n\nВторая строка.')
 })
 
@@ -47,37 +47,44 @@ test('without markers the answer is not a document', () => {
 
 test('a word or a fence above the marker breaks the format', () => {
   // Strictness is the point: "похоже" is not the protocol.
-  assert.equal(parseVoiceDocument('Ответ:\n---\nт\n---\nр\n...').reason, 'not-a-document')
+  assert.equal(parseVoiceDocument('Ответ:\n---\nт\n---\nр').reason, 'not-a-document')
   assert.equal(parseVoiceDocument('```\n---\nт\n---\nр\n...\n```').reason, 'not-a-document')
 })
 
 test('the markers must be exactly the markers', () => {
   // Trailing space, extra dashes, a heading: all deviations, all AS IS.
-  assert.equal(parseVoiceDocument('--- \nт\n---\nр\n...').reason, 'not-a-document')
-  assert.equal(parseVoiceDocument('----\nт\n---\nр\n...').reason, 'not-a-document')
-  assert.equal(parseVoiceDocument('--- # say\nт\n---\nр\n...').reason, 'not-a-document')
-  assert.equal(parseVoiceDocument('---\nт\n--- \nр\n...').reason, 'one-marker')
-  assert.equal(parseVoiceDocument('---\nт\n---\nр\n......').reason, 'no-end-marker')
+  assert.equal(parseVoiceDocument('--- \nт\n---\nр').reason, 'not-a-document')
+  assert.equal(parseVoiceDocument('----\nт\n---\nр').reason, 'not-a-document')
+  assert.equal(parseVoiceDocument('--- # say\nт\n---\nр').reason, 'not-a-document')
+  assert.equal(parseVoiceDocument('---\nт\n--- \nр').reason, 'one-marker')
+  // No closing marker exists in the format, so trailing prose is just the rest.
+  assert.equal(parseVoiceDocument('---\nт\n---\nр\n......').ok, true)
 })
 
 test('one separator instead of two is refused with its own reason', () => {
-  assert.equal(parseVoiceDocument('---\nт\nр\n...').reason, 'one-marker')
+  assert.equal(parseVoiceDocument('---\nт\nр').reason, 'one-marker')
 })
 
 test('a third separator is refused, not read as a nested document', () => {
-  assert.equal(parseVoiceDocument('---\nт\n---\nр\n---\nещё\n...').reason, 'extra-marker')
+  assert.equal(parseVoiceDocument('---\nт\n---\nр\n---\nещё').reason, 'extra-marker')
 })
 
-test('a document without the closing marker is refused', () => {
-  assert.equal(parseVoiceDocument('---\nт\n---\nр').reason, 'no-end-marker')
-  assert.equal(parseVoiceDocument('---\nт\n---\nр\n..').reason, 'no-end-marker')
+test('a document needs no closing marker, and trailing dots are just text', () => {
+  // YAML's `...` promised a following document that never comes; two markers say
+  // exactly what is true. Anything after them belongs to the part without sound.
+  const withoutEnd = parseVoiceDocument('---\nт\n---\nр')
+  assert.equal(withoutEnd.ok, true)
+  assert.equal(withoutEnd.spoken, 'т')
+  assert.equal(withoutEnd.rest, 'р')
+  assert.equal(parseVoiceDocument('---\nт\n---\nр\n..').rest, 'р\n..')
 })
 
 test('an empty or blank part makes the document invalid', () => {
-  assert.equal(parseVoiceDocument('---\n\n  \n---\nр\n...').reason, 'empty-spoken')
-  assert.equal(parseVoiceDocument('---\nт\n---\n\n   \n...').reason, 'empty-rest')
-  // `...` right below the separator leaves no text without sound.
-  assert.equal(parseVoiceDocument('---\nт\n---\n...').reason, 'empty-rest')
+  assert.equal(parseVoiceDocument('---\n\n  \n---\nр').reason, 'empty-spoken')
+  assert.equal(parseVoiceDocument('---\nт\n---\n\n   ').reason, 'empty-rest')
+  // Nothing may follow the separator: `...` used to close a document and is now
+  // ordinary text, so it is a real (unwanted) second part, not an empty one.
+  assert.equal(parseVoiceDocument('---\nт\n---\n...').rest, '...')
 })
 
 test('an empty answer is not a document either', () => {
@@ -100,7 +107,7 @@ test('the prompt section states the format and the configured limit', () => {
   const text = replyContract({ maxChars: 321 })
   assert.match(text, /^## Ответ голосом$/mu)
   assert.match(text, /^---$/mu)
-  assert.match(text, /^\.\.\.$/mu)
+  assert.doesNotMatch(text, /^\.\.\.$/mu, 'no closing marker in the format')
   assert.match(text, /321/u)
   assert.match(text, /как есть/u)
   assert.equal(replyContract().includes(String(DEFAULT_MAX_CHARS)), true)
