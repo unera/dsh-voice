@@ -5,6 +5,13 @@ All notable changes to this package are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-11-16
+
+### Changed
+- The voice note is named `voice-<uuid>.ogg`. A UUID starts with a hex digit about six
+  times in ten, and a file whose name begins with a digit is the one shape a receiving
+  side may refuse without saying why. Costs nothing, removes a variable.
+
 ## [0.4.2] - 2026-11-16
 
 ### Fixed

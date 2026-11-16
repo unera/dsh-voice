@@ -183,8 +183,11 @@ export async function deliverVoice ({
   signal?.throwIfAborted()
 
   await makeDirectory(directory, { recursive: true })
-  const wavPath = join(directory, `${uuid}.wav`)
-  const oggPath = join(directory, `${uuid}.ogg`)
+  // The name starts with a letter on purpose: a UUID's first character is a hex
+  // digit about six times in ten, and a file whose name begins with a digit is the
+  // one shape a receiving side may refuse without saying why.
+  const wavPath = join(directory, `voice-${uuid}.wav`)
+  const oggPath = join(directory, `voice-${uuid}.ogg`)
   await write(wavPath, speech.audio)
   try {
     await convert(wavPath, oggPath, speed, { signal })
