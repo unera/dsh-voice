@@ -1,7 +1,7 @@
 {
   "name": "@dr-co/dsh-voice",
-  "version": "0.1.16",
-  "description": "Voice markup for DeepSeek Harness: an input marker lifted at agent/pre-step, and the reply contract for spoken answers.",
+  "version": "0.1.17",
+  "description": "A spoken turn for DeepSeek Harness: the voice loop that turns a device recording into a chat answer the phone can speak, the input marker and the reply contract.",
   "type": "module",
   "main": "./index.mjs",
   "exports": {
@@ -16,9 +16,9 @@
     "trace.mjs",
     "audio.mjs",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
-    "cordis.patch.yml",
-    "docs"
+    "cordis.patch.yml"
   ],
   "license": "MIT",
   "scripts": {

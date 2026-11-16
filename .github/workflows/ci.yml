@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install ffmpeg
+        # `synth=host` converts the provider's WAV to OGG/Opus, and five tests run the real
+        # binary: without ffmpeg on PATH they fail, so a green CI run means the path works.
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: npm test

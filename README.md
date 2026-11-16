@@ -1,13 +1,86 @@
 # @dr-co/dsh-voice
 
-Voice markup for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness):
-one format for both directions of a spoken turn, an input marker lifted out of
-the prompt at `agent/pre-step`, and the prompt section that tells the model how
-a spoken answer is written.
+A spoken turn for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness):
+a press on a node becomes a recording, the recording becomes a transcript, and
+the answer comes back to the phone as one chat message that carries both the
+line to show and the speech to play.
 
-This package synthesizes nothing and sends nothing. A Host that wants audio
-installs a text-to-speech provider and a layer that reads `splitReply()`; this
-package only makes the turn *legible* as spoken.
+Four things live here, and the package ships all of them:
+
+| part | what it does |
+|---|---|
+| the marker | `--- # voice` in, `--- # say`/`--- # screen` out, read by `splitReply()` |
+| the loop | record → transcribe → deliver → watch the turn → answer the device |
+| the prompt section | how a spoken answer is written, and what it may not contain |
+| the trace | one log line per stage of every exchange, one closing line with the reason |
+
+The device commands the answer travels by are `voice.chat` (`{role, text, speak,
+say, who, degraded}`) for the screen and `voice.answer` (`{id, text, speak, who,
+seconds, path}`) when the host is the one speaking. `voice.say`/`voice.play` are
+not the main path: `voice.say` is what the loop uses to say one short sentence on
+the device when a press produced nothing to answer.
+
+## Requirements
+
+| what | why | needed for |
+|---|---|---|
+| Node.js 22+ | `node --test`, and the `engines` field says so | everything |
+| `dsh-nodes` with the `voice` API | the device side of every command | everything |
+| a `speechToText` service | nothing can be transcribed without it | answering words |
+| `ffmpeg` on `PATH` | the host converts the provider's WAV to OGG/Opus (`libopus`) and applies the playback tempo with `atempo` | `synth=host` only |
+| a `textToSpeech` service | the host voice | `synth=host` only |
+
+Neither service is declared in `inject`: a Host may have none (no synthesizer is
+the normal case for `synth=device`, the default) and a provider may register
+after this plugin. Both are read at the moment they are needed, so a missing one
+degrades instead of keeping the chat dead:
+
+- no recognizer — a press is answered in words ("не могу распознать речь: нет
+  сервиса распознавания") and the closing line says `reason=no-stt`;
+- no synthesizer — `synth=host` falls back to the device engine, the message
+  carries `degraded: {kind: "tts-failed"}`, and the closing line says
+  `reason=tts-failed`.
+
+`npm test` also needs `ffmpeg`: five tests run the real binary for the host-audio
+path, so a green run means that path works. CI installs it explicitly.
+
+## Install
+
+`dsh plugin` forwards its arguments to `pnpm` inside the profile directory, so a
+local directory and a registry name are the same command with a different target.
+
+```sh
+# from a local checkout: pnpm links the directory, so the profile runs this copy
+dsh plugin --profile <profile> add /path/to/dsh-voice
+
+# once the package is on npm — nothing else changes
+dsh plugin --profile <profile> add @dr-co/dsh-voice
+```
+
+The package is not published yet; the second form starts working the moment it
+is, with the same row and the same code.
+
+The package ships `dsh.bundle.patch`, so the row mounts itself:
+
+```yaml
+- insert:
+    - id: dsh-voice
+      name: '@dr-co/dsh-voice'
+```
+
+## Configuration
+
+| key | default | what it changes |
+|---|---|---|
+| `cacheDir` | `$DSH_HOME/cache/voice` (`./.dsh/cache/voice` without `DSH_HOME`) | where recordings wait, where rendered answers wait for the device, and where `sessions.json` keeps the node → session bindings |
+| `language` | `ru` | the language the recognizer is asked for. Named, not inherited from the Host default: `auto` lets a short noisy take drift into another language, and the transcript then reaches the session as the person's own words |
+| `minSeconds` | `0.4` | below this a take is a button click, not speech: it never reaches the recognizer, the session is untouched, and the closing line says `reason=too-short` |
+| `keepRecording` | `last` | `last` keeps the newest take of every node (older ones go), `none` removes a take as soon as it is used. Anything that is not `none` reads as `last`: a typo must not throw a recording away |
+
+The recordings live in `<cacheDir>/incoming/<node>/`, the rendered answers in
+`<cacheDir>/out/`. Both are swept by `mtime`: a recording older than 24 hours is
+removed at boot and then once a day, and an orphaned `.ogg` goes by the same
+rule (its fast path is the two-minute guard that follows every answer).
 
 ## Who speaks
 
@@ -66,8 +139,9 @@ A wait can no longer stick: any `turn/end` clears it (`cancelled` and `error` cl
 ## Waking the model before the first word
 
 Opening the voice screen sends `{"type":"voice-warmup"}`, which reaches the loop as
-`dsh-nodes/voice-warmup` and calls `textToSpeech.warmup()` — the synthesizer starts its worker
-while the person is still deciding what to say. Nothing else happens: no session, no exchange, no
+`dsh-nodes/voice-warmup` and calls the synthesizer's `warmup()` — the model starts its worker
+while the person is still deciding what to say. A host with no synthesizer closes the stage with
+`warmup=no-service` and nothing else happens. Nothing else happens: no session, no exchange, no
 line on the screen, nothing spoken.
 
 The warmup is debounced to one per node per minute — entering, leaving and entering again is not a
@@ -114,14 +188,15 @@ event arrived, and exactly one closing line with the deltas:
 [dsh-voice] exchange take-1 node=A059P stage=turn-end ms=4120 reason=completed
 [dsh-voice] exchange take-1 node=A059P stage=split ms=4122 speakChars=68
 [dsh-voice] exchange take-1 node=A059P stage=synthesized ms=5030 seconds=6.8
-[dsh-voice] exchange take-1 node=A059P stage=spoken ms=5310
+[dsh-voice] exchange take-1 node=A059P stage=answered ms=5310 via=voice.answer
 [dsh-voice] exchange take-1 node=A059P done total=5310ms
-            segments={record: 4800, upload: 180, stt: 312, model: 3769, tts: 908, play: 280}
+            segments={record: 4800, upload: 180, stt: 312, model: 3769, tts: 908}
 ```
 
 `record` and `upload` come from the device (`x-record-start/-stop`, `x-sent-at` against the
 server's `receivedAt`); a segment that never happened is absent from the line, not a zero. A
-failed exchange closes with `reason=empty`, `reason=no-session`, `reason=silent` and so on.
+failed exchange closes with its own reason: `empty`, `no-stt`, `no-recording`, `no-copy`,
+`no-session`, `silent`, `too-short`, `refused-path`, `timeout`, `disposed`, `tts-failed`.
 
 ## A new conversation on demand
 
@@ -151,17 +226,27 @@ in the closing line.
 
 ## Two ways a recording arrives
 
+The push path is the main one; the pull path is kept while the clients migrate.
+
 | path | who starts it | what the loop calls |
 |---|---|---|
-| push (new) | the device records and uploads | nothing — the file is already at `event.path` |
-| pull (old, still supported) | the host asks after `voice.want` | `voice.record` → `files.copyFromDevice` |
+| push | the device records and uploads | nothing — the file is already at `event.path` |
+| pull (older clients) | the host asks after `voice.want` | `voice.record` → `files.copyFromDevice` |
 
 `dsh-nodes/voice` carries `{node, nodeName, id, path, bytes, seconds}`. The `id` is the
 identity of one exchange: a retry with the same id is answered `already` and produces no
-second turn.
+second turn. The id is reserved as soon as the event is accepted, so a copy that arrives
+while the first one is still waiting for the model (up to three minutes) is a duplicate,
+not a second answer; a failed exchange releases it, because the client re-sends the same
+id on purpose. The reservation lives in memory: a restart kills the exchange in flight
+anyway, and a retry after it has to be handled again rather than declared answered.
 
-The upload lands in `<DSH_HOME>/cache/voice/incoming/<node>/<id>.wav`. What is left of it
-afterwards is the `keepRecording` setting:
+`path` must be inside `cacheDir`: the file is read and then removed, so an event naming
+anything else is refused whole — a warning with the path and a closing line with
+`reason=refused-path`, the file untouched.
+
+Both paths put the take in `<cacheDir>/incoming/<node>/`. What is left of it afterwards is
+the `keepRecording` setting:
 
 | value | what stays in `incoming/<node>/` |
 |---|---|
@@ -175,24 +260,27 @@ and the directory does not grow with every press.
 
 ## The voice loop
 
-A device cannot push a recording: the transfer endpoint accepts only an answer to a
-`copyFromDevice` command. So the phone says *"I want to talk"* (`POST /v1/events` with
-`{"voice":{"want":"record"}}`, no text, no session), and the host does the asking.
+On the push path the device records and uploads, and the loop starts with the file already
+here. On the still-supported pull path the phone says *"I want to talk"* (`POST /v1/events`
+with `{"voice":{"want":"record"}}`, no text, no session) and the host does the asking:
 
-For one exchange the loop:
-
-1. `nodes.call(node, 'voice', 'record', {mode, maxSeconds: 30, timeout: 45})` — wait for the take;
-2. `nodes.call(node, 'files', 'copyFromDevice', {path, hostPath})` — pull it into `<DSH_HOME>/cache/voice`;
-3. `nodes.call(node, 'shell', 'exec', {command: 'rm -f <device path>'})` — the device copy is litter once it is here;
+1. `nodes.call(node, 'voice', 'record', {mode, maxSeconds: 30, timeout: 12})` — wait for the take;
+2. `nodes.call(node, 'files', 'copyFromDevice', {path, hostPath})` — pull it into the node's
+   directory under `<cacheDir>/incoming/`;
+3. `nodes.call(node, 'shell', 'exec', {command: 'rm -f -- <device path>'})` — the device copy
+   is litter once it is here;
 4. `speechToText.resolve(...)` + `transcribe(...)` — the WAV is already the canonical 16 kHz mono PCM16;
 5. an empty transcript is answered out loud (`voice.say`) and never reaches a session;
 6. otherwise the text goes into the session as a user message with `source: {kind: 'dsh-nodes', voice: true}`;
 7. the turn is watched: on a completed turn the last assistant text is cut with `splitReply`,
-   only the `# say` part is spoken, and the phone says it through `voice.say`.
+   the `# screen` part (or `# say` when there is none) goes to `voice.chat`, and — on
+   `synth=host` — the `# say` part also becomes an OGG that `voice.answer` carries.
 
-The audio is synthesized on the host as well — the file is produced and dropped, so the
-moment `voice.play` exists nothing on this side has to change. Recordings and rendered
-speech are removed after each exchange.
+Every refusal on this way ends in a sentence the person hears, not in a log line: a
+timeout, a permission denial, a cancelled take, a `status: ok` without a path, a rejected
+`voice.record` or `copyFromDevice` ("не смог начать запись: <причина>"), a session that
+cannot be created, and a missing recognizer each have their own words and their own
+`reason=` in the closing line.
 
 ## The format
 
@@ -245,20 +333,6 @@ layer may read them for itself.
 A failed split never costs the user their message: the listener returns the
 original decision and the marker stays inline, exactly as it would on a Host
 without this plugin.
-
-## Install
-
-```sh
-dsh plugin --profile <profile> add @dr-co/dsh-voice
-```
-
-The package ships `dsh.bundle.patch`, so the row mounts itself:
-
-```yaml
-- insert:
-    - id: dsh-voice
-      name: '@dr-co/dsh-voice'
-```
 
 ## Use the parser without the plugin
 

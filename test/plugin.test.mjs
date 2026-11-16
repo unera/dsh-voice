@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { annotateVoiceMessages, install, voiceNotice } from '../index.mjs'
+import { annotateVoiceMessages, install, installLoop, voiceNotice } from '../index.mjs'
 
 /** Minimal Host stand-in: records listeners and prompt sections, no framework. */
 function stubHost () {
@@ -158,4 +158,74 @@ test('the notice names only the facts the marker carried', () => {
   const withFacts = voiceNotice({ options: { device: 'pixel', speed: '1.2' } }).content[0].text
   assert.match(withFacts, /устройство: pixel/)
   assert.match(withFacts, /желаемый темп: 1\.2/)
+})
+
+/** Host stand-in for the voice loop: services by name, listeners, effects. */
+function loopHost (services = {}) {
+  const listeners = []
+  const effects = []
+  return {
+    listeners,
+    effects,
+    services,
+    get (name) { return services[name] ?? null },
+    on (event, listener, options) {
+      listeners.push({ event, listener, options })
+      return () => {}
+    },
+    emit () {},
+    effect (fn) { effects.push(fn) },
+  }
+}
+
+/** A logger that keeps every line, so a test can read what a boot said. */
+function linesLogger (lines) {
+  return {
+    info: (line) => lines.push(String(line)),
+    warn: (line) => lines.push(`WARN ${line}`),
+    debug: () => {},
+  }
+}
+
+test('the loop starts with nodes alone, so a host without a synthesizer still talks', () => {
+  const lines = []
+  const host = loopHost({ nodes: { call: async () => ({ status: 'ok' }) } })
+
+  const loop = installLoop(host, { logger: linesLogger(lines) })
+
+  assert.ok(loop, 'the loop is up while synth=device needs no host service')
+  const events = host.listeners.map((entry) => entry.event)
+  for (const event of ['dsh-nodes/voice', 'dsh-nodes/voice-want', 'dsh-nodes/voice-warmup', 'dsh-nodes/bug-report', 'dsh-nodes/voice-new-session', 'session/event']) {
+    assert.ok(events.includes(event), `${event} must be wired with nodes alone`)
+  }
+  assert.ok(lines.some((line) => line.startsWith('WARN') && line.includes('speech recognition is not installed')),
+    'a missing recognizer is said in the log, not left implicit')
+  loop.dispose()
+})
+
+test('without nodes the loop waits for the service and then starts', async () => {
+  const host = loopHost({})
+  const lines = []
+
+  const waiting = installLoop(host, { logger: linesLogger(lines) })
+
+  assert.equal(waiting, undefined, 'nothing to talk to yet')
+  assert.ok(host.listeners.some((entry) => entry.event === 'internal/service' && entry.options?.global === true))
+  assert.ok(!host.listeners.some((entry) => entry.event === 'dsh-nodes/voice'), 'no device listener before nodes')
+
+  host.services.nodes = { call: async () => ({ status: 'ok' }) }
+  const waiter = host.listeners.find((entry) => entry.event === 'internal/service')
+  await waiter.listener()
+
+  assert.ok(host.listeners.some((entry) => entry.event === 'dsh-nodes/voice'), 'the loop starts once nodes appears')
+})
+
+test('a prompt service that cannot be declared does not cost the marker listener', () => {
+  const host = stubHost()
+  host.inject = () => { throw new Error('systemPrompt is not a declared dependency') }
+
+  const dispose = install(host, { logger: linesLogger([]) })
+
+  assert.equal(typeof dispose, 'function')
+  assert.ok(preStep(host), 'agent/pre-step is still registered')
 })

@@ -8,7 +8,7 @@
 // Every outside world dependency is passed in, so the whole loop can be exercised on stubs:
 // no device, no model, no speech service.
 import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, join, resolve, sep } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
 import { splitReply } from './markup.mjs'
@@ -57,6 +57,43 @@ export const RECORDING_TTL_MS = 24 * 60 * 60 * 1000
 const SWEEP_INTERVAL_MS = RECORDING_TTL_MS
 /** Where the device uploads land: `<cacheDir>/incoming/<node>/<id>.wav`. */
 const INCOMING_DIR = 'incoming'
+/** Where a synthesized answer waits for the device: `<cacheDir>/out/<id>.ogg`. */
+const OUTPUT_DIR = 'out'
+
+/**
+ * Is this path inside the voice cache?
+ *
+ * A recording path arrives in an event, and the file is read and then removed: `keepRecording:
+ * none` unlinks it, `last` prunes its whole directory. The event source is internal, but the
+ * boundary belongs to this plugin, so every path is checked before it is touched.
+ *
+ * @param path - the path from the event.
+ * @param cacheDir - the voice cache.
+ * @returns true only for a path strictly under the cache directory.
+ */
+export function insideCache (path, cacheDir) {
+  if (typeof path !== 'string' || !path) return false
+  try {
+    return resolve(path).startsWith(resolve(cacheDir) + sep)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * The directory of one node inside the cache.
+ *
+ * The node name comes from an event and becomes a path segment, so anything that is not a plain
+ * name character is replaced instead of being read as a separator.
+ *
+ * @param cacheDir - the voice cache.
+ * @param nodeName - the device name.
+ * @returns `<cacheDir>/incoming/<safe node>`.
+ */
+export function nodeDir (cacheDir, nodeName) {
+  const safe = String(nodeName ?? '').replace(/[^A-Za-z0-9._-]/g, '_') || '_'
+  return join(cacheDir, INCOMING_DIR, safe)
+}
 
 /**
  * Read the `keepRecording` setting.
@@ -142,6 +179,10 @@ export function sweepRecordings (cacheDir, { now = Date.now(), maxAgeMs = RECORD
       log?.warn?.('[dsh-voice] could not remove an expired recording:', error?.message ?? error)
     }
   }
+  // A rendered answer is removed as soon as the device takes it, with a two-minute guard for a
+  // device that never answers. A crash between the two leaves an orphan, and this sweep is what
+  // keeps it from living forever; the age window is the recording one, the guard is the fast path.
+  for (const file of filesIn(join(cacheDir, OUTPUT_DIR))) expire(file)
   for (const entry of filesIn(root)) expire(entry)
   let nodes = []
   try {
@@ -178,6 +219,35 @@ export function shellQuote (value) {
 const WARMUP_DEBOUNCE_MS = 60_000
 /** What we say when the recording produced no words. */
 const NOT_HEARD = 'Не расслышал, повтори пожалуйста.'
+/**
+ * What we say when there is no recognizer at all.
+ *
+ * Without it nothing can be transcribed, so the press cannot be answered — but it must be said:
+ * a press that ends in silence is indistinguishable from a broken button.
+ */
+const NO_TRANSCRIBER = 'Не могу распознать речь: на хосте нет сервиса распознавания.'
+/** What we say when the device could not even start a recording. */
+const RECORD_REFUSED = 'Не смог начать запись'
+
+/**
+ * Turn a refused `voice.record` into one short sentence for the person.
+ *
+ * A timeout is the expected case and keeps its own wording; everything else — permission, a
+ * cancelled take, a `status: ok` without a path, a rejected call — names the reason it carried.
+ *
+ * @param record - the answer of `voice.record`, or the failure the call produced.
+ * @returns a sentence to speak on the device.
+ */
+export function refusalText (record) {
+  if (record?.code === 'voice_timeout') return 'Не услышал попробуй ещё раз.'
+  const raw = String(record?.message ?? record?.code ?? record?.status ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[.。]+$/, '')
+  // `status: ok` without a path names no reason at all: it is said like one.
+  const reason = !raw || raw === 'ok' || raw === 'failed' ? 'устройство не отдало запись' : raw
+  return `${RECORD_REFUSED}: ${reason.slice(0, 120)}.`
+}
 
 /** File that remembers which session a node talks to, next to the recordings. */
 const BINDINGS_FILE = 'sessions.json'
@@ -262,6 +332,9 @@ export function assistantTextOf (event) {
  * @param deps.nodes - the `nodes` service: `call(node, api, method, data, options)`.
  * @param deps.speechToText - the recognition service, or null when it is not installed.
  * @param deps.textToSpeech - the synthesis service; optional.
+ * @param deps.serviceFor - the Host's lazy getter: `(name) => service | null`. When given, it is
+ *   what every optional service read goes through, so a plugin that registers after this one is
+ *   still found and a missing one degrades instead of stopping the loop.
  * @param deps.sessions - the session service (`flush`).
  * @param deps.sessionController - resolves and creates sessions.
  * @param {string} deps.cacheDir - where a recording is kept on the host while it is used.
@@ -270,12 +343,14 @@ export function assistantTextOf (event) {
  * @param {Function} [deps.on] - subscription for session events.
  * @param {string} [deps.keepRecording] - `last` (default) keeps the newest take of every node,
  *   `none` removes every take once it is used.
- * @returns `{ handle, observeSessionEvent, pending, dispose }`
+ * @param {number} [deps.warmupDebounceMs] - how long one node's warmup holds; a test value.
+ * @returns `{ handle, handleUpload, observeSessionEvent, pending, dispose }`
  */
 export function createVoiceLoop ({
   nodes,
   speechToText = null,
   textToSpeech = null,
+  serviceFor = null,
   sessions = null,
   sessionController = null,
   cacheDir,
@@ -290,7 +365,18 @@ export function createVoiceLoop ({
   language = DEFAULT_LANGUAGE,
   minSeconds = MIN_SECONDS,
   keepRecording = KEEP_LAST,
+  warmupDebounceMs = WARMUP_DEBOUNCE_MS,
 }) {
+  /**
+   * A service, read at the moment it is needed.
+   *
+   * The synthesizer may legitimately be absent (`synth=device` is the default) or may register
+   * after this plugin: reading it once at build time was how a host with nodes and recognition
+   * lost the whole loop over an optional service.
+   */
+  const stt = () => (typeof serviceFor === 'function' ? serviceFor('speechToText') : speechToText)
+  const tts = () => (typeof serviceFor === 'function' ? serviceFor('textToSpeech') : textToSpeech)
+
   /** `last` or `none`, decided once: the config cannot change under a running loop. */
   const keeping = resolveKeepRecording(keepRecording)
   /** One entry per node that is currently being talked to. */
@@ -317,7 +403,7 @@ export function createVoiceLoop ({
   }
 
   /** Where a synthesized answer waits for the device to fetch it. */
-  const outputDir = join(cacheDir, 'out')
+  const outputDir = join(cacheDir, OUTPUT_DIR)
 
   /** Nodes whose "new session" arrived while an exchange was still running. */
   const resetPending = new Set()
@@ -325,9 +411,19 @@ export function createVoiceLoop ({
   /** When each node last warmed the synthesizer up, for the debounce. */
   const warmups = new Map()
 
-  /** Recording ids already handled: a retry must not become a second answer. */
+  /** Recording ids already delivered: a retry must not become a second answer. */
   const seen = new Map()
   const SEEN_LIMIT = 200
+  /**
+   * Recording ids whose exchange is running right now.
+   *
+   * The id used to be remembered only after a delivery, so two copies of one recording that
+   * arrived while the first was still waiting for the model (up to three minutes) both passed the
+   * check and the person was answered twice. The reservation is taken when the event is accepted
+   * and released when the exchange ends, whatever the outcome — a failed exchange must leave the
+   * id free, because the client re-sends it on purpose.
+   */
+  const inFlight = new Set()
 
   /**
    * Show one line on the device screen.
@@ -403,6 +499,12 @@ export function createVoiceLoop ({
    * @returns the kept path, or null when it was removed.
    */
   function discardRecording (path) {
+    if (!insideCache(path, cacheDir)) {
+      // A path that is not ours is neither read nor removed: `none` would unlink an arbitrary
+      // file, and `last` would prune a directory belonging to somebody else.
+      log.warn?.('[dsh-voice] refusing to touch a file outside the voice cache', { path })
+      return null
+    }
     if (keeping !== KEEP_LAST) {
       cleanup([path])
       return null
@@ -431,28 +533,36 @@ export function createVoiceLoop ({
 
   /** Say something short on the device through its own engine, best effort. */
   async function say (node, text) {
-    const answer = await nodes.call(node, 'voice', 'say', { text })
-    if (answer?.status !== 'ok') log.warn?.('[dsh-voice] the device did not speak:', answer?.message ?? answer?.code)
-    return answer
+    // A device that cannot be reached must not turn a report into a crash: the caller is already
+    // in the middle of telling the person what went wrong.
+    try {
+      const answer = await nodes.call(node, 'voice', 'say', { text })
+      if (answer?.status !== 'ok') log.warn?.('[dsh-voice] the device did not speak:', answer?.message ?? answer?.code)
+      return answer
+    } catch (error) {
+      log.warn?.('[dsh-voice] the device did not speak:', error?.message ?? error)
+      return null
+    }
   }
 
   /** Ask the device how much of the words it heard. */
   async function transcribe (audioPath, trace = null) {
-    if (!speechToText) throw Object.assign(new Error('speech recognition is not installed'), { code: 'no_speech' })
+    const recognizer = stt()
+    if (!recognizer) throw Object.assign(new Error('speech recognition is not installed'), { code: 'no_speech' })
     const audio = readFileSync(audioPath)
     // The language is named, not inherited: a Host default of `auto` lets a short noisy take drift
     // into any language the model likes, and the person's words are then translated by accident.
     let spec = null
     try {
-      spec = speechToText.resolve({ audio, language })
+      spec = recognizer.resolve({ audio, language })
     } catch (error) {
       // A provider that does not take this language is not an emergency: say so and let the
       // service pick its own default rather than losing the recording.
       log.warn?.('[dsh-voice] the recognizer does not take the configured language:', error?.message ?? error)
-      spec = speechToText.resolve({ audio })
+      spec = recognizer.resolve({ audio })
     }
     trace?.mark('stt-request', { provider: spec?.provider?.info?.id ?? 'default', language })
-    return await speechToText.transcribe(spec, new AbortController().signal)
+    return await recognizer.transcribe(spec, new AbortController().signal)
   }
 
   /**
@@ -562,13 +672,53 @@ export function createVoiceLoop ({
     // the press, park its take, and then answer the previous question only when
     // the *next* press asked for a recording — the words arrived one message late
     // and the delay grew with every press.
+    return await enqueue(nodeName, async () => await exchange(want, nodeName))
+  }
+
+  /**
+   * Run one exchange behind whatever this node is already doing.
+   *
+   * The queue is keyed by a name that comes from an event: a key that is never removed is one
+   * entry per device ever seen, held for the lifetime of the host. It is dropped once its chain
+   * is the current one again and nothing waits behind it.
+   *
+   * @param nodeName - the node the exchange talks to.
+   * @param run - the exchange itself.
+   * @param label - the warning for a failure that escaped the exchange.
+   * @returns what the exchange returned, or `{status: 'failed'}`.
+   */
+  function enqueue (nodeName, run, label = 'voice exchange failed') {
     const chain = queues.get(nodeName) ?? Promise.resolve()
-    const mine = chain.then(async () => await exchange(want, nodeName)).catch((error) => {
-      log.warn?.('[dsh-voice] voice exchange failed:', error?.message ?? error)
+    const mine = chain.then(run).catch((error) => {
+      log.warn?.(`[dsh-voice] ${label}:`, error?.message ?? error)
       return { status: 'failed' }
     })
-    queues.set(nodeName, mine.then(() => {}).catch(() => {}))
-    return await mine
+    const settled = mine.then(() => {}).catch(() => {})
+    queues.set(nodeName, settled)
+    void settled.then(() => {
+      if (queues.get(nodeName) === settled) queues.delete(nodeName)
+    })
+    return mine
+  }
+
+  /**
+   * Ask one node for something, and never let the call itself throw.
+   *
+   * A rejected `voice.record` or `copyFromDevice` used to travel to the outer catch, where it
+   * became a single warning line: the person pressed, heard nothing, and had no way to know why.
+   *
+   * @param node - the node to call.
+   * @param api - the node API number.
+   * @param method - the method name.
+   * @param data - its arguments.
+   * @returns the answer, or a failure shaped like one.
+   */
+  async function callNode (node, api, method, data) {
+    try {
+      return await nodes.call(node, api, method, data)
+    } catch (error) {
+      return { status: 'failed', code: 'rejected', message: String(error?.message ?? error) }
+    }
   }
 
   /**
@@ -583,7 +733,7 @@ export function createVoiceLoop ({
     trace.mark('received')
     active.set(nodeName, { sessionId: want?.sessionId ?? bindings.get(nodeName) ?? null })
     mkdirSync(cacheDir, { recursive: true })
-    const record = await nodes.call(nodeName, 'voice', 'record', {
+    const record = await callNode(nodeName, 'voice', 'record', {
       mode: want?.mode ?? 'ptt',
       maxSeconds: 30,
       timeout: RECORD_TIMEOUT_SECONDS,
@@ -591,15 +741,21 @@ export function createVoiceLoop ({
     if (record?.status !== 'ok' || !record?.payload?.path) {
       releaseNode(nodeName)
       log.info?.('[dsh-voice] no recording', { node: nodeName, code: record?.code ?? record?.status })
-      if (record?.code === 'voice_timeout') await say(nodeName, 'Не услышал попробуй ещё раз.')
-      trace.done('no-recording', { code: record?.code ?? null, language })
+      // Every refusal is said out loud: permission, a cancelled take, a `status: ok` with no
+      // path, a rejected call — a press that ends in silence is indistinguishable from a button
+      // that does not work.
+      await say(nodeName, refusalText(record))
+      trace.done('no-recording', { code: record?.code ?? record?.status ?? null, language })
       return { status: 'no-recording', code: record?.code ?? null }
     }
     const devicePath = record.payload.path
-    const localPath = join(cacheDir, `take-${Date.now()}-${basename(devicePath)}`)
-    const copy = await nodes.call(nodeName, 'files', 'copyFromDevice', { path: devicePath, hostPath: localPath })
+    // The take lands in the node's own directory, the same one a pushed recording uses: then
+    // `keepRecording` and the age sweep treat both paths alike.
+    const localPath = join(nodeDir(cacheDir, nodeName), `take-${Date.now()}-${basename(devicePath)}`)
+    mkdirSync(dirname(localPath), { recursive: true })
+    const copy = await callNode(nodeName, 'files', 'copyFromDevice', { path: devicePath, hostPath: localPath })
     // The take belongs to the person's words: once it is here, the device copy is litter.
-    await nodes.call(nodeName, 'shell', 'exec', { command: `rm -f -- ${shellQuote(devicePath)}` })
+    await callNode(nodeName, 'shell', 'exec', { command: `rm -f -- ${shellQuote(devicePath)}` })
     if (copy?.status !== 'ok') {
       releaseNode(nodeName)
       cleanup([localPath])
@@ -611,15 +767,17 @@ export function createVoiceLoop ({
     const recordedSeconds = Number(record.payload.seconds)
     if (Number.isFinite(recordedSeconds) && recordedSeconds > 0 && recordedSeconds < minSeconds) {
       releaseNode(nodeName)
-      cleanup([localPath])
+      discardRecording(localPath)
       trace.done('too-short', { language, seconds: recordedSeconds })
       return { status: 'too-short', code: 'too-short' }
     }
     let text = ''
+    let failure = null
     try {
       const transcript = await transcribe(localPath, trace)
       text = String(typeof transcript === 'string' ? transcript : transcript?.text ?? '').trim()
     } catch (error) {
+      failure = error
       log.warn?.('[dsh-voice] transcription failed:', error?.message ?? error)
     }
     trace.mark('transcribed')
@@ -628,12 +786,26 @@ export function createVoiceLoop ({
     if (text) pushChat({ node: nodeName, role: 'user', text, trace })
     if (!text) {
       releaseNode(nodeName)
-      cleanup([localPath])
-      await say(nodeName, NOT_HEARD)
-      trace.done('empty', { language })
-      return { status: 'empty' }
+      discardRecording(localPath)
+      // "I did not hear you" is a lie when there is no recognizer at all: the reason is named.
+      const noRecognizer = failure?.code === 'no_speech'
+      await say(nodeName, noRecognizer ? NO_TRANSCRIBER : NOT_HEARD)
+      trace.done(noRecognizer ? 'no-stt' : 'empty', { language })
+      return { status: noRecognizer ? 'no-stt' : 'empty' }
     }
-    const sessionId = await sessionFor(nodeName, want?.sessionId ?? null, want?.node ?? null)
+    let sessionId
+    try {
+      sessionId = await sessionFor(nodeName, want?.sessionId ?? null, want?.node ?? null)
+    } catch (error) {
+      // This used to disappear into the outer catch: the words were never delivered, nothing was
+      // said, and no closing line was written.
+      releaseNode(nodeName)
+      discardRecording(localPath)
+      log.warn?.('[dsh-voice] could not get a session:', error?.message ?? error)
+      await say(nodeName, 'Не смог начать новую сессию.')
+      trace.done('no-session', { language })
+      return { status: 'no-session' }
+    }
     active.set(nodeName, { sessionId })
     // The wait is registered before the message is delivered: a turn that starts
     // and ends quickly otherwise finishes before anyone is awaiting it, and the
@@ -647,25 +819,31 @@ export function createVoiceLoop ({
       trace.mark('delivered')
     } catch (error) {
       releaseNode(nodeName)
-      cleanup([localPath])
+      discardRecording(localPath)
       awaiting.delete(sessionId)
       log.warn?.('[dsh-voice] delivery failed:', error?.message ?? error)
       await say(nodeName, 'Не смог передать запрос.')
       trace.done('no-session', { language })
       return { status: 'no-session' }
     }
-    cleanup([localPath])
+    discardRecording(localPath)
     return { status: 'delivered', session: sessionId, text }
   }
 
   /**
-   * Remember one recording id, and say whether it is new.
+   * Remember one delivered recording id.
    *
    * A device that retries must not be answered twice: the id is the identity of one
    * exchange, not of one request. Old ids are dropped in insertion order, so the map cannot
    * grow for the lifetime of the host.
    *
-   * @param id - the recording id from the device.
+   * This memory is deliberately not written to disk. A restart kills every exchange in flight,
+   * so the client's retry of one has to be handled again — persisting the id would turn that
+   * retry into "already answered" and lose the person's words, which is the worse failure. The
+   * only case a file would cover is a delivery whose answer never reached the client, and that
+   * one is better answered twice than never.
+   *
+   * @param id - the recording id, already keyed by node.
    * @returns true the first time this id is seen.
    */
   function rememberId (id) {
@@ -686,33 +864,54 @@ export function createVoiceLoop ({
     const path = typeof event?.path === 'string' ? event.path : ''
     if (!path) return { status: 'no-file' }
     const nodeName = event?.nodeName ?? String(event?.node ?? '')
+    if (!insideCache(path, cacheDir)) {
+      // This path is read and then removed: `keepRecording: none` unlinks it, `last` prunes its
+      // directory. The event source is internal, and this is the plugin's own boundary — one
+      // event with a strange path must not delete files anywhere else, so it is refused whole.
+      log.warn?.('[dsh-voice] refusing a recording outside the voice cache', {
+        path,
+        node: nodeName,
+        id: id || null,
+        stack: new Error('a recording path outside the voice cache').stack,
+      })
+      const refused = createTrace({ id: event?.id ?? null, node: nodeName, at: event?.at ?? null, log })
+      refused.mark('received')
+      refused.done('refused-path', { language })
+      return { status: 'refused-path', id: event?.id ?? null }
+    }
     // Two devices may well produce the same id: the key is the pair, not the id alone.
     const key = `${nodeName}:${id}`
-    if (id && seen.has(key)) {
-      // A retry of something already answered. The server has just written a fresh file for it,
-      // and leaving every repeat behind would grow the cache without end: it becomes the node's
-      // one kept recording, and its predecessors go.
-      discardRecording(path)
-      log.info?.('[dsh-voice] the same recording arrived again, ignoring', { id, node: nodeName })
+    if (id && (seen.has(key) || inFlight.has(key))) {
+      // A retry of something already answered, or of one still being worked on. The server has
+      // just written a fresh file for it, and leaving every repeat behind would grow the cache
+      // without end: after a delivery the repeat becomes the node's one kept recording and its
+      // predecessors go; while the first is still running only its own file is dropped, because
+      // the take the running exchange reads must stay where it is.
+      if (inFlight.has(key)) cleanup([path])
+      else discardRecording(path)
+      log.info?.('[dsh-voice] the same recording arrived again, ignoring', {
+        id,
+        node: nodeName,
+        inFlight: inFlight.has(key),
+      })
       return { status: 'already', id }
     }
+    // The id is taken now, not when the answer is delivered: the model may take three minutes,
+    // and a second copy of the same recording arriving meanwhile must not become a second answer.
+    if (id) inFlight.add(key)
     // The same per-node order as a press: two takes cannot overtake each other, and the
     // second waits instead of being dropped.
-    const chain = queues.get(nodeName) ?? Promise.resolve()
-    const mine = chain
-      .then(async () => {
+    return await enqueue(nodeName, async () => {
+      try {
         const outcome = await exchangeFromFile(event, nodeName)
         // Only a delivered turn owns the id. A failure — recognition, delivery, an empty take —
         // must leave the retry path open: the client re-sends the same id on purpose.
         if (id && outcome?.status === 'delivered') rememberId(key)
         return outcome
-      })
-      .catch((error) => {
-        log.warn?.('[dsh-voice] uploaded exchange failed:', error?.message ?? error)
-        return { status: 'failed' }
-      })
-    queues.set(nodeName, mine.then(() => {}).catch(() => {}))
-    return await mine
+      } finally {
+        if (id) inFlight.delete(key)
+      }
+    }, 'uploaded exchange failed')
   }
 
   /**
@@ -735,21 +934,34 @@ export function createVoiceLoop ({
       return { status: 'too-short', id: event?.id ?? null, seconds }
     }
     let text = ''
+    let failure = null
     try {
       const transcript = await transcribe(event.path, trace)
       text = String(typeof transcript === 'string' ? transcript : transcript?.text ?? '').trim()
     } catch (error) {
+      failure = error
       log.warn?.('[dsh-voice] transcription failed:', error?.message ?? error)
     }
     trace.mark('transcribed')
     if (text) pushChat({ node: nodeName, role: 'user', text, id: event?.id ?? null, trace })
     if (!text) {
       discardRecording(event.path)
-      await say(nodeName, NOT_HEARD)
-      trace.done('empty', { language })
-      return { status: 'empty', id: event?.id ?? null }
+      const noRecognizer = failure?.code === 'no_speech'
+      await say(nodeName, noRecognizer ? NO_TRANSCRIBER : NOT_HEARD)
+      trace.done(noRecognizer ? 'no-stt' : 'empty', { language })
+      return { status: noRecognizer ? 'no-stt' : 'empty', id: event?.id ?? null }
     }
-    const sessionId = await sessionFor(nodeName, event?.sessionId ?? null, event?.node ?? null)
+    let sessionId
+    try {
+      sessionId = await sessionFor(nodeName, event?.sessionId ?? null, event?.node ?? null)
+    } catch (error) {
+      // The exception used to reach the outer catch: no answer, no words, and no closing line.
+      discardRecording(event.path)
+      log.warn?.('[dsh-voice] could not get a session:', error?.message ?? error)
+      await say(nodeName, 'Не смог начать новую сессию.')
+      trace.done('no-session', { language })
+      return { status: 'no-session', id: event?.id ?? null }
+    }
     active.set(nodeName, { sessionId })
     // The wait is registered before the message is delivered: a turn that starts and ends
     // quickly would otherwise finish before anyone awaits it.
@@ -799,8 +1011,12 @@ export function createVoiceLoop ({
       return { status: 'not-voice' }
     }
     const now = Date.now()
+    // The map is keyed by a name that comes from an event, and only the names warmed inside the
+    // debounce window can change an answer: the rest are dropped instead of being held for the
+    // lifetime of the host.
+    for (const [name, at] of warmups) if (now - at >= warmupDebounceMs) warmups.delete(name)
     const last = warmups.get(nodeName) ?? 0
-    if (now - last < WARMUP_DEBOUNCE_MS) {
+    if (now - last < warmupDebounceMs) {
       // Entering, leaving and entering again within a minute must not wake the model twice.
       trace.mark('warmup', { result: 'skipped' })
       trace.done('skipped', { language })
@@ -808,12 +1024,13 @@ export function createVoiceLoop ({
     }
     warmups.set(nodeName, now)
     trace.mark('warmup', { result: 'ready' })
-    if (typeof textToSpeech?.warmup !== 'function') {
+    const speech = tts()
+    if (typeof speech?.warmup !== 'function') {
       trace.done('ready', { language, warmup: 'no-service' })
       return { status: 'ready' }
     }
     try {
-      await textToSpeech.warmup()
+      await speech.warmup()
       trace.done('ready', { language })
       return { status: 'ready' }
     } catch (error) {
@@ -954,16 +1171,22 @@ export function createVoiceLoop ({
 
   /** The configured playback tempo, applied to host audio only. */
   function tempo () {
-    const configured = Number(textToSpeech?.snapshot?.().selection?.speed ?? 1)
+    const configured = Number(tts()?.snapshot?.().selection?.speed ?? 1)
     return Number.isFinite(configured) && configured > 0 ? configured : 1
   }
 
-  /** Ask the service for audio; a missing service is a failure, not a silence. */
+  /**
+   * Ask the service for audio; a missing service is a failure, not a silence.
+   *
+   * `synth=host` on a host without a synthesizer lands here: the answer takes the same degraded
+   * path as a broken provider — the device engine reads it and the screen says why.
+   */
   async function synthesize (text) {
-    if (!textToSpeech?.resolve || !textToSpeech?.synthesize) throw new Error('text-to-speech is not installed')
+    const speech = tts()
+    if (!speech?.resolve || !speech?.synthesize) throw new Error('синтез речи на хосте не установлен')
     // The provider speaks at its own rate: a tempo belongs to playback, not to synthesis.
-    const spec = textToSpeech.resolve({ text, speed: 1, format: 'wav' })
-    return await textToSpeech.synthesize(spec, new AbortController().signal)
+    const spec = speech.resolve({ text, speed: 1, format: 'wav' })
+    return await speech.synthesize(spec, new AbortController().signal)
   }
 
   /**
@@ -1193,12 +1416,18 @@ export function createVoiceLoop ({
     handleWarmup,
     observeSessionEvent,
     awaiting,
+    /** The per-node exchange queues: exposed so a test can see that none is left behind. */
+    queues,
+    /** When each node last warmed the synthesizer up: the same, for the debounce map. */
+    warmups,
     dispose () {
       clearInterval(sweepTimer)
       stopWatching()
       awaiting.clear()
       drafts.clear()
       active.clear()
+      queues.clear()
+      warmups.clear()
     },
   }
 }

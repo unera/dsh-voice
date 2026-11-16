@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 
 import { assistantTextOf, createVoiceLoop, resolveKeepRecording, sweepRecordings } from '../loop.mjs'
@@ -25,6 +25,20 @@ function wavBytes (seconds = 0.2, sampleRate = 16000) {
   header.write('data', 36, 'ascii')
   header.writeUInt32LE(data.length, 40)
   return Buffer.concat([header, data])
+}
+
+/**
+ * A recording where the device puts it: under the cache directory the loop is given.
+ *
+ * An upload event names a path inside `cacheDir/incoming`, and the loop now refuses anything
+ * else — so a fixture that writes beside the cache is testing a case that cannot happen.
+ */
+function uploadPath (dir, name = undefined) {
+  const file = name ?? `take-${Math.random().toString(36).slice(2, 8)}.wav`
+  const target = join(dir, 'cache', 'incoming', 'A059P', file)
+  mkdirSync(dirname(target), { recursive: true })
+  writeFileSync(target, wavBytes())
+  return target
 }
 
 /** Record every call, answer with a table of canned outcomes. */
@@ -250,11 +264,16 @@ test('nothing is left on disk after an exchange', async () => {
       create: async () => ({ sessionId: 'session-upload' }),
     },
         cacheDir: dir,
+        keepRecording: 'none',
         log: { info: () => {}, warn: () => {}, debug: () => {} },
       })
       await loop.handle({ node: 19, nodeName: 'A059P', mode: 'ptt', sessionId: 's-1' })
-      // copyFromDevice is a stub, so the loop must not leave its own copy behind either
+      // copyFromDevice is a stub, so the loop must not leave its own copy behind either. With
+      // `keepRecording: none` the take goes as it is used; the directory it lands in is the one
+      // a device upload uses, so the same assertions hold for both paths.
+      const nodeDirectory = join(dir, 'incoming', 'A059P')
       assert.equal(existsSync(join(dir, 'take-1.wav')), false)
+      assert.deepEqual(existsSync(nodeDirectory) ? readdirSync(nodeDirectory) : [], [])
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -330,8 +349,7 @@ test('an answer to the previous question is not spoken for a new take', async (t
 test('an uploaded recording is answered without asking the device for anything', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-upload-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
-  const take = join(dir, 'incoming-id1.wav')
-  writeFileSync(take, wavBytes())
+  const take = uploadPath(dir, 'incoming-id1.wav')
 
   const nodes = stubNodes({ 'voice.say': { status: 'ok' } })
   const loop = createVoiceLoop({
@@ -373,11 +391,7 @@ test('a repeated recording id does not become a second turn', async (t) => {
     log: { info: () => {}, warn: () => {}, debug: () => {} },
   })
 
-  const makeTake = (name) => {
-    const path = join(dir, name)
-    writeFileSync(path, wavBytes())
-    return path
-  }
+  const makeTake = (name) => uploadPath(dir, name)
 
   const first = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'same', path: makeTake('a.wav') })
   const second = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'same', path: makeTake('b.wav') })
@@ -390,8 +404,7 @@ test('a repeated recording id does not become a second turn', async (t) => {
 test('an empty transcript from an upload is answered out loud and closes the exchange', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-upload-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
-  const take = join(dir, 'silence.wav')
-  writeFileSync(take, wavBytes())
+  const take = uploadPath(dir, 'silence.wav')
 
   const nodes = stubNodes({ 'voice.say': { status: 'ok' } })
   const delivered = []
@@ -417,8 +430,7 @@ test('an empty transcript from an upload is answered out loud and closes the exc
 test('one exchange writes every stage it reached and exactly one closing line', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-trace-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
-  const take = join(dir, 'take.wav')
-  writeFileSync(take, wavBytes())
+  const take = uploadPath(dir, 'take.wav')
 
   const lines = []
   const nodes = stubNodes({ 'voice.say': { status: 'ok' } })
@@ -478,8 +490,7 @@ test('one exchange writes every stage it reached and exactly one closing line', 
 test('an exchange without client times has no record or upload segment', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-trace-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
-  const take = join(dir, 'take.wav')
-  writeFileSync(take, wavBytes())
+  const take = uploadPath(dir, 'take.wav')
 
   const lines = []
   const loop = createVoiceLoop({
@@ -510,8 +521,7 @@ test('an exchange without client times has no record or upload segment', async (
 test('an empty transcript closes the exchange with reason=empty', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-trace-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
-  const take = join(dir, 'take.wav')
-  writeFileSync(take, wavBytes())
+  const take = uploadPath(dir, 'take.wav')
 
   const lines = []
   const loop = createVoiceLoop({
@@ -531,8 +541,7 @@ test('an empty transcript closes the exchange with reason=empty', async (t) => {
 
 /** Drive a full exchange by event: upload, a completed turn with one answer. */
 async function drive (loop, { id, dir, synth, answer = '--- # say\nготово' }) {
-  const take = join(dir, `${id}.wav`)
-  writeFileSync(take, wavBytes())
+  const take = uploadPath(dir, `${id}.wav`)
   const outcome = await loop.handleUpload({ node: 19, nodeName: 'A059P', id, path: take, synth })
   await loop.observeSessionEvent({ id: outcome.session }, { type: 'turn/start', data: { turn: 1 } })
   await loop.observeSessionEvent({ id: outcome.session }, {
@@ -669,7 +678,7 @@ test('an unanswered answer does not hold the next exchange', async (t) => {
     node: 19,
     nodeName: 'A059P',
     id: 'fast-2',
-    path: (() => { const path = join(dir, 'fast.wav'); writeFileSync(path, wavBytes()); return path })(),
+    path: uploadPath(dir, 'fast.wav'),
     synth: 'device',
   })
   assert.equal(second.status, 'delivered')
@@ -684,8 +693,7 @@ test('an unanswered answer does not hold the next exchange', async (t) => {
 test('the transcript reaches the screen with the exchange id and role user', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-chat-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
-  const take = join(dir, 'take.wav')
-  writeFileSync(take, wavBytes())
+  const take = uploadPath(dir, 'take.wav')
 
   const nodes = stubNodes({ 'voice.chat': { status: 'ok' }, 'voice.say': { status: 'ok' } })
   const loop = bareLoop({ dir, nodes, synthService: null })
@@ -766,7 +774,7 @@ test('the cadence counts tool calls from one and starts over on a new exchange',
   const lines = []
   const loop = bareLoop({ dir, nodes, lines, synthService: null })
 
-  const first = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'cad-1', path: (() => { const p = join(dir, 'a.wav'); writeFileSync(p, wavBytes()); return p })() })
+  const first = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'cad-1', path: uploadPath(dir, 'a.wav') })
   await loop.observeSessionEvent({ id: first.session }, { type: 'turn/start', data: { turn: 1 } })
   await loop.observeSessionEvent({ id: first.session }, toolCalls('bash', 'web_search', 'nodes_call'))
   await loop.observeSessionEvent({ id: first.session }, {
@@ -784,7 +792,7 @@ test('the cadence counts tool calls from one and starts over on a new exchange',
   assert.equal(lines.filter((line) => line.includes('stage=activity')).length, 3)
 
   // a second press starts the counter again
-  const second = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'cad-2', path: (() => { const p = join(dir, 'b.wav'); writeFileSync(p, wavBytes()); return p })() })
+  const second = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'cad-2', path: uploadPath(dir, 'b.wav') })
   await loop.observeSessionEvent({ id: second.session }, { type: 'turn/start', data: { turn: 2 } })
   await loop.observeSessionEvent({ id: second.session }, toolCalls('bash'))
   const secondActivity = nodes.calls.filter((call) => call.method === 'activity').at(-1).data
@@ -798,7 +806,7 @@ test('a cancelled turn closes the wait and says nothing', async (t) => {
   const lines = []
   const loop = bareLoop({ dir, nodes, lines, synthService: null })
 
-  const outcome = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'cancel-1', path: (() => { const p = join(dir, 'a.wav'); writeFileSync(p, wavBytes()); return p })() })
+  const outcome = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'cancel-1', path: uploadPath(dir, 'a.wav') })
   await loop.observeSessionEvent({ id: outcome.session }, { type: 'turn/start', data: { turn: 1 } })
   await loop.observeSessionEvent({ id: outcome.session }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'cancelled' } } })
 
@@ -820,7 +828,7 @@ test('a disposed session releases the wait', async (t) => {
   const lines = []
   const loop = bareLoop({ dir, nodes, lines, synthService: null, on })
 
-  const outcome = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'gone-1', path: (() => { const p = join(dir, 'a.wav'); writeFileSync(p, wavBytes()); return p })() })
+  const outcome = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'gone-1', path: uploadPath(dir, 'a.wav') })
   await loop.observeSessionEvent({ id: outcome.session }, { type: 'turn/start', data: { turn: 1 } })
   assert.equal(loop.awaiting.size, 1)
 
@@ -836,7 +844,7 @@ test('an answer that never comes is released by the deadline', async (t) => {
   const lines = []
   const loop = bareLoop({ dir, nodes, lines, synthService: null, exchangeTimeoutMs: 40 })
 
-  await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'stuck-1', path: (() => { const p = join(dir, 'a.wav'); writeFileSync(p, wavBytes()); return p })() })
+  await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'stuck-1', path: uploadPath(dir, 'a.wav') })
   assert.equal(loop.awaiting.size, 1)
   await new Promise((resolve) => setTimeout(resolve, 80))
   assert.equal(loop.awaiting.size, 0, 'the stuck exchange is released')
@@ -846,8 +854,7 @@ test('an answer that never comes is released by the deadline', async (t) => {
 test('a recording shorter than the threshold never reaches the recognizer', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-short-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
-  const take = join(dir, 'click.wav')
-  writeFileSync(take, wavBytes())
+  const take = uploadPath(dir, 'click.wav')
 
   let transcribed = 0
   const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
@@ -878,8 +885,7 @@ test('a recording shorter than the threshold never reaches the recognizer', asyn
 test('the configured language is what the recognizer is asked for', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-lang-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
-  const take = join(dir, 'take.wav')
-  writeFileSync(take, wavBytes())
+  const take = uploadPath(dir, 'take.wav')
 
   const asked = []
   const lines = []
@@ -917,8 +923,7 @@ test('the configured language is what the recognizer is asked for', async (t) =>
 test('a language the provider refuses falls back instead of losing the recording', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-lang-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
-  const take = join(dir, 'take.wav')
-  writeFileSync(take, wavBytes())
+  const take = uploadPath(dir, 'take.wav')
 
   const asked = []
   const warnings = []
@@ -1039,7 +1044,7 @@ test('a new-session event drops the binding, so the next take starts a new conve
     log: { info: (line) => lines.push(line), warn: () => {}, debug: () => {} },
   })
 
-  const take = () => { const p = join(dir, `t-${Math.random().toString(36).slice(2, 6)}.wav`); writeFileSync(p, wavBytes()); return p }
+  const take = () => uploadPath(dir)
   const first = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'n1', path: take(), seconds: 1.2 })
   assert.equal(first.session, 'session-1')
   // finish the exchange: a reset while it runs is deferred, which the next test covers
@@ -1077,7 +1082,7 @@ test('a reset during a running exchange waits for it to finish', async (t) => {
     log: { info: (line) => lines.push(line), warn: () => {}, debug: () => {} },
   })
 
-  const take = () => { const p = join(dir, `t-${Math.random().toString(36).slice(2, 6)}.wav`); writeFileSync(p, wavBytes()); return p }
+  const take = () => uploadPath(dir)
   const first = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'r1', path: take(), seconds: 1.2 })
   await loop.observeSessionEvent({ id: first.session }, { type: 'turn/start', data: { turn: 1 } })
 
@@ -1345,7 +1350,7 @@ test('a bug report reaches the session marked as a fact, not spoken', async (t) 
     node: 19,
     nodeName: 'A059P',
     id: 'bind-1',
-    path: (() => { const p = join(dir, 'a.wav'); writeFileSync(p, wavBytes()); return p })(),
+    path: uploadPath(dir, 'a.wav'),
     seconds: 1.2,
   })
 
@@ -1441,7 +1446,7 @@ test('a repeat of an answered id leaves no file behind', async (t) => {
   const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
   const loop = bareLoop({ dir, nodes, synthService: null, keepRecording: 'none' })
 
-  const take = () => { const p = join(dir, `t-${Math.random().toString(36).slice(2, 6)}.wav`); writeFileSync(p, wavBytes()); return p }
+  const take = () => uploadPath(dir)
   const first = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'dup-1', path: take(), seconds: 1.2 })
   assert.equal(first.status, 'delivered')
 
@@ -1475,7 +1480,7 @@ test('a failed exchange leaves the id free for a retry', async (t) => {
     log: { info: () => {}, warn: () => {}, debug: () => {} },
   })
 
-  const take = () => { const p = join(dir, `t-${Math.random().toString(36).slice(2, 6)}.wav`); writeFileSync(p, wavBytes()); return p }
+  const take = () => uploadPath(dir)
   // the first attempt recognizes nothing, so the take never becomes a turn
   const first = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'retry-1', path: take(), seconds: 1.2 })
   assert.equal(first.status, 'empty')
@@ -1502,7 +1507,7 @@ test('two devices with the same id are two different exchanges', async (t) => {
     log: { info: () => {}, warn: () => {}, debug: () => {} },
   })
 
-  const take = () => { const p = join(dir, `t-${Math.random().toString(36).slice(2, 6)}.wav`); writeFileSync(p, wavBytes()); return p }
+  const take = () => uploadPath(dir)
   const phone = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'same', path: take(), seconds: 1.2 })
   const tablet = await loop.handleUpload({ node: 20, nodeName: 'Tablet', id: 'same', path: take(), seconds: 1.2 })
   assert.equal(phone.status, 'delivered')
@@ -1642,4 +1647,330 @@ test('a broken keepRecording value reads as last, never as none', () => {
   for (const junk of [undefined, null, '', 'yes', 'true', 0, 1, {}, ['none']]) {
     assert.equal(resolveKeepRecording(junk), 'last', `junk ${JSON.stringify(junk)} keeps the recording`)
   }
+})
+
+/**
+ * A loop over one temp directory, with the log kept in `lines` so a test can read the trace.
+ *
+ * @param args - the cache root, the stubs to override, and the extra loop options.
+ * @returns the loop and the lines it wrote.
+ */
+function traceLoop ({ dir, nodes = stubNodes({ 'voice.chat': { status: 'ok' }, 'voice.say': { status: 'ok' } }), speech = { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) }, speak = null, sessionController = undefined, ...rest }) {
+  const lines = []
+  const loop = createVoiceLoop({
+    nodes,
+    speechToText: 'speech' in rest ? rest.speech : speech,
+    textToSpeech: speak,
+    sessions: { flush: async () => {} },
+    sessionController: sessionController ?? {
+      resolveAgent: async () => ({ agent: { followup: () => {} } }),
+      create: async () => ({ sessionId: 'session-trace' }),
+    },
+    cacheDir: join(dir, 'cache'),
+    log: { info: (line) => lines.push(String(line)), warn: (line) => lines.push(`WARN ${line}`), debug: () => {} },
+    ...rest,
+  })
+  return { loop, lines, nodes }
+}
+
+test('a recording outside the voice cache is refused before it is read or removed', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-jail-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  // A file that is not the loop's to touch, and a path that only looks like it is inside.
+  const outside = join(dir, 'outside', 'take.wav')
+  mkdirSync(join(dir, 'outside'), { recursive: true })
+  writeFileSync(outside, wavBytes())
+  let transcribed = 0
+  const { loop, lines } = traceLoop({
+    dir,
+    speech: { resolve: (r) => r, transcribe: async () => { transcribed += 1; return { text: 'привет' } } },
+    keepRecording: 'none',
+  })
+  t.after(() => loop.dispose())
+
+  const traversal = `${join(dir, 'cache', 'incoming', 'A059P')}/../../../outside/take.wav`
+  const escaped = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'jail-1', path: traversal })
+  assert.equal(escaped.status, 'refused-path', 'a path that climbs out of the cache is refused')
+  assert.equal(existsSync(outside), true, 'and the file is left where it is')
+
+  const system = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'jail-2', path: '/etc/passwd' })
+  assert.equal(system.status, 'refused-path', 'an absolute path outside the cache is refused too')
+  assert.equal(existsSync('/etc/passwd'), true)
+
+  assert.equal(transcribed, 0, 'nothing outside the cache is read')
+  assert.ok(lines.some((line) => line.startsWith('WARN') && line.includes('outside the voice cache')),
+    'the refusal is a warning, not a silence')
+  assert.ok(lines.some((line) => line.includes(' done ') && line.includes('reason=refused-path')),
+    'and it closes with a trace line')
+})
+
+test('two copies of one recording in flight at once are one exchange', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-race-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  let transcribed = 0
+  const { loop, nodes } = traceLoop({
+    dir,
+    speech: {
+      resolve: (r) => r,
+      transcribe: async () => {
+        transcribed += 1
+        await gate
+        return { text: 'привет' }
+      },
+    },
+  })
+  t.after(() => loop.dispose())
+
+  // The first copy is held in the model wait — up to three minutes — while the second arrives.
+  const first = loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'race-1', path: uploadPath(dir) })
+  await new Promise((resolve) => setImmediate(resolve))
+  const duplicate = uploadPath(dir)
+  const second = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'race-1', path: duplicate })
+
+  assert.equal(second.status, 'already', 'the id is taken at once, not after the delivery')
+  assert.equal(existsSync(duplicate), false, 'its own file is dropped instead of leaking')
+  release()
+  const outcome = await first
+  assert.equal(outcome.status, 'delivered')
+  assert.equal(transcribed, 1, 'the recognizer saw one take, so the person is answered once')
+  assert.equal(nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'user').length, 1)
+})
+
+test('a refused recording is said out loud, whatever the code', async (t) => {
+  const refusals = [
+    { status: 'denied', code: 'permission', message: 'RECORD_AUDIO is denied' },
+    { status: 'ok' },
+    { status: 'cancelled', code: 'cancelled' },
+  ]
+  for (const record of refusals) {
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-refuse-'))
+    t.after(() => rmSync(dir, { recursive: true, force: true }))
+    const nodes = stubNodes({ 'voice.record': record, 'voice.say': { status: 'ok' } })
+    const { loop, lines } = traceLoop({ dir, nodes })
+    t.after(() => loop.dispose())
+
+    const outcome = await loop.handle({ node: 19, nodeName: 'A059P', mode: 'ptt' })
+    assert.equal(outcome.status, 'no-recording')
+    const said = nodes.calls.filter((call) => call.method === 'say')
+    assert.equal(said.length, 1, `a refusal with ${JSON.stringify(record.code ?? record.status)} is spoken`)
+    assert.match(said[0].data.text, /Не смог начать запись/)
+    if (record.message) assert.match(said[0].data.text, /RECORD_AUDIO is denied/)
+    else if (record.code) assert.match(said[0].data.text, new RegExp(record.code))
+    else assert.match(said[0].data.text, /устройство не отдало запись/, 'a missing reason is named too')
+    assert.ok(lines.some((line) => line.includes(' done ') && line.includes('reason=no-recording')),
+      'and the closing line names the reason')
+  }
+})
+
+test('a recording call that rejects is said out loud', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-reject-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodes = {
+    calls: [],
+    async call (node, api, method, data) {
+      this.calls.push({ node, api, method, data })
+      if (api === 'voice' && method === 'record') throw new Error('the device hung up')
+      return { status: 'ok' }
+    },
+  }
+  const { loop, lines } = traceLoop({ dir, nodes })
+  t.after(() => loop.dispose())
+
+  const outcome = await loop.handle({ node: 19, nodeName: 'A059P', mode: 'ptt' })
+  assert.equal(outcome.status, 'no-recording')
+  assert.equal(outcome.code, 'rejected')
+  const said = nodes.calls.filter((call) => call.method === 'say')
+  assert.equal(said.length, 1, 'the person hears why, not nothing')
+  assert.match(said[0].data.text, /the device hung up/)
+  assert.ok(lines.some((line) => line.includes(' done ') && line.includes('reason=no-recording')))
+})
+
+test('a session that cannot be created is said out loud from the push path', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-nosession-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' }, 'voice.say': { status: 'ok' } })
+  const { loop, lines } = traceLoop({
+    dir,
+    nodes,
+    sessionController: {
+      resolveAgent: async () => ({ agent: { followup: () => {} } }),
+      create: async () => { throw new Error('нет места под сессии') },
+    },
+  })
+  t.after(() => loop.dispose())
+
+  const outcome = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'nosess-1', path: uploadPath(dir) })
+  assert.equal(outcome.status, 'no-session')
+  const said = nodes.calls.filter((call) => call.method === 'say')
+  assert.equal(said.length, 1, 'the failure is not swallowed')
+  assert.match(said[0].data.text, /Не смог начать новую сессию/)
+  assert.ok(lines.some((line) => line.includes(' done ') && line.includes('reason=no-session')),
+    'and the exchange is closed with a reason')
+})
+
+test('a session that cannot be created is said out loud from the pull path too', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-nosession-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodes = stubNodes({
+    'voice.record': { status: 'ok', payload: { path: '/device/a.wav' } },
+    'files.copyFromDevice': ({ data }) => { writeFileSync(data.hostPath, wavBytes()); return { status: 'ok' } },
+    'shell.exec': { status: 'ok' },
+    'voice.say': { status: 'ok' },
+  })
+  const { loop, lines } = traceLoop({
+    dir,
+    nodes,
+    keepRecording: 'none',
+    sessionController: {
+      resolveAgent: async () => ({ agent: { followup: () => {} } }),
+      create: async () => { throw new Error('нет места под сессии') },
+    },
+  })
+  t.after(() => loop.dispose())
+
+  const outcome = await loop.handle({ node: 19, nodeName: 'A059P', mode: 'ptt' })
+  assert.equal(outcome.status, 'no-session')
+  assert.ok(nodes.calls.some((call) => call.method === 'say' && /Не смог начать новую сессию/.test(call.data.text)))
+  assert.ok(lines.some((line) => line.includes(' done ') && line.includes('reason=no-session')))
+  const nodeDirectory = join(dir, 'cache', 'incoming', 'A059P')
+  assert.deepEqual(readdirSync(nodeDirectory), [], 'the take does not stay behind for a failed session')
+})
+
+test('without a recognizer the person is told, not told "I did not hear you"', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-nostt-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' }, 'voice.say': { status: 'ok' } })
+  const lines = []
+  const loop = createVoiceLoop({
+    nodes,
+    speechToText: null,
+    sessions: { flush: async () => {} },
+    sessionController: { resolveAgent: async () => ({ agent: { followup: () => {} } }) },
+    cacheDir: join(dir, 'cache'),
+    log: { info: (line) => lines.push(String(line)), warn: (line) => lines.push(`WARN ${line}`), debug: () => {} },
+  })
+  t.after(() => loop.dispose())
+
+  const outcome = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'nostt-1', path: uploadPath(dir) })
+  assert.equal(outcome.status, 'no-stt')
+  const said = nodes.calls.filter((call) => call.method === 'say')
+  assert.equal(said.length, 1)
+  assert.match(said[0].data.text, /нет сервиса распознавания/)
+  assert.doesNotMatch(said[0].data.text, /Не расслышал/)
+  assert.ok(lines.some((line) => line.includes(' done ') && line.includes('reason=no-stt')))
+})
+
+test('synth=host without a synthesizer degrades to the device voice', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-hostnone-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
+  const lines = []
+  const loop = createVoiceLoop({
+    nodes,
+    speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
+    textToSpeech: null,
+    sessions: { flush: async () => {} },
+    sessionController: {
+      resolveAgent: async () => ({ agent: { followup: () => {} } }),
+      create: async () => ({ sessionId: 'session-hostnone' }),
+    },
+    cacheDir: join(dir, 'cache'),
+    log: { info: (line) => lines.push(String(line)), warn: (line) => lines.push(`WARN ${line}`), debug: () => {} },
+  })
+  t.after(() => loop.dispose())
+
+  await drive(loop, { id: 'host-none', dir, synth: 'host' })
+  const answered = nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'assistant')
+  assert.equal(answered.length, 1, 'the answer still goes out')
+  assert.equal(answered[0].data.say, true, 'spoken by the device engine')
+  assert.equal(answered[0].data.degraded?.kind, 'tts-failed', 'and the screen is told why')
+  assert.ok(lines.some((line) => line.includes(' done ') && line.includes('reason=tts-failed')))
+})
+
+test('keepRecording: last keeps the pull take too', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-pullkeep-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodes = stubNodes({
+    'voice.record': { status: 'ok', payload: { path: '/device/a.wav', seconds: 1.2 } },
+    'files.copyFromDevice': ({ data }) => { writeFileSync(data.hostPath, wavBytes()); return { status: 'ok' } },
+    'shell.exec': { status: 'ok' },
+    'voice.chat': { status: 'ok' },
+  })
+  const { loop } = traceLoop({ dir, nodes })
+  t.after(() => loop.dispose())
+
+  const outcome = await loop.handle({ node: 19, nodeName: 'A059P', mode: 'ptt' })
+  assert.equal(outcome.status, 'delivered')
+  const kept = readdirSync(join(dir, 'cache', 'incoming', 'A059P'))
+  assert.equal(kept.length, 1, 'the take that was used is the one kept')
+  assert.match(kept[0], /^take-\d+-a\.wav$/)
+})
+
+test('keepRecording: none removes the pull take as it is used', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-pullkeep-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodes = stubNodes({
+    'voice.record': { status: 'ok', payload: { path: '/device/b.wav', seconds: 1.2 } },
+    'files.copyFromDevice': ({ data }) => { writeFileSync(data.hostPath, wavBytes()); return { status: 'ok' } },
+    'shell.exec': { status: 'ok' },
+    'voice.chat': { status: 'ok' },
+  })
+  const { loop } = traceLoop({ dir, nodes, keepRecording: 'none' })
+  t.after(() => loop.dispose())
+
+  const outcome = await loop.handle({ node: 19, nodeName: 'A059P', mode: 'ptt' })
+  assert.equal(outcome.status, 'delivered')
+  assert.deepEqual(readdirSync(join(dir, 'cache', 'incoming', 'A059P')), [], 'nothing is left behind')
+})
+
+test('the sweep removes a rendered answer orphaned in out/', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-sweep-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const out = join(dir, 'cache', 'out')
+  mkdirSync(out, { recursive: true })
+  const orphan = join(out, 'ex-1.ogg')
+  writeFileSync(orphan, wavBytes())
+  const dayAndHourAgo = new Date(Date.now() - 25 * 3_600_000)
+  utimesSync(orphan, dayAndHourAgo, dayAndHourAgo)
+  const fresh = join(out, 'ex-2.ogg')
+  writeFileSync(fresh, wavBytes())
+
+  const removed = sweepRecordings(join(dir, 'cache'))
+
+  assert.deepEqual(removed, [orphan], 'an orphaned answer does not live forever')
+  assert.equal(existsSync(fresh), true, 'and a fresh one is untouched')
+})
+
+test('a node that stops talking leaves no queue entry behind', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-maps-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const { loop } = traceLoop({ dir })
+  t.after(() => loop.dispose())
+
+  await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'map-1', path: uploadPath(dir) })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(loop.queues.size, 0, 'the map is keyed by a name from an event: it cannot keep every device')
+})
+
+test('the warmup map holds only the nodes inside the debounce window', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-maps-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const lines = []
+  const loop = createVoiceLoop({
+    nodes: stubNodes(),
+    textToSpeech: { warmup: async () => {} },
+    speechToText: null,
+    cacheDir: join(dir, 'cache'),
+    warmupDebounceMs: 20,
+    log: { info: (line) => lines.push(String(line)), warn: () => {}, debug: () => {} },
+  })
+  t.after(() => loop.dispose())
+
+  await loop.handleWarmup({ node: 1, nodeName: 'first' })
+  assert.equal(loop.warmups.size, 1)
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  await loop.handleWarmup({ node: 2, nodeName: 'second' })
+  assert.deepEqual([...loop.warmups.keys()], ['second'], 'the expired node is dropped')
 })

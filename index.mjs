@@ -143,8 +143,18 @@ export function install (ctx, { logger } = {}) {
       text: REPLY_CONTRACT,
     })
   }
-  if (typeof ctx.inject === 'function') ctx.inject(['systemPrompt'], startContract)
-  else startContract(ctx)
+  if (typeof ctx.inject === 'function') {
+    try {
+      ctx.inject(['systemPrompt'], startContract)
+    } catch (error) {
+      // The contract is the smaller half of this plugin: a Host whose prompt service cannot be
+      // declared here must still get the marker lifted and the voice loop running.
+      log.warn?.('[dsh-voice] the reply contract was not registered:', error?.message ?? error)
+      try {
+        startContract(ctx)
+      } catch {}
+    }
+  } else startContract(ctx)
 
   const listener = async (payload, next) => {
     const decision = await next()
@@ -191,6 +201,16 @@ function cacheDirectory (config) {
 /**
  * Start the loop and wire it to the events the node plugin emits.
  *
+ * The nodes plugin may register its service after this one loads: cordis announces every
+ * registration on `internal/service`, so a missing service is a reason to wait, not to give up.
+ * Without this the loop stayed off on every boot where the profile order put voice before nodes.
+ *
+ * Only `nodes` is waited for. Everything else is read lazily by the loop (`serviceFor`): a Host
+ * may legitimately have no synthesizer — `synth=device` is the default — and refusing to start
+ * over an optional service left the chat dead where a device voice was all that was needed. A
+ * missing recognizer is the opposite case, and the loop says it to the person instead of going
+ * quiet when a press arrives.
+ *
  * @param ctx - owning Host context.
  * @param config - `cacheDir`, `logger`, `keepRecording`.
  * @returns a disposer.
@@ -198,24 +218,12 @@ function cacheDirectory (config) {
 export function installLoop (ctx, config = {}) {
   if (typeof ctx?.on !== 'function') return undefined
   const log = config.logger ?? (typeof ctx.logger === 'function' ? ctx.logger('dsh-voice') : console)
-  // The nodes plugin may register its service after this one loads: cordis
-  // announces every registration on `internal/service`, so a missing service is
-  // a reason to wait, not to give up. Without this the loop stayed off on every
-  // boot where the profile order put voice before nodes.
-  // The loop needs three services, and any of them may register after this
-  // plugin: a missing one is a reason to wait, not to give up. Without this the
-  // loop stayed off on every boot whose profile order put voice before nodes.
-  const required = ['nodes', 'speechToText', 'textToSpeech']
-  const missing = () => required.filter((name) => {
-    const value = service(ctx, name)
-    return name === 'nodes' ? !value?.call : !value
-  })
-  const absent = missing()
-  if (absent.length > 0) {
-    log.info?.(`[dsh-voice] waiting for services: ${absent.join(', ')}`)
+  const noNodes = () => !service(ctx, 'nodes')?.call
+  if (noNodes()) {
+    log.info?.('[dsh-voice] waiting for services: nodes')
     let disposeWait = null
     disposeWait = ctx.on('internal/service', () => {
-      if (missing().length > 0) return
+      if (noNodes()) return
       try {
         disposeWait?.()
       } catch {}
@@ -245,11 +253,20 @@ function startLoop (ctx, config) {
     textToSpeech: Boolean(service(ctx, 'textToSpeech')),
     sessions: Boolean(service(ctx, 'sessions')),
   })
+  if (!service(ctx, 'speechToText')) {
+    // Nothing can be transcribed without it, so every press will be answered with an apology
+    // (`reason=no-stt` in the closing line). The warning is what makes the reason readable later.
+    log.warn?.('[dsh-voice] speech recognition is not installed: a press will be answered with an apology')
+  }
+  if (!service(ctx, 'textToSpeech')) {
+    log.info?.('[dsh-voice] no synthesizer: synth=host answers with the device voice and degraded')
+  }
   let createUserMessage = null
   const loop = createVoiceLoop({
     nodes,
-    speechToText: service(ctx, 'speechToText'),
-    textToSpeech: service(ctx, 'textToSpeech'),
+    // Read at the moment they are needed: a provider may register after this plugin, and an
+    // absent synthesizer is a degradation, not a reason to have no loop at all.
+    serviceFor: (name) => service(ctx, name),
     // Optional: names the assistant on the device screen. Absent on a Host without it.
     assistants: service(ctx, 'assistants'),
     sessions: service(ctx, 'sessions'),
