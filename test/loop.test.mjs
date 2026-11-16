@@ -2107,3 +2107,22 @@ test('a retry in flight leaves the first exchange delivered, not empty', async (
   assert.deepEqual(readdirSync(nodeDirOf(dir)), ['race-keep.wav'],
     'and its take is the one kept, not a directory that lost the recording')
 })
+
+test('a recording in the node-number directory is accepted and pruned there', async () => {
+  // `dsh-nodes` names the directory after the node number, while the event also carries the
+  // name. Checking only the name refused every real recording; pruning by the name would have
+  // left files behind.
+  const { loop, dir, delivered } = makeLoop({
+    keepRecording: 'last',
+    speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
+  })
+  const id = 'number-dir-1'
+  const path = join(dir, 'voice', 'incoming', '19', `${id}.wav`)
+  mkdirSync(dirname(path), { recursive: true })
+  writeFileSync(path, Buffer.alloc(3200))
+
+  const outcome = await loop.handleUpload({ node: 19, nodeName: 'Телефон', id, path, seconds: 1 })
+  assert.equal(outcome.status, 'delivered', 'a recording under the node number must be accepted')
+  assert.equal(delivered.length, 1)
+  assert.equal(existsSync(path), true, 'keepRecording: last keeps the take that was just used')
+})

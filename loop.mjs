@@ -159,6 +159,28 @@ export function insideNodeDir (path, cacheDir, nodeName) {
 }
 
 /**
+ * Which node directory a path belongs to, if any.
+ *
+ * The device event carries both the node number and its name, and `dsh-nodes` names the
+ * directory after the number while older code used the name. A check against one of them
+ * refuses a perfectly good recording, so both are tried and the matching segment is
+ * returned — it is also the directory that may be pruned.
+ *
+ * @param path - the path from the event.
+ * @param cacheDir - the voice cache.
+ * @param segments - candidate directory names, in order of preference.
+ * @returns the segment that matched, or null.
+ */
+export function matchNodeSegment (path, cacheDir, segments) {
+  if (typeof path !== 'string' || !path) return null
+  for (const segment of segments) {
+    if (typeof segment !== 'string' || !segment) continue
+    if (underReal(path, nodeDir(cacheDir, segment))) return segment
+  }
+  return null
+}
+
+/**
  * The directory of one node inside the cache.
  *
  * The node name comes from an event and becomes a path segment, so anything that is not a plain
@@ -951,10 +973,15 @@ export function createVoiceLoop ({
     const path = typeof event?.path === 'string' ? event.path : ''
     if (!path) return { status: 'no-file' }
     const nodeName = event?.nodeName ?? String(event?.node ?? '')
+    // The device number and the device name are both legitimate directory names: `dsh-nodes`
+    // uses the number, older code used the name. Trying only one of them refused every real
+    // recording once the two disagreed, so both are tried and the match decides the directory.
+    const segments = [event?.node, event?.nodeName].map((value) => (value === undefined || value === null ? '' : String(value))).filter(Boolean)
+    const segment = matchNodeSegment(path, cacheDir, segments) ?? (segments.length === 0 ? (insideCache(path, cacheDir) ? '' : null) : null)
     // Symlinks are resolved, and the path has to be inside this node's own upload directory:
     // `cacheDir` itself and its `out/` are not recordings, and pruning "their" directory would
     // delete `sessions.json` and the answers waiting for the device.
-    const mine = nodeName ? insideNodeDir(path, cacheDir, nodeName) : insideCache(path, cacheDir)
+    const mine = segment !== null
     if (!mine) {
       // This path is read and then removed: `keepRecording: none` unlinks it, `last` prunes its
       // directory. The event source is internal, and this is the plugin's own boundary — one
@@ -984,7 +1011,7 @@ export function createVoiceLoop ({
       const held = inFlight.get(key)
       if (inFlight.has(key)) {
         if (!held || !sameFile(held, path)) cleanup([path])
-      } else discardRecording(path, nodeName)
+      } else discardRecording(path, segment || nodeName)
       log.info?.('[dsh-voice] the same recording arrived again, ignoring', {
         id,
         node: nodeName,
@@ -999,7 +1026,7 @@ export function createVoiceLoop ({
     // second waits instead of being dropped.
     return await enqueue(nodeName, async () => {
       try {
-        const outcome = await exchangeFromFile(event, nodeName)
+        const outcome = await exchangeFromFile(event, nodeName, segment)
         // Only a delivered turn owns the id. A failure — recognition, delivery, an empty take —
         // must leave the retry path open: the client re-sends the same id on purpose.
         if (id && outcome?.status === 'delivered') rememberId(key)
@@ -1017,7 +1044,7 @@ export function createVoiceLoop ({
    * @param nodeName - the node to speak to.
    * @returns a short outcome for the log.
    */
-  async function exchangeFromFile (event, nodeName) {
+  async function exchangeFromFile (event, nodeName, segment = '') {
     const trace = createTrace({ id: event?.id ?? null, node: nodeName, at: event?.at ?? null, log })
     trace.mark('received')
     const seconds = Number(event?.seconds)
@@ -1025,7 +1052,7 @@ export function createVoiceLoop ({
       // Nothing worth recognizing: the session stays untouched and the device is told nothing —
       // the person knows they only brushed the button. The take itself is kept like any other,
       // because a click that was heard as words is exactly what one wants to listen to.
-      discardRecording(event.path, nodeName)
+      discardRecording(event.path, segment || nodeName)
       trace.done('too-short', { language, seconds })
       return { status: 'too-short', id: event?.id ?? null, seconds }
     }
@@ -1041,7 +1068,7 @@ export function createVoiceLoop ({
     trace.mark('transcribed')
     if (text) pushChat({ node: nodeName, role: 'user', text, id: event?.id ?? null, trace })
     if (!text) {
-      discardRecording(event.path, nodeName)
+      discardRecording(event.path, segment || nodeName)
       const noRecognizer = failure?.code === 'no_speech'
       await say(nodeName, noRecognizer ? NO_TRANSCRIBER : NOT_HEARD)
       trace.done(noRecognizer ? 'no-stt' : 'empty', { language })
@@ -1052,7 +1079,7 @@ export function createVoiceLoop ({
       sessionId = await sessionFor(nodeName, event?.sessionId ?? null, event?.node ?? null)
     } catch (error) {
       // The exception used to reach the outer catch: no answer, no words, and no closing line.
-      discardRecording(event.path, nodeName)
+      discardRecording(event.path, segment || nodeName)
       log.warn?.('[dsh-voice] could not get a session:', error?.message ?? error)
       await say(nodeName, 'Не смог начать новую сессию.')
       trace.done('no-session', { language })
@@ -1071,7 +1098,7 @@ export function createVoiceLoop ({
     } catch (error) {
       awaiting.delete(sessionId)
       releaseNode(nodeName)
-      discardRecording(event.path, nodeName)
+      discardRecording(event.path, segment || nodeName)
       log.warn?.('[dsh-voice] delivery failed:', error?.message ?? error)
       await say(nodeName, 'Не смог передать запрос.')
       trace.done('no-session', { language })
@@ -1079,7 +1106,7 @@ export function createVoiceLoop ({
     }
     // The recording has done its job: the newest take stays (unless keepRecording says `none`),
     // the node's older ones do not.
-    discardRecording(event.path, nodeName)
+    discardRecording(event.path, segment || nodeName)
     return { status: 'delivered', session: sessionId, text, id: event?.id ?? null }
   }
 

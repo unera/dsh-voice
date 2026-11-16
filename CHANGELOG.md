@@ -5,6 +5,15 @@ All notable changes to this package are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.19] - 2026-11-16
+
+### Fixed
+- A recording is accepted when it lives in the directory named after the node **number**
+  (that is what `dsh-nodes` writes) as well as after the node name. The 0.1.18 guard
+  checked only the name and refused every real recording with `refused-path`.
+- Pruning uses the directory that actually holds the file, so `keepRecording` still works
+  for the number-named directory.
+
 ## [0.1.18] - 2026-11-16
 
 A recording path is now checked against the filesystem, not against a string:
