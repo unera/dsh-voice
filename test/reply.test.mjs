@@ -494,4 +494,10 @@ test('a volatile field with no saved value mounts instead of failing', () => {
   const settings = normalizeReplySettings({ speakReplies: false, maxChars: {} })
   assert.equal(settings.maxChars, 600)
   assert.equal(settings.speakReplies, false)
+  // A schema placeholder is not a plain object either, so anything that is not a
+  // number reads as unset; only a real number outside the range is an error.
+  assert.equal(normalizeReplySettings({ maxChars: new Map() }).maxChars, 600)
+  assert.throws(() => normalizeReplySettings({ maxChars: 0 }), /целым числом/u)
+  assert.throws(() => normalizeReplySettings({ maxChars: 6000 }), /целым числом/u)
+  assert.throws(() => normalizeReplySettings({ maxChars: 2.5 }), /целым числом/u)
 })

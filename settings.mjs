@@ -73,12 +73,14 @@ function positive (value, fallback) {
  *   an integer: a clamp would change what the owner asked for without saying so.
  */
 export function maxCharsSetting (value) {
-  // The settings service hands back an empty object for a volatile field that has
-  // no saved value yet; that is a placeholder, not something a person typed, and
-  // treating it as an error stopped the whole plugin from mounting.
-  const unset = value === undefined || value === null
-    || (typeof value === 'object' && value !== null && Object.keys(value).length === 0)
-  if (unset) return DEFAULT_MAX_CHARS
+  // The settings service answers an object for a volatile field before a value is
+  // saved (an empty one, or a schema placeholder with symbol keys). That is "not
+  // set" and falls back to the default: treating it as a bad number took the whole
+  // voice loop down at mount. Everything else is checked strictly — a person types
+  // a number here, and a string or an out-of-range number is a configuration
+  // mistake that must be reported, not quietly replaced.
+  if (value === undefined || value === null) return DEFAULT_MAX_CHARS
+  if (typeof value === 'object') return DEFAULT_MAX_CHARS
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > MAX_CHARS_LIMIT) {
     throw new RangeError(
       `dsh-voice: maxChars должен быть целым числом от 1 до ${MAX_CHARS_LIMIT}, получено ${JSON.stringify(value)}`,
