@@ -425,6 +425,54 @@ export function sweepRecordings (cacheDir, { now = Date.now(), maxAgeMs = RECORD
 }
 
 /**
+ * The mtime of a directory, or infinity when it cannot be read.
+ *
+ * Infinity keeps an unreadable directory: a failed `stat` is not evidence of age.
+ *
+ * @param path - the directory.
+ * @returns its mtime in milliseconds.
+ */
+function mtimeOf (path) {
+  try {
+    return statSync(path).mtimeMs
+  } catch {
+    return Number.POSITIVE_INFINITY
+  }
+}
+
+/**
+ * Remove the files of one tree that are older than the window, and the directories they empty.
+ *
+ * The age that decides is the file's own. Both writers — the loop and `dsh-nodes` — update the
+ * mtime of `<node>/` when a take lands, and neither touches `<run>/`: a fresh recording can sit in
+ * a run directory that looks two hours old, and a decision made at directory level deletes the
+ * words a neighbour has just put there.
+ *
+ * An empty directory goes only when it is old itself or when this pass has just emptied it: a
+ * neighbour may have created it a second ago and be about to write its first take.
+ *
+ * @param dir - the directory to sweep.
+ * @param ctx - `now`, `maxAgeMs`, `log` and the `removed` list to fill.
+ * @returns true when the directory itself is now empty and may be removed.
+ */
+function sweepStaleTree (dir, ctx) {
+  let emptied = false
+  for (const entry of entriesIn(dir)) {
+    if (entry.isDirectory) {
+      if (!sweepStaleTree(entry.path, ctx)) continue
+      ctx.remove(entry.path)
+      emptied = true
+      continue
+    }
+    if (ctx.now - entry.mtimeMs <= ctx.maxAgeMs) continue
+    ctx.remove(entry.path)
+    emptied = true
+  }
+  if (entriesIn(dir).length > 0) return false
+  return emptied || ctx.now - mtimeOf(dir) > ctx.maxAgeMs
+}
+
+/**
  * Remove what earlier runs left behind, before this one talks to anybody.
  *
  * The rule is age, not ownership. Another process may share this `cacheDir`, and a recording or an
@@ -432,10 +480,10 @@ export function sweepRecordings (cacheDir, { now = Date.now(), maxAgeMs = RECORD
  * mine" would delete live work of a neighbour. An hour of age is the safe signal, and it is the
  * same grace the device gets to fetch a rendered answer.
  *
- * Both trees are swept whole, directory entries included: a subdirectory is one run (or, in the
- * old layout, one node) that has not been touched for an hour, and nothing inside it can be live
- * either. The directories of this run are never touched, however old the clock says they are —
- * this process is the one using them.
+ * Age is measured on the files, not on the directories that hold them: writing a take updates
+ * `<node>/` and nothing above it, so a run started this morning can hold a file written a minute
+ * ago. What is left empty behind the removed files is swept as well. The directories of this run
+ * are never touched, however old the clock says they are — this process is the one using them.
  *
  * @param cacheDir - the voice cache.
  * @param runId - the run that is starting.
@@ -444,21 +492,31 @@ export function sweepRecordings (cacheDir, { now = Date.now(), maxAgeMs = RECORD
  */
 export function cleanRunCache (cacheDir, runId, { now = Date.now(), maxAgeMs = RUN_STALE_MS, log = null } = {}) {
   const removed = []
-  const mine = new Set([runIncomingDir(cacheDir, runId), runOutputDir(cacheDir, runId)])
+  const remove = (path) => {
+    try {
+      rmSync(path, { recursive: true, force: true })
+      removed.push(path)
+    } catch (error) {
+      log?.warn?.('[dsh-voice] could not remove a stale cache entry:', error?.message ?? error)
+    }
+  }
+  const ctx = { now, maxAgeMs, log, remove }
+  // A symlink is compared by its target: a link in `incoming/` that points into this run would
+  // otherwise let the sweep walk straight into the directories it must never touch.
+  const mine = new Set([runIncomingDir(cacheDir, runId), runOutputDir(cacheDir, runId)].map((dir) => realPath(dir)))
   // The run's own directory is created here, before the first exchange and before any timer: a
   // device may write into it at any moment, and an empty directory is cheaper to explain than a
   // missing one.
   mkdirSync(runIncomingDir(cacheDir, runId), { recursive: true })
   for (const root of [join(cacheDir, INCOMING_DIR), join(cacheDir, OUTPUT_DIR)]) {
     for (const entry of entriesIn(root)) {
-      if (mine.has(entry.path)) continue
-      if (now - entry.mtimeMs <= maxAgeMs) continue
-      try {
-        rmSync(entry.path, { recursive: true, force: true })
-        removed.push(entry.path)
-      } catch (error) {
-        log?.warn?.('[dsh-voice] could not remove a stale cache entry:', error?.message ?? error)
+      if (mine.has(realPath(entry.path))) continue
+      // A stray file directly under `incoming/` or `out/`: the same age rule, one level less.
+      if (!entry.isDirectory) {
+        if (now - entry.mtimeMs > maxAgeMs) remove(entry.path)
+        continue
       }
+      if (sweepStaleTree(entry.path, ctx)) remove(entry.path)
     }
   }
   return removed

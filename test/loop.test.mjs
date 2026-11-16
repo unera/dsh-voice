@@ -6,6 +6,7 @@ import { test } from 'node:test'
 
 import {
   assistantTextOf,
+  cleanRunCache,
   createVoiceLoop,
   newRunId,
   resolveKeepRecording,
@@ -2328,5 +2329,41 @@ test('keepRecording: last keeps one take in the flat layout', async (t) => {
   assert.deepEqual(readdirSync(nodeDir), ['flat-last.wav'], 'one take stays, and it is the used one')
   assert.equal(lines.some((line) => line.includes('refusing to touch')), false,
     'and the pruning pass is not a refusal')
+})
+
+test('the boot cleanup trusts the age of a file, not of the run directory above it', (t) => {
+  // Writing a recording updates the mtime of `<node>/`, never of `<run>/`. Measuring the run
+  // directory therefore throws away a fresh take of a neighbour whose run started two hours ago.
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-clean-age-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const cache = join(dir, 'cache')
+  const twoHoursAgo = new Date(Date.now() - 2 * 3_600_000)
+
+  const freshTake = join(cache, 'incoming', '1111-aaaaaa', '19', 'fresh.wav')
+  mkdirSync(dirname(freshTake), { recursive: true })
+  writeFileSync(freshTake, wavBytes())
+  utimesSync(dirname(freshTake), twoHoursAgo, twoHoursAgo)
+  utimesSync(join(cache, 'incoming', '1111-aaaaaa'), twoHoursAgo, twoHoursAgo)
+
+  const staleTake = join(cache, 'incoming', '2222-bbbbbb', '19', 'stale.wav')
+  mkdirSync(dirname(staleTake), { recursive: true })
+  writeFileSync(staleTake, wavBytes())
+  utimesSync(staleTake, twoHoursAgo, twoHoursAgo)
+  utimesSync(dirname(staleTake), twoHoursAgo, twoHoursAgo)
+  utimesSync(join(cache, 'incoming', '2222-bbbbbb'), twoHoursAgo, twoHoursAgo)
+
+  const mine = join(cache, 'incoming', RUN, '19', 'mine.wav')
+  mkdirSync(dirname(mine), { recursive: true })
+  writeFileSync(mine, wavBytes())
+  utimesSync(mine, twoHoursAgo, twoHoursAgo)
+
+  const removed = cleanRunCache(cache, RUN)
+
+  assert.equal(existsSync(freshTake), true, 'a fresh file is not litter because its run directory is old')
+  assert.equal(existsSync(staleTake), false, 'a file of two hours is litter whatever holds it')
+  assert.equal(existsSync(join(cache, 'incoming', '2222-bbbbbb')), false,
+    'and the directory it leaves empty goes with it')
+  assert.equal(existsSync(mine), true, 'the run that is starting is never touched')
+  assert.ok(removed.includes(staleTake), 'the removed file is reported')
 })
 
