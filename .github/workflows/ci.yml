@@ -14,7 +14,13 @@ jobs:
         with:
           node-version: 22
       - name: Install ffmpeg
-        # `synth=host` converts the provider's WAV to OGG/Opus, and five tests run the real
-        # binary: without ffmpeg on PATH they fail, so a green CI run means the path works.
+        # `synth=host` converts the provider's WAV to OGG/Opus, and the tests of the
+        # spoken reply do the same: without ffmpeg on PATH they fail, so a green CI
+        # run means the path works.
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install dependencies
+        # Both are development-only: `@deepseek-ai/schemastery` is a peer of the host
+        # that declares the Config schema, and `esbuild` builds the client half. A
+        # checkout with neither cannot even import `index.mjs`.
+        run: npm install --no-audit --no-fund
       - run: npm test

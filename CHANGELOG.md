@@ -5,6 +5,60 @@ All notable changes to this package are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-16
+
+The host can now speak a text chat by itself, and the plugin it was meant to be
+merged from — `@dr-co/dsh-voice-reply` — is gone: everything it did lives here,
+under one switch.
+
+### Added
+
+- **The spoken reply of a closing turn.** An answer that wants to be heard is
+  written as three markers — `---`, the spoken part, `---`, the rest, `...` — and
+  the host synthesizes the first part into an OGG, attached to the turn as
+  `deliverables/presented` from inside `agent/turn-stopping`, exactly as `present`
+  does it. `structure.mjs` keeps the protocol, `reply.mjs` the delivery.
+- **The switch and the limit are configuration**, editable live in Settings →
+  Plugins → `@dr-co/dsh-voice`: `speakReplies` (default `false` — a new feature
+  nobody asked for is off) and `maxChars` (default `600`, range `1..5000`, counted
+  in characters, not bytes). Both are `.volatile()`, so the hook, the prompt
+  section and the form all read the value of the moment.
+- **A client half**: `src/client/` builds `lib/client.js` (`npm run build`) and
+  registers the card into the Plugins page's `plugins.row.config` slot under the
+  key `@dr-co/dsh-voice#dsh-voice`. Dictionaries in English, Russian and Chinese.
+- **`GET /api/voice/state`** answers whether this Host has a synthesizer. Without
+  one the switch is inactive and says "a synthesizer is needed" instead of
+  storing a setting nothing can honour; a failed check leaves it inactive with a
+  retry, never a guess.
+- **A second prompt section**, contributed only while the switch is on: three
+  markers, the configured limit, and the fact that a broken format means no
+  sound. The `--- # say` contract of the device path is untouched and stays.
+
+### Changed
+
+- The Config schema is now declared (`settings.mjs`) and exported as
+  `apply.Config`, so the Loader validates a profile and the settings service can
+  project the two live fields. The plugin also tells the settings service that it
+  draws its own page (`configure({auto: false})`), so a schema-generated form does
+  not appear beside the card.
+- A voice note is only made for a well-formed document: one marker, three
+  markers, a missing `...`, an empty part, or a `---` with a trailing space all
+  pass the message through as it is, without audio.
+- The first part is synthesized verbatim: no markdown cleaning, no truncation.
+  Longer than the limit means no sound at all.
+- `diagnose` is off by default; the probe waits only when a profile asks for it.
+- CI installs its dependencies: `@deepseek-ai/schemastery` is a peer of the host
+  and `esbuild` builds the client half.
+
+### Removed
+
+- `@dr-co/dsh-voice-reply` as a separate package, together with its
+  `trigger.mjs` — the regexes over the person's words (`ответь голосом`, `скажи
+  вслух`, the refusals, the `plugin:dsh-voice` notice), the `mode`
+  `request`/`always`/`off` setting, and the "first section up to a blank line"
+  heuristic of `spoken.mjs`. The decision is the structure of the answer alone,
+  which is the same in every language.
+
 ## [0.2.0] - 2026-11-16
 
 The cache is no longer divided with another plugin: a recording is copied into our own directory,

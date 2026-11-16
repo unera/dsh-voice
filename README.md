@@ -5,7 +5,7 @@ a press on a node becomes a recording, the recording becomes a transcript, and
 the answer comes back to the phone as one chat message that carries both the
 line to show and the speech to play.
 
-Four things live here, and the package ships all of them:
+Five things live here, and the package ships all of them:
 
 | part | what it does |
 |---|---|
@@ -13,6 +13,7 @@ Four things live here, and the package ships all of them:
 | the loop | record → transcribe → deliver → watch the turn → answer the device |
 | the prompt section | how a spoken answer is written, and what it may not contain |
 | the trace | one log line per stage of every exchange, one closing line with the reason |
+| the spoken reply | a switch in the Plugins page: the host synthesizes the part of a text-chat answer written between three markers and attaches the OGG to the turn |
 
 The device commands the answer travels by are `voice.chat` (`{role, text, speak,
 say, who, degraded}`) for the screen and `voice.answer` (`{id, text, speak, who,
@@ -76,6 +77,14 @@ The package ships `dsh.bundle.patch`, so the row mounts itself:
 | `language` | `ru` | the language the recognizer is asked for. Named, not inherited from the Host default: `auto` lets a short noisy take drift into another language, and the transcript then reaches the session as the person's own words |
 | `minSeconds` | `0.4` | below this a take is a button click, not speech: it never reaches the recognizer, the session is untouched, and the closing line says `reason=too-short` |
 | `runId` | `<pid>-<six hex>` | the directory name this process owns inside the cache, made once at boot. Normally left out: a host that sets it gets a stable name, and a test gets one it can predict. Anything unusable as one path segment is replaced, and an empty value gets a fresh id |
+| `speakReplies` | `false` | **the switch of the spoken reply**, editable live in Settings → Plugins → `@dr-co/dsh-voice`. Off means a closing turn does nothing at all — no synthesis, no file, and no prompt section telling the model about the format |
+| `maxChars` | `600` | how many **characters** the spoken part may have, editable live beside the switch. The range is `1..5000`: anything else is a configuration error, and the plugin refuses to mount rather than clamp the number to something the owner did not ask for |
+| `timeoutMs` | `20000` | how long a slow engine may hold the closing turn. A timeout costs the voice note, never the answer |
+| `speed` | the service's own | playback tempo for the attached voice note, `0.5..2`, applied with ffmpeg's `atempo` |
+| `description` | `Озвучка ответа` | the line the Web client shows beside the file |
+| `subagents` | `false` | whether subagent turns are spoken too |
+| `prompt` | `true` | whether the format is explained to the model while the switch is on |
+| `diagnose` | `false` | wait for `dsh-im` to take the record and say in the log whether it did; costs part of the closing turn, so it is opt-in |
 
 ### Where things live: two plugins, two directories
 
@@ -124,6 +133,97 @@ has.
 Neither call is awaited: speaking takes as long as the sentence, and nothing waits behind it.
 `voice.stop` is what cuts a speech short. When a host synthesis fails the loop
 falls back to the device engine and closes the line with `reason=tts-failed`.
+
+## Spoken replies in a text chat
+
+The device path above needs a press. A text chat has no press, so the host speaks
+when the answer itself says it wants to be heard — and that is the whole decision.
+Nothing reads the person's words: there is no list of "reply aloud" phrases in any
+language here, and nothing to translate.
+
+### The protocol
+
+An answer that wants to be heard is written as three markers:
+
+```text
+---
+текст для голоса
+---
+текст без звука
+...
+```
+
+| line | meaning |
+|---|---|
+| the first non-empty line | `---`, the document opens |
+| above the next `---` | the spoken part, spoken verbatim |
+| exactly one more `---` | the separator |
+| below it, up to `...` | the text that is only read |
+| the last non-empty line | `...`, the document closes |
+
+### The four rules
+
+| rule | what the plugin does |
+|---|---|
+| the answer is the documented document | the first part is synthesized and the OGG is declared on the turn |
+| the answer is anything else — no markers, one marker, a third `---`, no `...`, an empty part, a `---` with a trailing space | the message is passed through **as is**: no audio, no change |
+| the first part is longer than `maxChars` **characters** | the same: as is, no audio, and the log says `too-long` |
+| otherwise | the first part goes to the synthesizer and the OGG is attached |
+
+Nothing is guessed. `--- ` with a trailing space, `----`, `--- # say`, a word above
+the first marker: each is a deviation, and a deviation means silence. The length is
+counted in characters (`[...text].length`), so a Cyrillic letter and an emoji count
+as one each — a 600-character Russian answer is 1200 bytes and still fits.
+
+The answer text is never touched: the markers stay in the message and the person
+reads them. The plugin appends a record, nothing else.
+
+### How the audio travels
+
+The audio takes the road `present` takes: inside `agent/turn-stopping` — the turn is
+still open, which is the only moment `dsh-im` accepts a presented file and the last
+moment the answer text is known — the OGG is written and
+`deliverables/presented` is appended with a non-empty `callId` and `description`.
+Every surface that already carries files delivers it: `dsh-im` uploads a voice
+note, the Web client lists the file under the answer.
+
+Files live in `<cacheDir>/reply` — `$DSH_HOME/cache/voice/reply` by default, a
+sibling of the loop's `work/` and `out/` rather than one of them, because the
+loop's sweep collects those two and knows nothing about these — and a run prunes
+its own files after a day. A turn that already carries a voice note — ours from an
+earlier stop, or one the model attached with `voice_say` — is never spoken twice.
+
+### Where the switch lives
+
+Settings → **Plugins** → `@dr-co/dsh-voice` → its row. The page is a client plugin
+(`lib/client.js`, built by `npm run build`), registered into the Plugins page's
+`plugins.row.config` slot under the key `@dr-co/dsh-voice#dsh-voice`.
+
+| control | behaviour |
+|---|---|
+| "Speak replies" | off by default. Volatile configuration: the turn-stopping hook and the prompt section read it at every turn, so flipping it works on the next answer, not on the next restart |
+| "Characters to speak" | `600` by default, `1..5000`, written on blur or Enter. It is the same number the prompt tells the model and the same number the plugin enforces |
+| no synthesizer | the switch is **inactive** and says so: "a synthesizer is needed". The card reads that from `GET /api/voice/state`, mounted on the Host's authenticated `/api` channel — a switch that stores a setting nothing can honour is worse than one that explains itself |
+| the check failed | the switch stays inactive with "could not find out" and a retry button; it never guesses in either direction |
+
+The two editable fields are the only `.volatile()` fields in the Config schema; the
+rest is ordinary profile configuration, read at boot. Because the plugin draws
+this page itself, it also tells the settings service so
+(`ctx.settings.configure({ auto: false }, ctx.fiber)`): a schema-generated form
+next to the card would be a second, poorer copy of the same two fields.
+
+### Two reply formats, two transports
+
+The formats do not fight, because they answer different questions:
+
+| question | format | who speaks |
+|---|---|---|
+| a request arrived by voice, the phone should answer aloud | `--- # say` / `--- # screen` | the device, or the host for `synth=host` |
+| a text answer should arrive as a voice note in the chat | `---` / `---` / `...` | the host, and the file is the message |
+
+The first section belongs to the loop and is registered always; the second one is
+contributed only while `speakReplies` is on, so a Host with the switch off never
+tells the model about a format it would not act on.
 
 ## The screen sees both sides
 

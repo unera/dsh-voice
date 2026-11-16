@@ -1,12 +1,14 @@
 {
   "name": "@dr-co/dsh-voice",
-  "version": "0.2.0",
-  "description": "A spoken turn for DeepSeek Harness: the voice loop that turns a device recording into a chat answer the phone can speak, the input marker and the reply contract.",
+  "version": "0.3.0",
+  "description": "A spoken turn for DeepSeek Harness: the voice loop that turns a device recording into a chat answer the phone can speak, the input marker, the reply contract, and — when switched on — the host's own spoken reply, declared as an OGG deliverable of the turn.",
   "type": "module",
   "main": "./index.mjs",
   "exports": {
     ".": "./index.mjs",
     "./markup": "./markup.mjs",
+    "./structure": "./structure.mjs",
+    "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
   "files": [
@@ -15,6 +17,12 @@
     "loop.mjs",
     "trace.mjs",
     "audio.mjs",
+    "structure.mjs",
+    "settings.mjs",
+    "reply.mjs",
+    "probe.mjs",
+    "routes.mjs",
+    "lib/",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
@@ -22,7 +30,8 @@
   ],
   "license": "MIT",
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "build": "node scripts/build-client.mjs"
   },
   "repository": {
     "type": "git",
@@ -45,9 +54,23 @@
   "engines": {
     "node": ">=22"
   },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.5"
+  },
+  "devDependencies": {
+    "@deepseek-ai/schemastery": "~3.18.5",
+    "esbuild": "^0.25.9"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
+      ],
+      "platform": "web"
     }
   }
 }

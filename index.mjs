@@ -20,8 +20,14 @@ import { join } from 'node:path'
 
 import { readVoiceMarkup } from './markup.mjs'
 import { createVoiceLoop } from './loop.mjs'
+import { installReply } from './reply.mjs'
+import { registerVoiceRoutes, voiceState } from './routes.mjs'
+import { Config } from './settings.mjs'
 
 export const name = 'dsh-voice'
+
+/** The configuration schema the Loader validates and the Plugins page edits. */
+export { Config }
 
 /** Source plugin name recorded on every message this plugin adds. */
 const PLUGIN = 'dsh-voice'
@@ -361,13 +367,105 @@ function startLoop (ctx, config) {
 }
 
 /**
+ * Mount the spoken reply: the closing-turn hook and its prompt section.
+ *
+ * Installed whether or not the switch is on: both read the configuration through
+ * the reference the Loader keeps live, so the switch works from the Plugins page
+ * without a restart. With it off the hook answers `off` and the prompt section
+ * contributes nothing.
+ *
+ * @param ctx - owning Host context.
+ * @param config - the plugin configuration.
+ * @returns a disposer, or undefined when the context cannot be listened to.
+ */
+export function installVoiceReply (ctx, config = {}) {
+  return installReply(ctx, {
+    config,
+    logger: config?.logger ?? null,
+    service: config?.service ?? null,
+    deps: config?.deps ?? {},
+  })
+}
+
+/**
+ * Mount the settings card's state route.
+ *
+ * The route answers one question — is there a synthesizer here — and it is
+ * mounted whether or not the switch is on, because the card has to read the
+ * answer before it can decide whether the switch may be pressed at all.
+ *
+ * @param ctx - owning Host context.
+ * @returns the child fibre's disposal handle, or undefined when this Host has no
+ *   `connection` service to mount a route on.
+ */
+export function installVoiceRoutes (ctx) {
+  if (typeof ctx?.inject !== 'function') return undefined
+  try {
+    return ctx.inject(['connection'], (child) => {
+      const connection = child?.connection ?? service(ctx, 'connection')
+      const disposers = registerVoiceRoutes(connection, () => voiceState({ textToSpeech: service(ctx, 'textToSpeech') }))
+      const dispose = () => {
+        for (const one of disposers) {
+          try {
+            one?.()
+          } catch {}
+        }
+      }
+      if (typeof child?.effect === 'function') return child.effect(() => dispose, 'dsh-voice: state route')
+      return undefined
+    })
+  } catch (error) {
+    // A Host without the seam simply has no card route; the rest of the plugin
+    // works exactly as before.
+    return undefined
+  }
+}
+
+/**
+ * Tell the settings service that this plugin ships its own page.
+ *
+ * Settings renders a form from the schema for every entry that does not say
+ * otherwise; ours is drawn by the client half, with the switch's own reason for
+ * being inactive, so the automatic page would be a second, poorer copy of it.
+ * The call belongs to an optional child: a Host without the settings service
+ * must be able to speak all the same.
+ *
+ * @param ctx - owning Host context.
+ * @returns the child fibre's disposal handle, or undefined when there is no
+ *   settings service to tell.
+ */
+export function installSettingsPolicy (ctx) {
+  if (typeof ctx?.inject !== 'function') return undefined
+  try {
+    return ctx.inject(['settings'], (child) => {
+      if (typeof child?.settings?.configure !== 'function') return undefined
+      const run = () => child.settings.configure({ auto: false }, ctx.fiber)
+      if (typeof child.effect === 'function') return child.effect(run, 'dsh-voice: own settings page')
+      return run()
+    })
+  } catch (error) {
+    // A Host whose settings service cannot be declared here keeps its schema
+    // page; this plugin still works.
+    return undefined
+  }
+}
+
+/**
  * Plugin entry point.
  * @param ctx - owning Host context.
- * @param config - `cacheDir` for the cache, `logger`, `language`.
+ * @param config - `cacheDir` for the cache, `logger`, `language`, `speakReplies`,
+ *   `maxChars`.
  */
 export function apply (ctx, config = {}) {
   install(ctx, config)
   installLoop(ctx, config)
+  installVoiceReply(ctx, config)
+  installVoiceRoutes(ctx)
+  installSettingsPolicy(ctx)
 }
 
-export default Object.freeze({ name, apply, install })
+// The Loader reads the schema off the entry point and the settings service
+// projects its volatile fields into the Plugins page.
+apply.Config = Config
+
+export default Object.freeze({ name, apply, install, Config })

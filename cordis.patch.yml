@@ -1,9 +1,14 @@
 # Bundle layer for @dr-co/dsh-voice.
 #
-# One row: the plugin that lifts the input voice marker at `agent/pre-step` and
-# registers the reply contract in the system prompt. It synthesizes nothing and
-# sends nothing — a Host that wants a spoken answer installs a text-to-speech
-# provider and the layer that reads `splitReply`.
+# One row: the plugin that lifts the input voice marker at `agent/pre-step`,
+# registers the reply contract in the system prompt, and — when its own switch is
+# on — speaks the part of a text-chat answer written between the three markers,
+# declaring the OGG as a deliverable of the turn.
+#
+# `speakReplies` and `maxChars` are volatile configuration: Settings → Plugins →
+# @dr-co/dsh-voice edits them live, without a restart. Nothing here synthesizes on
+# its own: a Host without a `textToSpeech` service has the switch inactive and says
+# why.
 - insert:
     - id: dsh-voice
       name: '@dr-co/dsh-voice'
