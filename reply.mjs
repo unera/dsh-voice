@@ -14,6 +14,10 @@
 //   `dsh-im` requires to accept a presented file, and the last moment the text of
 //   the answer is known. Synthesis therefore happens inside the hook, and a
 //   timeout bounds how long a slow engine may hold the turn.
+// * being open at the append is not enough. `dsh-im` copies the file into its own
+//   snapshot directory *after* the record lands and re-checks the turn when the
+//   copy is done, so the hook also waits for that copy (`holdForSnapshot`) instead
+//   of letting `turn/end` overtake it and losing the file without a word.
 // * the answer text is never touched. The markers stay in the message, the parts
 //   are read and nothing is written back; the plugin only appends a record.
 import { randomUUID } from 'node:crypto'
@@ -284,6 +288,49 @@ export function withTimeout (work, ms, message = 'озвучка не успел
   })
 }
 
+/**
+ * How long the channel gets, after its copy is on disk, to hash it and re-check
+ * the turn. That hash is the last thing `dsh-im` does before it decides whether
+ * the file still belongs to an open turn, and it is cheap: one small file.
+ */
+export const SNAPSHOT_GRACE_MS = 50
+
+/** Wait for a timer without keeping the process alive for it. */
+const after = (ms) => new Promise((resolve) => { setTimeout(resolve, ms).unref?.() })
+
+/**
+ * Keep the closing turn open until the channel has copied the announced file.
+ *
+ * `dsh-im` accepts `deliverables/presented` only while the turn is open, and the
+ * expensive half of that acceptance — copying the file into its own snapshot
+ * directory and hashing it — happens *after* the record is appended, followed by
+ * a re-check of the turn (`semantic/artifact.mjs:493` and `:506`). A copy that
+ * finishes after `turn/end` is dropped silently: the record is in the log, the
+ * answer goes out, no voice note arrives, and nothing says why. This package
+ * cannot move that copy, but the hook is serial and `turn/end` waits for it, so
+ * waiting here is what keeps the turn open for the copy.
+ *
+ * @param options.path - the file this package declared.
+ * @param options.since - when the record was appended (epoch ms).
+ * @param options.timeoutMs - how long the turn may be held for this.
+ * @param options.graceMs - how long to keep holding after the copy is on disk.
+ * @param options.probe - probe seams (`dir`, `deps`), forwarded to `waitForSnapshot`.
+ * @returns `'taken' | 'not-taken' | 'no-channel' | 'unknown'`.
+ */
+export async function holdForSnapshot ({ path, since, timeoutMs = 0, graceMs = SNAPSHOT_GRACE_MS, probe = {} }) {
+  if (!(typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0)) return 'unknown'
+  try {
+    const result = await waitForSnapshot({ ...probe, path, since, timeoutMs })
+    if (!result.taken) return result.reason === 'no-directory' ? 'no-channel' : 'not-taken'
+    // The copy exists; the registry still has to hash it and re-check the turn.
+    if (graceMs > 0) await after(graceMs)
+    return 'taken'
+  } catch {
+    // Nothing here may cost the answer: the record is already in the log.
+    return 'unknown'
+  }
+}
+
 /** Read one service without declaring it in `inject`. */
 function service (ctx, name) {
   try {
@@ -335,6 +382,9 @@ async function speakClosingTurn ({ agent, turn, signal }, settings, { ctx, log }
 
   const speed = settings.speed ?? (Number(engine.preferredSpeed?.() ?? 1) || 1)
   const cacheDir = settings.cacheDir ?? defaultCacheDir()
+  // Taken before the record is appended: the channel starts copying the file the
+  // moment the record lands, and a copy older than this cannot be ours.
+  const announcedAt = Date.now()
   const result = await withTimeout(deliverVoice({
     service: engine,
     session,
@@ -348,28 +398,20 @@ async function speakClosingTurn ({ agent, turn, signal }, settings, { ctx, log }
     deps: settings.deps,
   }), settings.timeoutMs)
 
-  // Pruning is housekeeping, not part of the answer: a failure there is silent.
-  void pruneOldFiles(cacheDir).catch(() => undefined)
-
-  // Whether the receiving side took the record. The append succeeds either way:
+  // Whether the receiving side took the record, and the wait that makes it so.
   // `dsh-im` drops a record it cannot own without saying so, and a delivery that
   // silently goes nowhere must be visible in the log rather than inferred from
-  // the absence of a voice note.
-  let handoff = null
-  if (settings.diagnose) {
-    try {
-      const probe = await waitForSnapshot({
-        path: result.path,
-        since: Date.now(),
-        timeoutMs: settings.diagnoseTimeoutMs,
-        // A test injects a temporary directory and its own seams here.
-        ...(settings.deps.probe ?? {}),
-      })
-      handoff = probe.taken ? 'taken' : 'not-taken'
-    } catch {
-      handoff = 'unknown'
-    }
-  }
+  // the absence of a voice note; the wait keeps the turn open while that copy is
+  // made, because the copy's own turn re-check is what a late append loses.
+  const handoff = await holdForSnapshot({
+    path: result.path,
+    since: announcedAt,
+    timeoutMs: settings.settleMs,
+    probe: settings.deps.probe ?? {},
+  })
+
+  // Pruning is housekeeping, not part of the answer: a failure there is silent.
+  void pruneOldFiles(cacheDir).catch(() => undefined)
 
   return {
     delivered: true,

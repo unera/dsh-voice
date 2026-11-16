@@ -19,6 +19,16 @@ import { DEFAULT_MAX_CHARS, MAX_CHARS_LIMIT } from './structure.mjs'
 /** A slow engine may hold the closing turn for this long, no longer. */
 export const DEFAULT_TIMEOUT_MS = 20_000
 
+/**
+ * How long the channel may hold the closing turn while it copies the announced
+ * file. The copy is one small file: tens of milliseconds when the filesystem is
+ * awake, and nothing at all from this side once the budget is spent.
+ */
+export const DEFAULT_SETTLE_MS = 600
+
+/** Upper bound of the turn-hold budget, matching the schema. */
+export const SETTLE_LIMIT_MS = 5000
+
 /** Every configuration field of this plugin. */
 export const Config = Schema.object({
   cacheDir: Schema.string().description('Каталог записей и озвучки; по умолчанию $DSH_HOME/cache/voice'),
@@ -35,8 +45,8 @@ export const Config = Schema.object({
   description: Schema.string().default('Озвучка ответа').description('Подпись файла в Web-клиенте'),
   subagents: Schema.boolean().default(false).description('Озвучивать и ходы субагентов'),
   prompt: Schema.boolean().default(true).description('Регистрировать секцию промпта с форматом'),
-  diagnose: Schema.boolean().default(false)
-    .description('Ждать, забрал ли канал запись, и писать это в журнал'),
+  settleMs: Schema.number().min(0).max(5000).default(DEFAULT_SETTLE_MS)
+    .description('Сколько канал может держать закрывающийся ход, забирая объявленный файл'),
 })
 
 /**
@@ -96,6 +106,21 @@ export function maxCharsSetting (value) {
 }
 
 /**
+ * The turn-hold budget, or the default for anything that is not a number.
+ *
+ * Unlike `maxChars` this is not a person's decision but a timeout: a value out of
+ * range is clamped to the nearest end, because refusing to mount over it would
+ * take the whole voice loop down for a knob that only bounds a wait.
+ *
+ * @param value - `config.settleMs`, if any.
+ * @returns milliseconds in `0..SETTLE_LIMIT_MS`.
+ */
+export function settleSetting (value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_SETTLE_MS
+  return Math.min(SETTLE_LIMIT_MS, Math.max(0, Math.round(value)))
+}
+
+/**
  * Turn one plugin configuration into the settings the reply hook reads.
  *
  * @param config - the plugin configuration, as the loader parsed it.
@@ -120,8 +145,9 @@ export function normalizeReplySettings (config = {}) {
     description: typeof source.description === 'string' && source.description.trim()
       ? source.description.trim()
       : 'Озвучка ответа',
-    diagnose: source.diagnose === true,
-    diagnoseTimeoutMs: positive(source.diagnoseTimeoutMs, 400),
+    // A negative or absurd budget is a configuration mistake, but it costs only
+    // the wait: without it the record is still appended and the answer still goes out.
+    settleMs: settleSetting(source.settleMs),
     logger: source.logger ?? null,
     // The synthesized engine, for a test that supplies its own; production reads
     // the `textToSpeech` service from the context at call time.

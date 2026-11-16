@@ -5,9 +5,9 @@
 // that the answer text the person reads is byte for byte the text the model wrote
 // — markers included.
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import test from 'node:test'
 
 import { CALL_ID_PREFIX, PRESENTED_EVENT, installReply } from '../reply.mjs'
@@ -44,10 +44,13 @@ const listenerOf = (host) => host.listeners.find((entry) => entry.event === 'age
  * flip the switch after mounting and see the next turn obey it — which is what the
  * Plugins page does through `loader/volatile-update`.
  */
-async function runTurn ({ answer, cacheDir: directory, config = {}, service = stubService(), logger = fakeLogger(), events }) {
+async function runTurn ({ answer, cacheDir: directory, config = {}, service = stubService(), logger = fakeLogger(), events, settleMs = 0 }) {
   const session = fakeSession({ events: events ?? closingTurn(answer) })
   const host = stubHost({ services: {}, logger })
-  const live = { speakReplies: true, ...config }
+  // `settleMs: 0` by default here: the wait for the channel's copy is the subject of
+  // `delivery-order.test.mjs`, and paying it in every structural test would only add
+  // latency. These tests are about what is spoken and what is written to the log.
+  const live = { speakReplies: true, settleMs, ...config }
   installReply(host, { config: live, logger, service, deps: {} })
   const outcome = await listenerOf(host).listener({ agent: { session }, turn: 9 })
   return { outcome, session, host, logger, service, config: live }
@@ -89,7 +92,9 @@ test('a documented answer produces an OGG declared on the closing turn', async (
   assert.equal(event.data.files.length, 1)
   assert.notEqual(event.data.files[0].description.trim(), '')
   assert.equal(event.data.files[0].path.endsWith('.ogg'), true)
-  assert.equal(outcome.handoff, null, 'the diagnostic is off by default')
+  // No turn-hold budget in these tests, so nothing was waited for and nothing is
+  // known about the handoff; the wait itself is tested in `delivery-order.test.mjs`.
+  assert.equal(outcome.handoff, 'unknown')
 
   const bytes = await readFile(event.data.files[0].path)
   assert.equal(bytes.subarray(0, 4).toString('latin1'), 'OggS')
@@ -399,40 +404,42 @@ test('a limit out of range is a configuration error, not a quiet clamp', () => {
   assert.equal(normalizeReplySettings({}).speakReplies, false, 'the switch is off by default')
 })
 
-test('the diagnostic is off unless the configuration asks for it', async (t) => {
+test('a zero budget does not touch the channel: nothing is waited for, nothing is claimed', async (t) => {
   const directory = await cacheDir(t)
-  // A probe seam that must not be touched: reaching it would be a bug.
+  // A probe seam that must not be touched when there is no budget to spend.
   const probe = {
     dir: '/virtual',
-    deps: { readdir: async () => { throw new Error('диагностика не должна запускаться') } },
+    deps: { readdir: async () => { throw new Error('без бюджета проба не должна запускаться') } },
   }
-  const { outcome } = await runTurn({ answer: voiceDocument('Готово.'), cacheDir: directory, config: { deps: { probe } } })
-
-  assert.equal(outcome.delivered, true)
-  assert.equal(outcome.handoff, null)
-})
-
-test('the log says the channel took the record when the probe is on', async (t) => {
-  const directory = await cacheDir(t)
-  const bytes = Buffer.from('snapshot-bytes')
-  const probe = {
-    dir: '/virtual',
-    deps: {
-      readdir: async (path) => (path === '/virtual' ? ['dsh-im-outbound-TEST'] : ['copy.artifact']),
-      stat: async () => ({ isFile: () => true, size: bytes.length, mtimeMs: Date.now() }),
-      readFile: async () => bytes,
-    },
-  }
-  const logger = fakeLogger()
   const { outcome } = await runTurn({
-    answer: voiceDocument('Готово.'), cacheDir: directory, logger, config: { diagnose: true, deps: { probe } },
+    answer: voiceDocument('Готово.'), cacheDir: directory, config: { settleMs: 0, deps: { probe } },
   })
 
-  assert.equal(outcome.handoff, 'taken')
-  const logged = logger.entries.info.find(([text]) => /озвучен/u.test(text))
-  assert.equal(logged[1].handoff, 'taken')
-  assert.equal(logged[1].turn, 9)
-  assert.equal(typeof logged[1].callId, 'string')
+  assert.equal(outcome.delivered, true)
+  assert.equal(outcome.handoff, 'unknown')
+})
+
+test('a record the channel never took is named in the log', async (t) => {
+  const directory = await cacheDir(t)
+  const snapshotDir = await mkdtemp(join(tmpdir(), 'dsh-im-outbound-'))
+  t.after(() => rm(snapshotDir, { recursive: true, force: true }))
+  // The channel's directory with a copy in it that is not our file: the record was
+  // written, the channel did not take it, and that has to end up in the log.
+  await writeFile(join(snapshotDir, 'other.artifact'), 'не наш файл')
+
+  const logger = fakeLogger()
+  const { outcome } = await runTurn({
+    answer: voiceDocument('Готово.'),
+    cacheDir: directory,
+    logger,
+    config: { settleMs: 40, deps: { probe: { dir: dirname(snapshotDir) } } },
+  })
+
+  assert.equal(outcome.handoff, 'not-taken')
+  const warned = logger.entries.warn.find(([text]) => /не забрал канал/u.test(text))
+  assert.ok(warned, 'the record nobody took is said out loud')
+  assert.equal(warned[1].turn, 9)
+  assert.equal(warned[1].callId, outcome.callId)
 })
 
 test('the plugin entry point mounts the reply hook, the card route and the loop', async (t) => {
@@ -458,7 +465,7 @@ test('the two fields the card edits are volatile, the rest is ordinary configura
   assert.equal(Config.dict.speakReplies.meta.default, false, 'the switch is off by default')
   assert.equal(Config.dict.maxChars.meta.default, DEFAULT_MAX_CHARS)
   // Ordinary configuration stays in the profile: it is not offered as a live field.
-  for (const field of ['cacheDir', 'language', 'subagents', 'diagnose', 'prompt']) {
+  for (const field of ['cacheDir', 'language', 'subagents', 'settleMs', 'prompt']) {
     assert.ok(Config.dict[field], `${field} is declared, or the Loader would reject it`)
     assert.equal(Config.dict[field].meta.volatile, undefined, `${field} is not a live field`)
   }

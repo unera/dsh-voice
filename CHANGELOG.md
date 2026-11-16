@@ -5,6 +5,31 @@ All notable changes to this package are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] - 2026-11-16
+
+### Fixed
+- A voice note declared at the closing turn now actually reaches the channel. `dsh-im`
+  accepts `deliverables/presented` only while the turn is open, and everything expensive
+  about that acceptance happens *after* the record lands: it copies the file into its own
+  snapshot directory, digests it, and only then re-checks the turn
+  (`semantic/artifact.mjs:493`, `:506`). The hook is the last thing before `turn/end`, so
+  that copy always outlived the turn and was deleted silently — the record was in the log,
+  the answer went out, no audio arrived, and nothing said why. The closing turn is now held
+  until the channel's copy is on disk (plus a 50 ms grace for its digest and re-check), so
+  the claim that happens after `turn/end` finds the file.
+
+### Added
+- `settleMs` (default `600`, ceiling `5000`) bounds that wait. A Host with no `dsh-im`
+  pays only the probe's creation window: the snapshot directory is created lazily with the
+  channel's first copy, and its absence is decided in 150 ms rather than by the whole budget.
+
+### Changed
+- `diagnose` is gone: waiting for the channel was a diagnostic while the reason was
+  unknown, and it is part of the delivery now. `handoff` is reported in the `ответ озвучен`
+  line on every spoken turn, and a record the channel did not take is logged as a warning
+  instead of behind a switch. A profile that still sets `diagnose` keeps working — the Host
+  passes unknown keys through — it simply has no effect.
+
 ## [0.4.3] - 2026-11-16
 
 ### Changed

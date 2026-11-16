@@ -84,7 +84,7 @@ The package ships `dsh.bundle.patch`, so the row mounts itself:
 | `description` | `Озвучка ответа` | the line the Web client shows beside the file |
 | `subagents` | `false` | whether subagent turns are spoken too |
 | `prompt` | `true` | whether the format is explained to the model while the switch is on |
-| `diagnose` | `false` | wait for `dsh-im` to take the record and say in the log whether it did; costs part of the closing turn, so it is opt-in |
+| `settleMs` | `600` | how long the closing turn stays open while the channel copies the announced file. `dsh-im` accepts the record only while the turn is open and copies the file *after* it, re-checking the turn when the copy is done — a copy made after `turn/end` is dropped without a word, so this wait is what turns "declared" into "delivered". `0` disables it; `5000` is the ceiling. The wait ends as soon as the copy is there (tens of milliseconds for one voice note); the full budget is paid only when no channel is coming for the file — a Host with no `dsh-im` at all is decided in 150 ms, and a turn that has `dsh-im` but no channel consumer for it costs the budget |
 
 ### Where things live: two plugins, two directories
 

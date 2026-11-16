@@ -1,4 +1,4 @@
-// Did the delivery side take the record?
+// Did the delivery side take the record — and, while it has not, keep the turn open.
 //
 // The record this package appends is read by whoever listens to
 // `deliverables/presented`. `dsh-im` accepts it only while the turn is open and
@@ -12,10 +12,12 @@
 // record was taken; seeing none within the window means it was dropped, and the
 // reason is on the consumer side, not in this package.
 //
-// It is a diagnostic, not a feature: the work is bounded by a few kilobytes, a
-// few hundred milliseconds, and one listing of the parent directory — the
-// candidate directories are remembered after the first round, so a busy `/tmp`
-// is walked once, not on every poll.
+// It is also more than a diagnostic: that copy is the work `dsh-im` does *after*
+// the record lands, and its registry re-checks the open turn once the copy and
+// its digest are done (`semantic/artifact.mjs:506`). A copy that finishes after
+// `turn/end` is dropped without a word, which is exactly what a record appended
+// at the last moment of the turn used to suffer. Waiting here while the hook is
+// still running keeps the turn open until the channel owns the file.
 import { createHash } from 'node:crypto'
 import { readdir, readFile, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -26,6 +28,17 @@ export const SNAPSHOT_PREFIX = 'dsh-im-outbound-'
 
 /** Suffix of one snapshot file inside it. */
 const SNAPSHOT_SUFFIX = '.artifact'
+
+/**
+ * How long an absent snapshot directory is waited for.
+ *
+ * `dsh-im` creates one directory per process, lazily, together with its first
+ * copy. So an empty listing means either "the first copy is being written right
+ * now" or "there is no channel in this Host at all", and the two are told apart by
+ * this window: a Host without `dsh-im` pays it once per spoken reply, not a whole
+ * budget.
+ */
+export const DEFAULT_CREATION_WINDOW_MS = 150
 
 const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms) })
 
@@ -97,15 +110,18 @@ async function findSnapshot ({ candidates, digest, size, since, dir, deps }) {
  * @param options.since - when it was declared (epoch ms); older copies do not count.
  * @param options.timeoutMs - how long to look; the turn is open, so this is a delay.
  * @param options.intervalMs - pause between rounds.
+ * @param options.creationWindowMs - how long an as yet absent snapshot directory is waited for.
  * @param options.dir - directory holding the snapshot directories.
  * @param options.deps - test seams (`readdir`, `stat`, `readFile`, `sleep`, `now`).
- * @returns `{taken, snapshot, rounds}`.
+ * @returns `{taken, snapshot, rounds, reason}`; `reason` is `'no-directory'` when no
+ *   snapshot directory appeared within the creation window, `'timed-out'` otherwise.
  */
 export async function waitForSnapshot ({
   path,
   since = Date.now(),
   timeoutMs = 400,
   intervalMs = 25,
+  creationWindowMs = DEFAULT_CREATION_WINDOW_MS,
   dir = tmpdir(),
   deps = {},
 }) {
@@ -118,28 +134,36 @@ export async function waitForSnapshot ({
   try {
     size = Number((await inspect(path)).size)
   } catch {
-    return { taken: false, snapshot: null, rounds: 0 }
+    return { taken: false, snapshot: null, rounds: 0, reason: 'no-file' }
   }
   const digest = await digestOf(path, read)
-  if (digest === null) return { taken: false, snapshot: null, rounds: 0 }
+  if (digest === null) return { taken: false, snapshot: null, rounds: 0, reason: 'no-file' }
 
   // One listing of the parent; later rounds reuse it, because a snapshot lands
-  // inside a directory that already exists.
+  // inside a directory that already exists. An empty listing is listed again —
+  // that is the case of the very first copy, which is what creates the directory.
+  const startedAt = now()
+  const deadline = startedAt + Math.max(0, Number(timeoutMs) || 0)
+  const directoryDeadline = Math.min(deadline, startedAt + Math.max(0, Number(creationWindowMs) || 0))
   let candidates = null
-  const deadline = now() + Math.max(0, Number(timeoutMs) || 0)
   let rounds = 0
   for (;;) {
     rounds += 1
-    if (candidates === null) {
+    if (candidates === null || candidates.length === 0) {
       try {
         candidates = (await list(dir)).map(String).filter((name) => name.startsWith(SNAPSHOT_PREFIX))
       } catch {
         candidates = []
       }
     }
-    const snapshot = await findSnapshot({ candidates, digest, size, since, dir, deps })
-    if (snapshot !== null) return { taken: true, snapshot, rounds }
-    if (now() >= deadline) return { taken: false, snapshot: null, rounds }
-    await pause(Math.min(intervalMs, Math.max(0, deadline - now())))
+    if (candidates.length > 0) {
+      const snapshot = await findSnapshot({ candidates, digest, size, since, dir, deps })
+      if (snapshot !== null) return { taken: true, snapshot, rounds, reason: 'taken' }
+    } else if (now() >= directoryDeadline) {
+      return { taken: false, snapshot: null, rounds, reason: 'no-directory' }
+    }
+    if (now() >= deadline) return { taken: false, snapshot: null, rounds, reason: 'timed-out' }
+    const until = candidates.length > 0 ? deadline : directoryDeadline
+    await pause(Math.min(intervalMs, Math.max(1, until - now())))
   }
 }
