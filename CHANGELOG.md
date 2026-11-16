@@ -5,6 +5,15 @@ All notable changes to this package are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-11-17
+### Fixed
+- The contract now says what the tool section used to contradict: for a reply in a chat, do not
+  call `voice_say` and do not show a file with `present` — the document *is* the voice note,
+  the host synthesizes it. It also forbids narrating the tools used. A fresh session asked to
+  answer aloud called `voice_say` + `present` and described the two steps instead of
+  answering: the trigger phrase "when the person asks to hear an answer spoken" belonged to
+  the text-to-speech section, and it read as the more direct instruction.
+
 ## [0.6.0] - 2026-11-17
 ### Changed
 - **One signature: `🔊`.** The spoken part starts with the speaker symbol and nothing else
