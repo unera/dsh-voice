@@ -245,14 +245,6 @@ function startLoop (ctx, config) {
   const log = config.logger
   const nodes = config.nodes ?? service(ctx, 'nodes')
   if (!nodes?.call) return undefined
-  // One line so a boot can be read afterwards: without it "no log" meant both
-  // "the loop is up" and "the loop never started", and telling them apart cost
-  // a restart each time.
-  log.info?.('[dsh-voice] the voice loop is up', {
-    speechToText: Boolean(service(ctx, 'speechToText')),
-    textToSpeech: Boolean(service(ctx, 'textToSpeech')),
-    sessions: Boolean(service(ctx, 'sessions')),
-  })
   if (!service(ctx, 'speechToText')) {
     // Nothing can be transcribed without it, so every press will be answered with an apology
     // (`reason=no-stt` in the closing line). The warning is what makes the reason readable later.
@@ -280,6 +272,9 @@ function startLoop (ctx, config) {
     // `none` removes it once used. Anything else reads as `last`: a typo must not throw takes away.
     keepRecording: resolveKeepRecording(config.keepRecording),
     ...typeof config.minSeconds === 'number' && config.minSeconds > 0 ? { minSeconds: config.minSeconds } : {},
+    // The directory this process owns inside the cache. Normally left out and made fresh at every
+    // boot; a host that wants a stable name can say so, and the value is made safe as a segment.
+    ...typeof config.runId === 'string' && config.runId.trim() ? { runId: config.runId.trim() } : {},
     on: (name, handler) => ctx.on(name, handler, { global: true }),
     // The loop announces the binding of a fresh session before creating it, the
     // way a messenger does, so dsh-assistants knows the transport and the device.
@@ -290,6 +285,16 @@ function startLoop (ctx, config) {
       if (!createUserMessage) return null
       return createUserMessage(input)
     },
+  })
+  // One line so a boot can be read afterwards: without it "no log" meant both "the loop is up"
+  // and "the loop never started", and telling them apart cost a restart each time. The run id
+  // names the directory this process owns under the cache, so a leftover on disk can be traced
+  // to the boot that wrote it.
+  log.info?.('[dsh-voice] the voice loop is up', {
+    run: loop.runId,
+    speechToText: Boolean(service(ctx, 'speechToText')),
+    textToSpeech: Boolean(service(ctx, 'textToSpeech')),
+    sessions: Boolean(service(ctx, 'sessions')),
   })
   void (async () => {
     try {

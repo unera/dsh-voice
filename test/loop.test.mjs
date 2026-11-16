@@ -4,7 +4,23 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 
-import { assistantTextOf, createVoiceLoop, resolveKeepRecording, sweepRecordings } from '../loop.mjs'
+import {
+  assistantTextOf,
+  createVoiceLoop,
+  newRunId,
+  resolveKeepRecording,
+  resolveRunId,
+  sweepRecordings,
+} from '../loop.mjs'
+
+/**
+ * The run id every fixture below writes under.
+ *
+ * The loop makes its own `<pid>-<hex>` unless it is told otherwise, and a test that placed a
+ * recording by hand would then have to know a name it cannot predict. Naming the run here keeps
+ * the fixtures honest: the path they build is the path the loop checks against.
+ */
+const RUN = 'run-test'
 
 /** A short WAV with real silence in it: ffmpeg has to be able to encode it. */
 function wavBytes (seconds = 0.2, sampleRate = 16000) {
@@ -28,14 +44,15 @@ function wavBytes (seconds = 0.2, sampleRate = 16000) {
 }
 
 /**
- * A recording where the device puts it: under the cache directory the loop is given.
+ * A recording where the device puts it: under the run directory of the loop under test.
  *
- * An upload event names a path inside `cacheDir/incoming`, and the loop now refuses anything
- * else — so a fixture that writes beside the cache is testing a case that cannot happen.
+ * An upload event names a path inside `cacheDir/incoming/<run>/<node>/`, and the loop refuses
+ * anything else — so a fixture that writes beside the cache, or under another run, is testing a
+ * case that cannot happen.
  */
 function uploadPath (dir, name = undefined, node = 'A059P') {
   const file = name ?? `take-${Math.random().toString(36).slice(2, 8)}.wav`
-  const target = join(dir, 'cache', 'incoming', node, file)
+  const target = join(dir, 'cache', 'incoming', RUN, node, file)
   mkdirSync(dirname(target), { recursive: true })
   writeFileSync(target, wavBytes())
   return target
@@ -61,6 +78,7 @@ function makeLoop (overrides = {}) {
   const loops = []
   const delivered = []
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes: overrides.nodes ?? stubNodes(),
     speechToText: overrides.speechToText ?? null,
     textToSpeech: overrides.textToSpeech ?? null,
@@ -256,6 +274,7 @@ test('nothing is left on disk after an exchange', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-cache-'))
     try {
       const loop = createVoiceLoop({
+        runId: RUN,
         nodes,
         speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'раз' }) },
         sessions: { flush: async () => {} },
@@ -271,7 +290,7 @@ test('nothing is left on disk after an exchange', async () => {
       // copyFromDevice is a stub, so the loop must not leave its own copy behind either. With
       // `keepRecording: none` the take goes as it is used; the directory it lands in is the one
       // a device upload uses, so the same assertions hold for both paths.
-      const nodeDirectory = join(dir, 'incoming', 'A059P')
+      const nodeDirectory = join(dir, 'incoming', RUN, 'A059P')
       assert.equal(existsSync(join(dir, 'take-1.wav')), false)
       assert.deepEqual(existsSync(nodeDirectory) ? readdirSync(nodeDirectory) : [], [])
     } finally {
@@ -353,6 +372,7 @@ test('an uploaded recording is answered without asking the device for anything',
 
   const nodes = stubNodes({ 'voice.say': { status: 'ok' } })
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes,
     speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'какая сегодня погода' }) },
     sessions: { flush: async () => {} },
@@ -380,6 +400,7 @@ test('a repeated recording id does not become a second turn', async (t) => {
   const nodes = stubNodes({ 'voice.say': { status: 'ok' } })
   const delivered = []
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes,
     speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'раз' }) },
     sessions: { flush: async () => {} },
@@ -409,6 +430,7 @@ test('an empty transcript from an upload is answered out loud and closes the exc
   const nodes = stubNodes({ 'voice.say': { status: 'ok' } })
   const delivered = []
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes,
     speechToText: { resolve: (r) => r, transcribe: async () => ({ text: '' }) },
     sessions: { flush: async () => {} },
@@ -435,6 +457,7 @@ test('one exchange writes every stage it reached and exactly one closing line', 
   const lines = []
   const nodes = stubNodes({ 'voice.say': { status: 'ok' } })
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes,
     speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
     textToSpeech: {
@@ -494,6 +517,7 @@ test('an exchange without client times has no record or upload segment', async (
 
   const lines = []
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes: stubNodes({ 'voice.say': { status: 'ok' } }),
     speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
     sessions: { flush: async () => {} },
@@ -525,6 +549,7 @@ test('an empty transcript closes the exchange with reason=empty', async (t) => {
 
   const lines = []
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes: stubNodes({ 'voice.say': { status: 'ok' } }),
     speechToText: { resolve: (r) => r, transcribe: async () => ({ text: '' }) },
     sessions: { flush: async () => {} },
@@ -554,6 +579,7 @@ async function drive (loop, { id, dir, synth, answer = '--- # say\nготово'
 
 function bareLoop ({ dir, synthService, nodes, lines = [], exchangeTimeoutMs = undefined, on = undefined, keepRecording = undefined }) {
   return createVoiceLoop({
+    runId: RUN,
     ...(exchangeTimeoutMs === undefined ? {} : { exchangeTimeoutMs }),
     ...(on === undefined ? {} : { on }),
     ...(keepRecording === undefined ? {} : { keepRecording }),
@@ -618,7 +644,9 @@ test('synth=host synthesizes, converts and plays the file', async (t) => {
   assert.equal(args.id, 'host-1')
   assert.equal(args.text, 'готово')
   assert.equal(args.speak, 'готово')
-  assert.match(args.path, /\/cache\/out\/host-1\.ogg$/)
+  // The answer waits in this run's own `out/`: the device fetches it by the command's ticket, and
+  // a second process on the same cache has its own directory under `out/`.
+  assert.match(args.path, /\/cache\/out\/run-test\/host-1\.ogg$/)
   assert.equal(args.seconds, 1.5)
 
   const done = lines.find((line) => line.includes(' done '))
@@ -860,6 +888,7 @@ test('a recording shorter than the threshold never reaches the recognizer', asyn
   const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
   const lines = []
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes,
     speechToText: { resolve: (r) => r, transcribe: async () => { transcribed += 1; return { text: '良いです。' } } },
     sessions: { flush: async () => {} },
@@ -890,6 +919,7 @@ test('the configured language is what the recognizer is asked for', async (t) =>
   const asked = []
   const lines = []
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes: stubNodes({ 'voice.chat': { status: 'ok' } }),
     speechToText: {
       resolve: (request) => { asked.push(request.language); return { ...request, provider: { info: { id: 'openai-transcribe' } } } },
@@ -928,6 +958,7 @@ test('a language the provider refuses falls back instead of losing the recording
   const asked = []
   const warnings = []
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes: stubNodes({ 'voice.chat': { status: 'ok' } }),
     speechToText: {
       resolve: (request) => {
@@ -996,6 +1027,7 @@ test('host audio is synthesized from speak, not from the screen text', async (t)
   const spoken = []
   const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes,
     speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'сравни' }) },
     textToSpeech: {
@@ -1033,6 +1065,7 @@ test('a new-session event drops the binding, so the next take starts a new conve
   const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
   const lines = []
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes,
     speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
     sessions: { flush: async () => {} },
@@ -1071,6 +1104,7 @@ test('a reset during a running exchange waits for it to finish', async (t) => {
   const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
   const lines = []
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes,
     speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
     sessions: { flush: async () => {} },
@@ -1112,6 +1146,7 @@ function loopWithAssistants ({ dir, persona, calls = [] }) {
   return {
     nodes,
     loop: createVoiceLoop({
+      runId: RUN,
       nodes,
       assistants: {
         personaOf (sessionId) {
@@ -1169,6 +1204,7 @@ test('without the assistants service there is no who at all', async (t) => {
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes,
     speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
     sessions: { flush: async () => {} },
@@ -1204,6 +1240,7 @@ test('a broken assistants service does not cost the answer', async (t) => {
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes,
     assistants: { personaOf: () => { throw new Error('rules are broken') } },
     speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
@@ -1242,6 +1279,7 @@ test('the audio file lives until the answer command settles, and is gone afterwa
     },
   }
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes,
     speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
     textToSpeech: {
@@ -1287,6 +1325,7 @@ test('a failed synthesis is visible to the person as degraded', async (t) => {
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes,
     speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
     textToSpeech: {
@@ -1329,6 +1368,7 @@ test('a bug report reaches the session marked as a fact, not spoken', async (t) 
   let injected = 0
   const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes,
     speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
     sessions: { flush: async () => {} },
@@ -1385,6 +1425,7 @@ function warmLoop ({ dir, hasVoice = true, warmup = async () => {}, lines = [] }
     api (nodeRef, name) { return hasVoice && name === 'voice' ? { id: 1, name: 'voice' } : null },
   }
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes,
     textToSpeech: { warmup: async () => { warmed += 1; await warmup() }, resolve: (r) => r, synthesize: async () => ({ audio: wavBytes(), seconds: 1 }) },
     speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
@@ -1462,6 +1503,7 @@ test('a failed exchange leaves the id free for a retry', async (t) => {
   let transcribeCalls = 0
   const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes,
     speechToText: {
       resolve: (r) => r,
@@ -1496,6 +1538,7 @@ test('two devices with the same id are two different exchanges', async (t) => {
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes,
     speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
     sessions: { flush: async () => {} },
@@ -1524,7 +1567,7 @@ test('a path with a dollar sign is quoted, not executed', async () => {
 
 /** The directory a device uploads into, created on demand. */
 function nodeDirOf (dir, node = 'A059P') {
-  const nodeDir = join(dir, 'cache', 'incoming', node)
+  const nodeDir = join(dir, 'cache', 'incoming', RUN, node)
   mkdirSync(nodeDir, { recursive: true })
   return nodeDir
 }
@@ -1641,6 +1684,103 @@ test('the loop sweeps expired recordings when it starts', async (t) => {
   assert.equal(existsSync(expired), false, 'the boot sweep runs without being asked')
 })
 
+test('a boot removes the leftovers of earlier runs once they are an hour old', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-clean-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const cache = join(dir, 'cache')
+  const twoHoursAgo = new Date(Date.now() - 2 * 3_600_000)
+  const tenMinutesAgo = new Date(Date.now() - 10 * 60_000)
+
+  // Three shapes under `incoming/`: a run of two hours ago, a run of ten minutes ago, and the old
+  // flat layout, where the node directory sat right under `incoming/`. The current run has a file
+  // from two hours ago as well: this process is the one using it, so its age decides nothing.
+  const oldRun = join(cache, 'incoming', '1111-aaaaaa', 'A059P')
+  const freshRun = join(cache, 'incoming', '2222-bbbbbb', 'A059P')
+  const oldLayout = join(cache, 'incoming', 'A059P')
+  const currentTake = join(cache, 'incoming', RUN, 'A059P', 'kept.wav')
+  const takes = [
+    [join(oldRun, 'take.wav'), twoHoursAgo],
+    [join(freshRun, 'take.wav'), tenMinutesAgo],
+    [join(oldLayout, 'take.wav'), twoHoursAgo],
+    [currentTake, twoHoursAgo],
+  ]
+  for (const [path, when] of takes) {
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(path, wavBytes())
+    utimesSync(path, when, when)
+    utimesSync(dirname(path), when, when)
+  }
+  // The boot reads the age of the run directory itself, and creating a node directory inside it
+  // has just made it look fresh — so it is dated explicitly, like everything below it.
+  utimesSync(join(cache, 'incoming', '1111-aaaaaa'), twoHoursAgo, twoHoursAgo)
+
+  // `out/`: the same two ages, plus an answer of the current run that is old too.
+  const answers = [
+    [join(cache, 'out', '1111-aaaaaa', 'ex-1.ogg'), twoHoursAgo],
+    [join(cache, 'out', '2222-bbbbbb', 'ex-2.ogg'), tenMinutesAgo],
+    [join(cache, 'out', RUN, 'ex-3.ogg'), twoHoursAgo],
+  ]
+  for (const [path, when] of answers) {
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(path, wavBytes())
+    utimesSync(path, when, when)
+    utimesSync(dirname(path), when, when)
+  }
+
+  const loop = bareLoop({ dir, nodes: stubNodes(), synthService: null })
+  t.after(() => loop.dispose())
+  assert.equal(loop.runId, RUN, 'the loop writes under the id it was given')
+
+  assert.equal(existsSync(join(cache, 'incoming', '1111-aaaaaa')), false,
+    'the whole run of two hours ago is litter')
+  assert.equal(existsSync(oldLayout), false,
+    'and so is the old layout, where a node directory sat right under incoming/')
+  assert.deepEqual(readdirSync(freshRun), ['take.wav'],
+    'ten minutes is too young: a take may still be read or written by a neighbour')
+  assert.equal(existsSync(join(cache, 'out', '1111-aaaaaa')), false,
+    'an answer of that run goes with the run')
+  assert.deepEqual(readdirSync(join(cache, 'out', '2222-bbbbbb')), ['ex-2.ogg'],
+    'and the younger answer is left alone')
+  assert.equal(existsSync(currentTake), true,
+    'the directory of the current run is not touched, however old it looks')
+  assert.equal(existsSync(join(cache, 'out', RUN, 'ex-3.ogg')), true, 'nor is its out/')
+})
+
+test('a recording of another run is refused even under the same node name', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-runjail-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const foreign = join(dir, 'cache', 'incoming', 'another-run', 'A059P', 'take.wav')
+  mkdirSync(dirname(foreign), { recursive: true })
+  writeFileSync(foreign, wavBytes())
+  let transcribed = 0
+  const { loop, lines } = traceLoop({
+    dir,
+    speech: { resolve: (r) => r, transcribe: async () => { transcribed += 1; return { text: 'привет' } } },
+  })
+  t.after(() => loop.dispose())
+
+  const outcome = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'foreign-1', path: foreign })
+
+  assert.equal(outcome.status, 'refused-path', 'the run is part of the boundary, not decoration')
+  assert.equal(existsSync(foreign), true, 'and the other run\'s file is left where it is')
+  assert.equal(transcribed, 0, 'nothing of another run is read')
+  assert.ok(lines.some((line) => line.includes(' done ') && line.includes('reason=refused-path')),
+    'the refusal is written down like any other')
+})
+
+test('a run id is short, unique in practice and safe as one path segment', () => {
+  const id = newRunId()
+  assert.match(id, /^\d+-[0-9a-f]{6}$/, 'a pid and a random tail, short enough to read')
+  assert.notEqual(newRunId(), id, 'two runs do not share a directory')
+
+  assert.equal(resolveRunId('run-42'), 'run-42', 'a plain name is taken as written')
+  assert.equal(resolveRunId(' a/b '), 'a_b', 'a separator is replaced, never read as one')
+  assert.equal(resolveRunId('../../etc'), '.._.._etc', 'and a climb out of the cache is not a path either')
+  for (const junk of [undefined, null, '', '   ', '..', '.']) {
+    assert.match(resolveRunId(junk), /^\d+-[0-9a-f]{6}$/, `junk ${JSON.stringify(junk)} gets a fresh run`)
+  }
+})
+
 test('a broken keepRecording value reads as last, never as none', () => {
   assert.equal(resolveKeepRecording('none'), 'none')
   assert.equal(resolveKeepRecording(' NONE '), 'none')
@@ -1659,6 +1799,7 @@ test('a broken keepRecording value reads as last, never as none', () => {
 function traceLoop ({ dir, nodes = stubNodes({ 'voice.chat': { status: 'ok' }, 'voice.say': { status: 'ok' } }), speech = { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) }, speak = null, sessionController = undefined, ...rest }) {
   const lines = []
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes,
     speechToText: 'speech' in rest ? rest.speech : speech,
     textToSpeech: speak,
@@ -1689,7 +1830,7 @@ test('a recording outside the voice cache is refused before it is read or remove
   })
   t.after(() => loop.dispose())
 
-  const traversal = `${join(dir, 'cache', 'incoming', 'A059P')}/../../../outside/take.wav`
+  const traversal = `${join(dir, 'cache', 'incoming', RUN, 'A059P')}/../../../outside/take.wav`
   const escaped = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'jail-1', path: traversal })
   assert.equal(escaped.status, 'refused-path', 'a path that climbs out of the cache is refused')
   assert.equal(existsSync(outside), true, 'and the file is left where it is')
@@ -1835,7 +1976,7 @@ test('a session that cannot be created is said out loud from the pull path too',
   assert.equal(outcome.status, 'no-session')
   assert.ok(nodes.calls.some((call) => call.method === 'say' && /Не смог начать новую сессию/.test(call.data.text)))
   assert.ok(lines.some((line) => line.includes(' done ') && line.includes('reason=no-session')))
-  const nodeDirectory = join(dir, 'cache', 'incoming', '19')
+  const nodeDirectory = join(dir, 'cache', 'incoming', RUN, '19')
   assert.deepEqual(readdirSync(nodeDirectory), [], 'the take does not stay behind for a failed session')
 })
 
@@ -1845,6 +1986,7 @@ test('without a recognizer the person is told, not told "I did not hear you"', a
   const nodes = stubNodes({ 'voice.chat': { status: 'ok' }, 'voice.say': { status: 'ok' } })
   const lines = []
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes,
     speechToText: null,
     sessions: { flush: async () => {} },
@@ -1869,6 +2011,7 @@ test('synth=host without a synthesizer degrades to the device voice', async (t) 
   const nodes = stubNodes({ 'voice.chat': { status: 'ok' } })
   const lines = []
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes,
     speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
     textToSpeech: null,
@@ -1904,7 +2047,7 @@ test('keepRecording: last keeps the pull take too', async (t) => {
 
   const outcome = await loop.handle({ node: 19, nodeName: 'A059P', mode: 'ptt' })
   assert.equal(outcome.status, 'delivered')
-  const kept = readdirSync(join(dir, 'cache', 'incoming', '19'))
+  const kept = readdirSync(join(dir, 'cache', 'incoming', RUN, '19'))
   assert.equal(kept.length, 1, 'the take that was used is the one kept')
   assert.match(kept[0], /^take-\d+-a\.wav$/)
 })
@@ -1923,7 +2066,7 @@ test('keepRecording: none removes the pull take as it is used', async (t) => {
 
   const outcome = await loop.handle({ node: 19, nodeName: 'A059P', mode: 'ptt' })
   assert.equal(outcome.status, 'delivered')
-  assert.deepEqual(readdirSync(join(dir, 'cache', 'incoming', '19')), [], 'nothing is left behind')
+  assert.deepEqual(readdirSync(join(dir, 'cache', 'incoming', RUN, '19')), [], 'nothing is left behind')
 })
 
 test('the sweep removes a rendered answer orphaned in out/', (t) => {
@@ -1960,6 +2103,7 @@ test('the warmup map holds only the nodes inside the debounce window', async (t)
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const lines = []
   const loop = createVoiceLoop({
+    runId: RUN,
     nodes: stubNodes(),
     textToSpeech: { warmup: async () => {} },
     speechToText: null,
@@ -2117,7 +2261,7 @@ test('a recording in the node-number directory is accepted and pruned there', as
     speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
   })
   const id = 'number-dir-1'
-  const path = join(dir, 'voice', 'incoming', '19', `${id}.wav`)
+  const path = join(dir, 'voice', 'incoming', RUN, '19', `${id}.wav`)
   mkdirSync(dirname(path), { recursive: true })
   writeFileSync(path, Buffer.alloc(3200))
 

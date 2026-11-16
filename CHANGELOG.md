@@ -5,6 +5,32 @@ All notable changes to this package are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.21] - 2026-11-16
+
+### Changed
+
+- The cache is laid out per run. Recordings go to `<cacheDir>/incoming/<run>/<node>/<id>.<ext>`
+  and rendered answers to `<cacheDir>/out/<run>/<id>.ogg`, where `<run>` is `<pid>-<six hex>`,
+  made once when the loop is built (the `runId` option overrides it). The pid alone is not
+  identity — the kernel reuses the number, and a directory left by an earlier process with that
+  number looked like this one's own. Now a file on disk belongs to a named run, and both paths
+  (upload and pull) agree on where it lives.
+- The path guard is `<cacheDir>/incoming/<run>/<node>/`. A recording of another run is refused
+  with `reason=refused-path` even under the same node name; the node **number** and the node
+  **name** are still both accepted as the segment, as in 0.1.20.
+- A boot removes what earlier runs left behind, and it trusts age alone: everything under
+  `incoming/` and `out/` older than an hour goes — subdirectories and stray files alike, the old
+  `<node>/` layout included — while the directories of the current run are never touched,
+  however old they look. Age, not ownership, because a second process may share the cache and a
+  file may still be read or downloaded: "everything that is not mine" would delete live work of
+  a neighbour. A leftover younger than an hour is picked up by the next boot or by the daily
+  sweep, which stays as the insurance policy for a process that lives for weeks.
+- **`keepRecording` now works inside one run.** `last` leaves the newest take in
+  `incoming/<run>/<node>/` and `none` leaves nothing, but the directory of a finished run is a
+  leftover: once it is an hour old the next boot removes it whole, so after a restart the
+  previous recording can no longer be listened to. That is the conscious price of naming the
+  directories after the run, and it buys a cache where nothing has to be guessed by age.
+
 ## [0.1.20] - 2026-11-16
 
 ### Changed

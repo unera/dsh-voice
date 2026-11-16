@@ -7,9 +7,9 @@
 //
 // Every outside world dependency is passed in, so the whole loop can be exercised on stubs:
 // no device, no model, no speech service.
-import { mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join, resolve, sep } from 'node:path'
-import { randomUUID } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 
 import { splitReply } from './markup.mjs'
 import { createTrace } from './trace.mjs'
@@ -55,10 +55,56 @@ export const KEEP_NONE = 'none'
 export const RECORDING_TTL_MS = 24 * 60 * 60 * 1000
 /** The age sweep runs once a boot and then once a day: nothing else has to hold the timer. */
 const SWEEP_INTERVAL_MS = RECORDING_TTL_MS
-/** Where the device uploads land: `<cacheDir>/incoming/<node>/<id>.wav`. */
+/** Where the device uploads land: `<cacheDir>/incoming/<run>/<node>/<id>.wav`. */
 const INCOMING_DIR = 'incoming'
-/** Where a synthesized answer waits for the device: `<cacheDir>/out/<id>.ogg`. */
+/** Where a synthesized answer waits for the device: `<cacheDir>/out/<run>/<id>.ogg`. */
 const OUTPUT_DIR = 'out'
+/**
+ * How long the leftovers of a finished run may stay on disk before a boot removes them.
+ *
+ * Age is the rule, not ownership: a second process may share this cache, and a file may still be
+ * read or downloaded right after a restart, so "everything that is not mine" would delete live
+ * work. An hour is longer than any take or answer lives here, and it is the same grace a rendered
+ * answer gets while the device fetches it.
+ */
+export const RUN_STALE_MS = 60 * 60 * 1000
+
+/**
+ * A fresh identifier for one run of the loop: `<pid>-<six hex>`.
+ *
+ * The cache is shared by everything that starts with the same `cacheDir`, and before this a
+ * restart found the previous process's takes under the very same `<node>` names, with no way to
+ * tell whose they were. A run id in the path makes the question answerable and keeps the
+ * directories of two processes apart — for reading, and for cleaning.
+ *
+ * The pid alone is not identity enough: the kernel reuses a number, so a directory left by a
+ * process that had that number would look like this one's own. The random tail makes the pair
+ * unique in practice; both parts stay short and safe as one path segment.
+ *
+ * @returns `<pid>-<6 hex>`.
+ */
+export function newRunId () {
+  return `${process.pid}-${randomBytes(3).toString('hex')}`
+}
+
+/**
+ * Read a run id from the config, and keep it usable as one path segment.
+ *
+ * The value becomes a directory name, so a separator, a `..` or an absolute path would decide
+ * where the loop writes. Anything that is not a plain name character is replaced; a value that
+ * carries nothing usable falls back to a fresh id, because a missing run must not become a shared
+ * directory again.
+ *
+ * @param value - the configured run id, or anything else.
+ * @returns the sanitised id, or a fresh one.
+ */
+export function resolveRunId (value) {
+  const raw = typeof value === 'string' ? value.trim() : ''
+  const safe = raw.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 64)
+  // `.` and `..` are the two names a path segment may not be.
+  if (!safe || /^\.+$/.test(safe)) return newRunId()
+  return safe
+}
 
 /**
  * The same path with every symlink on the way resolved.
@@ -128,17 +174,18 @@ function underReal (path, root) {
  *
  * A recording path arrives in an event, and the file is read and then removed: `keepRecording:
  * none` unlinks it, `last` prunes its directory whole. The event source is internal, but the
- * boundary belongs to this plugin, so every path is checked before it is touched — against
- * `incoming/`, never against the cache root: the root holds `sessions.json`, and pruning "the
- * directory of the take" there deletes the node → session bindings.
+ * boundary belongs to this plugin, so every path is checked before it is touched — against this
+ * run's `incoming/`, never against the cache root: the root holds `sessions.json`, and pruning
+ * "the directory of the take" there deletes the node → session bindings.
  *
  * @param path - the path from the event.
  * @param cacheDir - the voice cache.
- * @returns true only for a path strictly under `<cacheDir>/incoming/`.
+ * @param runId - the run whose uploads may be touched.
+ * @returns true only for a path strictly under `<cacheDir>/incoming/<run>/`.
  */
-export function insideCache (path, cacheDir) {
+export function insideCache (path, cacheDir, runId) {
   if (typeof path !== 'string' || !path) return false
-  return underReal(path, join(cacheDir, INCOMING_DIR))
+  return underReal(path, runIncomingDir(cacheDir, runId))
 }
 
 /**
@@ -151,15 +198,16 @@ export function insideCache (path, cacheDir) {
  * @param path - the path from the event.
  * @param cacheDir - the voice cache.
  * @param nodeName - the device name from the same event.
- * @returns true only for a path strictly under `<cacheDir>/incoming/<node>/`.
+ * @param runId - the run whose uploads may be touched.
+ * @returns true only for a path strictly under `<cacheDir>/incoming/<run>/<node>/`.
  */
-export function insideNodeDir (path, cacheDir, nodeName) {
+export function insideNodeDir (path, cacheDir, nodeName, runId) {
   if (typeof path !== 'string' || !path) return false
-  return underReal(path, nodeDir(cacheDir, nodeName))
+  return underReal(path, nodeDir(cacheDir, nodeName, runId))
 }
 
 /**
- * Which node directory a path belongs to, if any.
+ * Which node directory of this run a path belongs to, if any.
  *
  * The device event carries both the node number and its name, and `dsh-nodes` names the
  * directory after the number while older code used the name. A check against one of them
@@ -169,30 +217,54 @@ export function insideNodeDir (path, cacheDir, nodeName) {
  * @param path - the path from the event.
  * @param cacheDir - the voice cache.
  * @param segments - candidate directory names, in order of preference.
+ * @param runId - the run whose uploads may be touched; another run's directory never matches.
  * @returns the segment that matched, or null.
  */
-export function matchNodeSegment (path, cacheDir, segments) {
+export function matchNodeSegment (path, cacheDir, segments, runId) {
   if (typeof path !== 'string' || !path) return null
   for (const segment of segments) {
     if (typeof segment !== 'string' || !segment) continue
-    if (underReal(path, nodeDir(cacheDir, segment))) return segment
+    if (underReal(path, nodeDir(cacheDir, segment, runId))) return segment
   }
   return null
 }
 
 /**
- * The directory of one node inside the cache.
+ * The uploads of one run: `<cacheDir>/incoming/<run>`.
+ *
+ * @param cacheDir - the voice cache.
+ * @param runId - the run.
+ * @returns the run's incoming directory.
+ */
+export function runIncomingDir (cacheDir, runId) {
+  return join(cacheDir, INCOMING_DIR, runId)
+}
+
+/**
+ * The rendered answers of one run: `<cacheDir>/out/<run>`.
+ *
+ * @param cacheDir - the voice cache.
+ * @param runId - the run.
+ * @returns the run's output directory.
+ */
+export function runOutputDir (cacheDir, runId) {
+  return join(cacheDir, OUTPUT_DIR, runId)
+}
+
+/**
+ * The directory of one node inside one run.
  *
  * The node name comes from an event and becomes a path segment, so anything that is not a plain
  * name character is replaced instead of being read as a separator.
  *
  * @param cacheDir - the voice cache.
  * @param nodeName - the device name.
- * @returns `<cacheDir>/incoming/<safe node>`.
+ * @param runId - the run.
+ * @returns `<cacheDir>/incoming/<run>/<safe node>`.
  */
-export function nodeDir (cacheDir, nodeName) {
+export function nodeDir (cacheDir, nodeName, runId) {
   const safe = String(nodeName ?? '').replace(/[^A-Za-z0-9._-]/g, '_') || '_'
-  return join(cacheDir, INCOMING_DIR, safe)
+  return join(runIncomingDir(cacheDir, runId), safe)
 }
 
 /**
@@ -228,6 +300,53 @@ function filesIn (dir) {
 }
 
 /**
+ * Everything a directory holds, with the type the cleanup rules need.
+ *
+ * `lstat`, not `stat`: a symlink is an entry of this directory, and neither its target's age nor
+ * its target's type may decide whether the link is removed.
+ *
+ * @param dir - the directory to read.
+ * @returns one entry per name: `{path, name, isDirectory, mtimeMs}`; empty for a missing directory.
+ */
+function entriesIn (dir) {
+  let names
+  try {
+    names = readdirSync(dir)
+  } catch {
+    return []
+  }
+  const entries = []
+  for (const name of names) {
+    const path = join(dir, name)
+    try {
+      const stat = lstatSync(path)
+      entries.push({ path, name, isDirectory: stat.isDirectory(), mtimeMs: stat.mtimeMs })
+    } catch {}
+  }
+  return entries
+}
+
+/**
+ * Every file under a directory, down to `depth` levels.
+ *
+ * The cache nests `<incoming>/<run>/<node>/<id>` and `<out>/<run>/<id>`, so two walks replace the
+ * two hard-coded levels the sweep used to know about.
+ *
+ * @param dir - the directory to read.
+ * @param depth - how many levels below `dir` to look.
+ * @returns the files, with their mtimes.
+ */
+function filesUnder (dir, depth) {
+  if (depth <= 0) return []
+  const files = []
+  for (const entry of entriesIn(dir)) {
+    if (entry.isDirectory) files.push(...filesUnder(entry.path, depth - 1))
+    else files.push({ path: entry.path, mtimeMs: entry.mtimeMs })
+  }
+  return files
+}
+
+/**
  * Remove every recording of one node directory except the newest one.
  *
  * The take that has just been used is passed as `prefer`: it is the last one by construction, and
@@ -258,17 +377,17 @@ export function pruneRecordings (dir, { prefer = null, log = null } = {}) {
 }
 
 /**
- * Delete recordings older than the retention window, node by node.
+ * Delete recordings older than the retention window, in every run directory.
  *
  * A plain mtime sweep: no bookkeeping file, so a take left behind by a crash is removed by the
- * same rule as one that was kept on purpose.
+ * same rule as one that was kept on purpose. It is the insurance policy for a process that lives
+ * for weeks — the boot cleanup (below) is what handles the leftovers of a process that is gone.
  *
  * @param cacheDir - the voice cache, whose `incoming/` holds the uploads.
  * @param options - `now`, `maxAgeMs` and `log`, all for tests and for a quiet failure.
  * @returns the removed paths.
  */
 export function sweepRecordings (cacheDir, { now = Date.now(), maxAgeMs = RECORDING_TTL_MS, log = null } = {}) {
-  const root = join(cacheDir, INCOMING_DIR)
   const removed = []
   const expire = (file) => {
     if (now - file.mtimeMs <= maxAgeMs) return
@@ -282,22 +401,47 @@ export function sweepRecordings (cacheDir, { now = Date.now(), maxAgeMs = RECORD
   // A rendered answer is removed as soon as the device takes it, with a two-minute guard for a
   // device that never answers. A crash between the two leaves an orphan, and this sweep is what
   // keeps it from living forever; the age window is the recording one, the guard is the fast path.
-  for (const file of filesIn(join(cacheDir, OUTPUT_DIR))) expire(file)
-  for (const entry of filesIn(root)) expire(entry)
-  let nodes = []
-  try {
-    nodes = readdirSync(root)
-  } catch {
-    return removed
-  }
-  for (const node of nodes) {
-    const dir = join(root, node)
-    try {
-      if (!statSync(dir).isDirectory()) continue
-    } catch {
-      continue
+  for (const file of filesUnder(join(cacheDir, OUTPUT_DIR), 3)) expire(file)
+  for (const file of filesUnder(join(cacheDir, INCOMING_DIR), 3)) expire(file)
+  return removed
+}
+
+/**
+ * Remove what earlier runs left behind, before this one talks to anybody.
+ *
+ * The rule is age, not ownership. Another process may share this `cacheDir`, and a recording or an
+ * answer may still be read or downloading right after a restart; deleting "everything that is not
+ * mine" would delete live work of a neighbour. An hour of age is the safe signal, and it is the
+ * same grace the device gets to fetch a rendered answer.
+ *
+ * Both trees are swept whole, directory entries included: a subdirectory is one run (or, in the
+ * old layout, one node) that has not been touched for an hour, and nothing inside it can be live
+ * either. The directories of this run are never touched, however old the clock says they are —
+ * this process is the one using them.
+ *
+ * @param cacheDir - the voice cache.
+ * @param runId - the run that is starting.
+ * @param options - `now`, `maxAgeMs` and `log`, for tests and a quiet failure.
+ * @returns the removed paths.
+ */
+export function cleanRunCache (cacheDir, runId, { now = Date.now(), maxAgeMs = RUN_STALE_MS, log = null } = {}) {
+  const removed = []
+  const mine = new Set([runIncomingDir(cacheDir, runId), runOutputDir(cacheDir, runId)])
+  // The run's own directory is created here, before the first exchange and before any timer: a
+  // device may write into it at any moment, and an empty directory is cheaper to explain than a
+  // missing one.
+  mkdirSync(runIncomingDir(cacheDir, runId), { recursive: true })
+  for (const root of [join(cacheDir, INCOMING_DIR), join(cacheDir, OUTPUT_DIR)]) {
+    for (const entry of entriesIn(root)) {
+      if (mine.has(entry.path)) continue
+      if (now - entry.mtimeMs <= maxAgeMs) continue
+      try {
+        rmSync(entry.path, { recursive: true, force: true })
+        removed.push(entry.path)
+      } catch (error) {
+        log?.warn?.('[dsh-voice] could not remove a stale cache entry:', error?.message ?? error)
+      }
     }
-    for (const file of filesIn(dir)) expire(file)
   }
   return removed
 }
@@ -444,7 +588,9 @@ export function assistantTextOf (event) {
  * @param {string} [deps.keepRecording] - `last` (default) keeps the newest take of every node,
  *   `none` removes every take once it is used.
  * @param {number} [deps.warmupDebounceMs] - how long one node's warmup holds; a test value.
- * @returns `{ handle, handleUpload, observeSessionEvent, pending, dispose }`
+ * @param {string} [deps.runId] - the name of this process inside the cache; a fresh
+ *   `<pid>-<6 hex>` when it is not given.
+ * @returns `{ handle, handleUpload, observeSessionEvent, runId, pending, dispose }`
  */
 export function createVoiceLoop ({
   nodes,
@@ -466,6 +612,9 @@ export function createVoiceLoop ({
   minSeconds = MIN_SECONDS,
   keepRecording = KEEP_LAST,
   warmupDebounceMs = WARMUP_DEBOUNCE_MS,
+  // The directory this process owns inside the cache. Left out, a fresh one is made here; a test
+  // (or a host that wants a stable name) may pass its own.
+  runId = null,
 }) {
   /**
    * A service, read at the moment it is needed.
@@ -479,6 +628,13 @@ export function createVoiceLoop ({
 
   /** `last` or `none`, decided once: the config cannot change under a running loop. */
   const keeping = resolveKeepRecording(keepRecording)
+  /**
+   * This process's own directory inside the cache: decided once, at build time.
+   *
+   * Everything the loop writes goes under it, so the files of one run are never confusable with
+   * those of another and a boot can tell whom a leftover belongs to.
+   */
+  const run = resolveRunId(runId)
   /** One entry per node that is currently being talked to. */
   const active = new Map()
   /** node → session id, kept across exchanges and restarts (`sessions.json`). */
@@ -502,8 +658,8 @@ export function createVoiceLoop ({
     }
   }
 
-  /** Where a synthesized answer waits for the device to fetch it. */
-  const outputDir = join(cacheDir, OUTPUT_DIR)
+  /** Where a synthesized answer waits for the device to fetch it: `<cacheDir>/out/<run>`. */
+  const answersDir = runOutputDir(cacheDir, run)
 
   /** Nodes whose "new session" arrived while an exchange was still running. */
   const resetPending = new Set()
@@ -606,7 +762,7 @@ export function createVoiceLoop ({
    * @returns the kept path, or null when it was removed.
    */
   function discardRecording (path, nodeName = null) {
-    const mine = nodeName ? insideNodeDir(path, cacheDir, nodeName) : insideCache(path, cacheDir)
+    const mine = nodeName ? insideNodeDir(path, cacheDir, nodeName, run) : insideCache(path, cacheDir, run)
     if (!mine) {
       // A path that is not ours is neither read nor removed: `none` would unlink an arbitrary
       // file, and `last` would prune a directory belonging to somebody else — `cacheDir` itself
@@ -624,6 +780,16 @@ export function createVoiceLoop ({
       log.warn?.('[dsh-voice] could not tidy the recordings:', error?.message ?? error)
       return path
     }
+  }
+
+  // The previous process is gone, and its directories are litter — but only once they are old
+  // enough that no neighbour sharing this cache and no half-finished download can still be using
+  // them. Nothing here runs on a timer, and nothing speaks to a device before it has finished.
+  try {
+    const cleaned = cleanRunCache(cacheDir, run, { log })
+    if (cleaned.length > 0) log.info?.('[dsh-voice] removed what an earlier run left', { count: cleaned.length, run })
+  } catch (error) {
+    log.warn?.('[dsh-voice] the startup cleanup failed:', error?.message ?? error)
   }
 
   // A kept recording must not live forever: one sweep at boot, then once a day. The timer is
@@ -862,7 +1028,7 @@ export function createVoiceLoop ({
     const devicePath = record.payload.path
     // The take lands in the node's own directory, the same one a pushed recording uses: then
     // `keepRecording` and the age sweep treat both paths alike.
-    const localPath = join(nodeDir(cacheDir, nodeKey), `take-${Date.now()}-${basename(devicePath)}`)
+    const localPath = join(nodeDir(cacheDir, nodeKey, run), `take-${Date.now()}-${basename(devicePath)}`)
     mkdirSync(dirname(localPath), { recursive: true })
     const copy = await callNode(nodeName, 'files', 'copyFromDevice', { path: devicePath, hostPath: localPath })
     // The take belongs to the person's words: once it is here, the device copy is litter.
@@ -981,7 +1147,7 @@ export function createVoiceLoop ({
     // The number is the key; the name is only a fallback for recordings written by older
     // versions, which named the directory after the device.
     const segments = [event?.node, event?.nodeName].map((value) => (value === undefined || value === null ? '' : String(value))).filter(Boolean)
-    const segment = matchNodeSegment(path, cacheDir, segments) ?? (segments.length === 0 ? (insideCache(path, cacheDir) ? '' : null) : null)
+    const segment = matchNodeSegment(path, cacheDir, segments, run) ?? (segments.length === 0 ? (insideCache(path, cacheDir, run) ? '' : null) : null)
     // Symlinks are resolved, and the path has to be inside this node's own upload directory:
     // `cacheDir` itself and its `out/` are not recordings, and pruning "their" directory would
     // delete `sessions.json` and the answers waiting for the device.
@@ -990,11 +1156,11 @@ export function createVoiceLoop ({
       // This path is read and then removed: `keepRecording: none` unlinks it, `last` prunes its
       // directory. The event source is internal, and this is the plugin's own boundary — one
       // event with a strange path must not delete files anywhere else, so it is refused whole.
-      log.warn?.('[dsh-voice] refusing a recording outside the voice cache', {
+      log.warn?.('[dsh-voice] refusing a recording outside the voice cache of this run', {
         path,
         node: nodeName,
         id: id || null,
-        stack: new Error('a recording path outside the voice cache').stack,
+        stack: new Error('a recording path outside the voice cache of this run').stack,
       })
       const refused = createTrace({ id: event?.id ?? null, node: nodeName, at: event?.at ?? null, log })
       refused.mark('received')
@@ -1448,11 +1614,13 @@ export function createVoiceLoop ({
       try {
         const speech = await synthesize(spoken)
         audioSeconds = Number(speech.seconds?.toFixed?.(2) ?? speech.seconds)
-        const wavPath = join(cacheDir, `say-${Date.now()}.wav`)
+        // Both files live under this run's `out/`: the wav is temporary, the answer waits there
+        // for the device to fetch it, and neither can be confused with another run's answer.
+        mkdirSync(answersDir, { recursive: true })
+        const wavPath = join(answersDir, `say-${Date.now()}.wav`)
         writeFileSync(wavPath, speech.audio)
         trace?.mark('synthesized', { seconds: audioSeconds })
-        mkdirSync(outputDir, { recursive: true })
-        audioPath = join(outputDir, `${id ?? Date.now()}.ogg`)
+        audioPath = join(answersDir, `${id ?? Date.now()}.ogg`)
         try {
           await toVoiceNote(wavPath, audioPath, tempo(), { signal: new AbortController().signal })
         } finally {
@@ -1542,6 +1710,8 @@ export function createVoiceLoop ({
     handleBugReport,
     handleWarmup,
     observeSessionEvent,
+    /** The directory name this run owns inside the cache. */
+    runId: run,
     awaiting,
     /** The per-node exchange queues: exposed so a test can see that none is left behind. */
     queues,

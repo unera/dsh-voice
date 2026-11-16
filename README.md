@@ -75,12 +75,40 @@ The package ships `dsh.bundle.patch`, so the row mounts itself:
 | `cacheDir` | `$DSH_HOME/cache/voice` (`./.dsh/cache/voice` without `DSH_HOME`) | where recordings wait, where rendered answers wait for the device, and where `sessions.json` keeps the node → session bindings |
 | `language` | `ru` | the language the recognizer is asked for. Named, not inherited from the Host default: `auto` lets a short noisy take drift into another language, and the transcript then reaches the session as the person's own words |
 | `minSeconds` | `0.4` | below this a take is a button click, not speech: it never reaches the recognizer, the session is untouched, and the closing line says `reason=too-short` |
+| `runId` | `<pid>-<six hex>` | the directory name this process owns inside the cache, made once at boot. Normally left out: a host that sets it gets a stable name, and a test gets one it can predict. Anything unusable as one path segment is replaced, and an empty value gets a fresh id |
 | `keepRecording` | `last` | `last` keeps the newest take of every node (older ones go), `none` removes a take as soon as it is used. Anything that is not `none` reads as `last`: a typo must not throw a recording away |
 
-The recordings live in `<cacheDir>/incoming/<node>/`, the rendered answers in
-`<cacheDir>/out/`. Both are swept by `mtime`: a recording older than 24 hours is
-removed at boot and then once a day, and an orphaned `.ogg` goes by the same
-rule (its fast path is the two-minute guard that follows every answer).
+### Where things live, and what a boot removes
+
+Every run of the loop owns one name: `<pid>-<six hex>`, made once when the loop is built (the
+`runId` option overrides it; a test uses its own). The pair is what counts, not the pid alone —
+the kernel reuses a number, and a directory left by a cancelled process with that number would
+look like this one's own. The name stays one path segment, so the files of two processes sharing
+a `cacheDir` never mix:
+
+| what | where |
+|---|---|
+| a recording — uploaded by the device, or pulled in | `<cacheDir>/incoming/<run>/<node>/<id>.<ext>` |
+| a rendered answer waiting for the device | `<cacheDir>/out/<run>/<id>.ogg` |
+| the node → session bindings | `<cacheDir>/sessions.json` — deliberately not per run |
+
+A boot cleans up after the runs that are gone, and the only signal it trusts is age:
+
+- `incoming/` — every entry older than an hour goes, subdirectories and stray files alike. That
+  is an earlier run, and it is also the old `<node>/` layout of 0.1.20 and before;
+- `out/` — the same hour: an answer may still be downloading right after a restart, and an hour
+  is far longer than the two-minute guard a live answer has;
+- the directories of **this** run are never touched, however old the clock says they are — this
+  process is the one using them.
+
+Age, not ownership, because a second process may share the cache and a file may still be read:
+"everything that is not mine" would delete a neighbour's live work. A leftover younger than the
+hour is simply picked up by the next boot, or by the daily sweep below.
+
+Both trees are also swept by `mtime` at boot and then once a day: a recording older than 24 hours
+is removed, and an orphaned `.ogg` goes by the same rule (its fast path is the two-minute guard
+that follows every answer). The sweep is the insurance policy for a process that lives for weeks;
+the boot cleanup is what handles a process that is already gone.
 
 ## Who speaks
 
@@ -241,14 +269,15 @@ not a second answer; a failed exchange releases it, because the client re-sends 
 id on purpose. The reservation lives in memory: a restart kills the exchange in flight
 anyway, and a retry after it has to be handled again rather than declared answered.
 
-`path` must be inside `cacheDir`: the file is read and then removed, so an event naming
-anything else is refused whole — a warning with the path and a closing line with
-`reason=refused-path`, the file untouched.
+`path` must be inside this run's own upload directory, `<cacheDir>/incoming/<run>/<node>/`: the
+file is read and then removed, so an event naming anything else — another run, another node, the
+cache root with `sessions.json`, `out/` with the answers waiting for the device — is refused
+whole: a warning with the path and a closing line with `reason=refused-path`, the file untouched.
 
-Both paths put the take in `<cacheDir>/incoming/<node>/`. What is left of it afterwards is
-the `keepRecording` setting:
+Both paths put the take under `<cacheDir>/incoming/<run>/<node>/`. What is left of it
+afterwards is the `keepRecording` setting:
 
-| value | what stays in `incoming/<node>/` |
+| value | what stays in `incoming/<run>/<node>/` |
 |---|---|
 | `last` (default) | exactly one file — the newest take of that node; its predecessors are removed |
 | `none` | nothing; the take goes as soon as the exchange is over |
@@ -258,6 +287,12 @@ take does not live forever — a sweep removes recordings older than 24 hours, o
 then once a day, by `mtime` alone. So "what did it actually hear" can be listened to the same day,
 and the directory does not grow with every press.
 
+Keeping works **inside one run**. The directory of a run that is over is a leftover, not a
+library: once it is an hour old, the next boot removes it whole. After a restart the recording of
+the previous session cannot be listened to any more — that is the conscious price of naming the
+directories after the run, and it buys a cache where nothing has to be guessed: the takes are a
+debugging aid of the live process, not an archive.
+
 ## The voice loop
 
 On the push path the device records and uploads, and the loop starts with the file already
@@ -265,8 +300,8 @@ here. On the still-supported pull path the phone says *"I want to talk"* (`POST 
 with `{"voice":{"want":"record"}}`, no text, no session) and the host does the asking:
 
 1. `nodes.call(node, 'voice', 'record', {mode, maxSeconds: 30, timeout: 12})` — wait for the take;
-2. `nodes.call(node, 'files', 'copyFromDevice', {path, hostPath})` — pull it into the node's
-   directory under `<cacheDir>/incoming/`;
+2. `nodes.call(node, 'files', 'copyFromDevice', {path, hostPath})` — pull it into
+   `<cacheDir>/incoming/<run>/<node>/`;
 3. `nodes.call(node, 'shell', 'exec', {command: 'rm -f -- <device path>'})` — the device copy
    is litter once it is here;
 4. `speechToText.resolve(...)` + `transcribe(...)` — the WAV is already the canonical 16 kHz mono PCM16;
