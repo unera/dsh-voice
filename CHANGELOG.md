@@ -5,6 +5,21 @@ All notable changes to this package are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-11-16
+
+### Fixed
+- The contract now requires a blank line around every marker. Without it markdown reads
+  the line above `---` as a setext heading: the spoken part arrived as a large heading and
+  the marker itself disappeared, as a rendered Telegram message showed.
+
+## [0.3.3] - 2026-11-16
+
+### Fixed
+- The client module declared a dependency on `@deepseek-ai/dsh-client-ui-plugin-manager`,
+  which is not a client module of this Host: an unsatisfied dependency kept the module
+  from activating, so the settings card never appeared. The working restart plugin
+  declares only `@deepseek-ai/dsh-client-locale` and gets `configForms` anyway.
+
 ## [0.3.2] - 2026-11-16
 
 ### Fixed
