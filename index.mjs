@@ -21,8 +21,8 @@ import { join } from 'node:path'
 import { readVoiceMarkup } from './markup.mjs'
 import { createVoiceLoop } from './loop.mjs'
 import { installReply } from './reply.mjs'
-import { registerVoiceRoutes, voiceState } from './routes.mjs'
-import { Config } from './settings.mjs'
+import { BASE_PATH, registerVoiceRoutes, voiceState } from './routes.mjs'
+import { Config, normalizeReplySettings } from './settings.mjs'
 
 export const name = 'dsh-voice'
 
@@ -379,6 +379,22 @@ function startLoop (ctx, config) {
  * @returns a disposer, or undefined when the context cannot be listened to.
  */
 export function installVoiceReply (ctx, config = {}) {
+  // One line about the switches at mount. This plugin spent an evening being
+  // debugged blind: the profile said one thing, the prompt section another, and
+  // nothing in the log contradicted either. A volatile field arrives as a live
+  // accessor, so the raw value and the effective one are worth printing.
+  const log = config?.logger ?? (typeof ctx?.logger === 'function' ? ctx.logger('dsh-voice') : console)
+  try {
+    const settings = normalizeReplySettings({ ...config, logger: null })
+    log.info?.('[dsh-voice] озвучка ответов при монтировании:', {
+      rawConfigMute: config?.mute ?? null,
+      rawConfigKeys: Object.keys(config ?? {}).sort(),
+      mute: settings.mute,
+      maxChars: settings.maxChars,
+    })
+  } catch (error) {
+    log.warn?.('[dsh-voice] настройки озвучки не прочитались:', error?.message ?? error)
+  }
   return installReply(ctx, {
     config,
     logger: config?.logger ?? null,
@@ -398,12 +414,21 @@ export function installVoiceReply (ctx, config = {}) {
  * @returns the child fibre's disposal handle, or undefined when this Host has no
  *   `connection` service to mount a route on.
  */
-export function installVoiceRoutes (ctx) {
+export function installVoiceRoutes (ctx, { logger = null } = {}) {
   if (typeof ctx?.inject !== 'function') return undefined
+  const log = logger ?? (typeof ctx.logger === 'function' ? ctx.logger('dsh-voice') : console)
   try {
     return ctx.inject(['connection'], (child) => {
       const connection = child?.connection ?? service(ctx, 'connection')
       const disposers = registerVoiceRoutes(connection, () => voiceState({ textToSpeech: service(ctx, 'textToSpeech') }))
+      // A route that never mounted used to be invisible from here: the card only
+      // said it could not learn the state, and nothing in the log said why. One
+      // line at mount and one on refusal is the difference.
+      if (disposers.length === 0) {
+        log.warn?.('[dsh-voice] карточка не получит состояние: у хоста нет ctx.connection.fetch.register')
+      } else {
+        log.info?.(`[dsh-voice] маршрут карточки смонтирован: ${BASE_PATH}/state`)
+      }
       const dispose = () => {
         for (const one of disposers) {
           try {
@@ -417,6 +442,7 @@ export function installVoiceRoutes (ctx) {
   } catch (error) {
     // A Host without the seam simply has no card route; the rest of the plugin
     // works exactly as before.
+    log.warn?.('[dsh-voice] маршрут карточки не смонтирован:', error?.message ?? error)
     return undefined
   }
 }
@@ -453,14 +479,14 @@ export function installSettingsPolicy (ctx) {
 /**
  * Plugin entry point.
  * @param ctx - owning Host context.
- * @param config - `cacheDir` for the cache, `logger`, `language`, `speakReplies`,
+ * @param config - `cacheDir` for the cache, `logger`, `language`, `mute`,
  *   `maxChars`.
  */
 export function apply (ctx, config = {}) {
   install(ctx, config)
   installLoop(ctx, config)
   installVoiceReply(ctx, config)
-  installVoiceRoutes(ctx)
+  installVoiceRoutes(ctx, { logger: config.logger ?? null })
   installSettingsPolicy(ctx)
 }
 

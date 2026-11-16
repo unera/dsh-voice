@@ -50,7 +50,7 @@ async function runTurn ({ answer, cacheDir: directory, config = {}, service = st
   // `settleMs: 0` by default here: the wait for the channel's copy is the subject of
   // `delivery-order.test.mjs`, and paying it in every structural test would only add
   // latency. These tests are about what is spoken and what is written to the log.
-  const live = { speakReplies: true, settleMs, ...config }
+  const live = { settleMs, ...config }
   installReply(host, { config: live, logger, service, deps: {} })
   const outcome = await listenerOf(host).listener({ agent: { session }, turn: 9 })
   return { outcome, session, host, logger, service, config: live }
@@ -61,7 +61,7 @@ const answerInLog = (session) => session.snapshotEvents()[2].data.message.conten
 
 test('install registers one global turn-stopping listener', () => {
   const host = stubHost()
-  installReply(host, { config: { speakReplies: true } })
+  installReply(host, { config: {} })
   assert.equal(host.listeners.length, 1)
   const entry = listenerOf(host)
   assert.deepEqual(entry.options, { global: true })
@@ -118,58 +118,55 @@ test('the answer text is never changed: markers stay, bytes match', async (t) =>
   )
 })
 
-test('with the switch off nothing happens at all', async (t) => {
+test('with the mute switch on nothing happens at all', async (t) => {
   const directory = await cacheDir(t)
   const answer = voiceDocument('Готово.')
   const { outcome, session, service, logger } = await runTurn({
-    answer, cacheDir: directory, config: { speakReplies: false },
+    answer, cacheDir: directory, config: { mute: true },
   })
 
-  assert.deepEqual([outcome.delivered, outcome.reason], [false, 'off'])
+  assert.deepEqual([outcome.delivered, outcome.reason], [false, 'muted'])
   assert.equal(service.calls.resolve.length, 0, 'the synthesizer is not even asked')
   assert.equal(session.appended.length, 0)
   assert.equal(answerInLog(session), answer)
   assert.equal(logger.entries.info.length, 0)
 })
 
-test('the switch is read per turn, so the Plugins page needs no restart', async (t) => {
+test('the switches are read per turn, so the Plugins page needs no restart', async (t) => {
   const directory = await cacheDir(t)
   const { session, host, config } = await runTurn({
-    answer: voiceDocument('Готово.'), cacheDir: directory, config: { speakReplies: false },
+    answer: voiceDocument('Готово.'), cacheDir: directory, config: { mute: true },
   })
   const listener = listenerOf(host).listener
-  assert.deepEqual(await listener({ agent: { session }, turn: 9 }), { delivered: false, reason: 'off' })
+  assert.deepEqual(await listener({ agent: { session }, turn: 9 }), { delivered: false, reason: 'muted' })
 
   // What the settings service does to the configuration reference it keeps live.
-  config.speakReplies = true
+  config.mute = false
   const second = await listener({ agent: { session }, turn: 9 })
   assert.equal(second.delivered, true)
 })
 
-test('the prompt section follows the switch and the limit', async (t) => {
+test('the prompt section follows the mute switch and the limit', async (t) => {
   const host = stubHost()
-  installReply(host, { config: { speakReplies: false, maxChars: 120 } })
+  installReply(host, { config: { maxChars: 120 } })
   const section = host.sections.find((entry) => entry.name === 'dsh-voice:spoken-reply-contract')
-  assert.ok(section, 'the section is registered even while the switch is off')
+  assert.ok(section, 'the section is registered')
   assert.equal(section.order, 118)
-  // The format is taught whether or not voicing is on: otherwise the model cannot
-  // produce a document, and the switch is the second thing a person touches.
-  assert.match(section.text(), /^---$/mu, 'the format is shown while the switch is off')
-  assert.match(section.text(), /Озвучка сейчас выключена/u, 'and the text says so')
+  // The format is taught always: the model has to know how to write a spoken
+  // answer, and the default is that such an answer is spoken.
+  assert.match(section.text(), /^---$/mu, 'the format is shown')
+  assert.match(section.text(), /🔊/u, 'the speaker mark is part of the format')
+  assert.match(section.text(), /Озвучка включена/u, 'without mute the answer will sound')
 
   const live = stubHost()
-  const config = { speakReplies: true, maxChars: 120 }
+  const config = { maxChars: 120, mute: true }
   installReply(live, { config })
   const text = live.sections[0].text()
-  assert.match(text, /^---$/mu)
   assert.doesNotMatch(text, /^\.\.\.$/mu, 'the format has no closing marker')
   assert.match(text, /120/u)
   assert.match(text, /как есть/u)
-
-  config.speakReplies = false
-  // Turning voicing off does not erase the contract: the model must still know
-  // how to write a spoken answer, and the text now says it will not sound.
-  assert.match(live.sections[0].text(), /Озвучка сейчас выключена/u)
+  // Muting does not erase the contract; the text only stops promising sound.
+  assert.match(text, /отключена галкой/u)
 })
 
 test('an answer without markers is passed through with no sound at all', async (t) => {
@@ -197,9 +194,17 @@ test('one marker instead of two is passed through as it is', async (t) => {
   assert.equal(answerInLog(session), answer)
 })
 
+test('a marked document is spoken with no switch pressed at all', async (t) => {
+  // The default: the speaker mark is the whole decision, nothing to switch on.
+  const directory = await cacheDir(t)
+  const { outcome, config } = await runTurn({ answer: voiceDocument('Готово.'), cacheDir: directory })
+  assert.equal(config.mute, undefined, 'nothing is muted')
+  assert.deepEqual([outcome.delivered, outcome.reason], [true, 'document'])
+})
+
 test('a document with two markers and no closing one is spoken', async (t) => {
   const directory = await cacheDir(t)
-  const answer = '---\nГотово, всё поднялось.\n---\nПорт 8080.'
+  const answer = '---\n🔊 Готово, всё поднялось.\n---\nПорт 8080.'
   const { outcome, session, service } = await runTurn({ answer, cacheDir: directory })
 
   assert.equal(outcome.delivered, true, 'two markers are the whole format now')
@@ -268,7 +273,7 @@ test('no synthesizer means no voice note, and no error either', async (t) => {
   const session = fakeSession({ events: closingTurn(voiceDocument('Готово.')) })
   const host = stubHost({ logger: fakeLogger() })
 
-  installReply(host, { config: { speakReplies: true }, service: null })
+  installReply(host, { config: {}, service: null })
   const outcome = await listenerOf(host).listener({ agent: { session }, turn: 9 })
 
   assert.deepEqual([outcome.delivered, outcome.reason], [false, 'no-tts'])
@@ -316,7 +321,7 @@ test('a second stop of the same turn does not speak twice', async (t) => {
   const directory = await cacheDir(t)
   const session = fakeSession({ events: closingTurn(voiceDocument('Готово.')) })
   const host = stubHost({ services: {}, logger: fakeLogger() })
-  installReply(host, { config: { speakReplies: true }, service: stubService() })
+  installReply(host, { config: {}, service: stubService() })
   const listener = listenerOf(host).listener
 
   await listener({ agent: { session }, turn: 9 })
@@ -346,13 +351,13 @@ test('a subagent session is left alone unless it is asked for', async (t) => {
     header: { origin: 'subagent', delegationDepth: 1 },
   })
   const host = stubHost({ logger: fakeLogger() })
-  installReply(host, { config: { speakReplies: true }, service: stubService() })
+  installReply(host, { config: {}, service: stubService() })
   const outcome = await listenerOf(host).listener({ agent: { session }, turn: 9 })
   assert.deepEqual([outcome.delivered, outcome.reason], [false, 'subagent'])
   assert.equal(session.appended.length, 0)
 
   const opting = stubHost({ logger: fakeLogger() })
-  installReply(opting, { config: { speakReplies: true, subagents: true }, service: stubService() })
+  installReply(opting, { config: { subagents: true }, service: stubService() })
   const allowed = await listenerOf(opting).listener({
     agent: { session: fakeSession({ events: closingTurn(voiceDocument('Готово.')), header: { origin: 'subagent' } }) },
     turn: 9,
@@ -369,7 +374,7 @@ test('a session that cannot take the event does not fail the turn', async (t) =>
   }
   const logger = fakeLogger()
   const host = stubHost({ logger })
-  installReply(host, { config: { speakReplies: true }, logger, service: stubService(), deps: { } })
+  installReply(host, { config: {}, logger, service: stubService(), deps: { } })
   const outcome = await listenerOf(host).listener({ agent: { session }, turn: 9 })
 
   assert.equal(outcome.delivered, false)
@@ -378,7 +383,7 @@ test('a session that cannot take the event does not fail the turn', async (t) =>
 
 test('a payload without a session is ignored rather than thrown at', async () => {
   const host = stubHost({ logger: fakeLogger() })
-  installReply(host, { config: { speakReplies: true }, logger: fakeLogger() })
+  installReply(host, { config: {}, logger: fakeLogger() })
   assert.deepEqual(await listenerOf(host).listener({ turn: 1 }), { delivered: false, reason: 'no-session' })
   assert.deepEqual(await listenerOf(host).listener(undefined), { delivered: false, reason: 'no-session' })
 })
@@ -393,7 +398,7 @@ test('a turn that produced no text is silent', async (t) => {
 
 test('a limit out of range is a configuration error, not a quiet clamp', () => {
   for (const value of [0, -1, 1.5, MAX_CHARS_LIMIT + 1, '600', Number.NaN, Infinity]) {
-    assert.throws(() => normalizeReplySettings({ speakReplies: true, maxChars: value }), RangeError,
+    assert.throws(() => normalizeReplySettings({ maxChars: value }), RangeError,
       `maxChars ${String(value)} is refused`)
     // The schema refuses it at mount, which is what a profile gets.
     assert.throws(() => Config({ maxChars: value }), undefined, `the schema refuses ${String(value)}`)
@@ -401,7 +406,6 @@ test('a limit out of range is a configuration error, not a quiet clamp', () => {
   assert.equal(normalizeReplySettings({ maxChars: 1 }).maxChars, 1)
   assert.equal(normalizeReplySettings({ maxChars: MAX_CHARS_LIMIT }).maxChars, MAX_CHARS_LIMIT)
   assert.equal(normalizeReplySettings({}).maxChars, DEFAULT_MAX_CHARS)
-  assert.equal(normalizeReplySettings({}).speakReplies, false, 'the switch is off by default')
 })
 
 test('a zero budget does not touch the channel: nothing is waited for, nothing is claimed', async (t) => {
@@ -453,18 +457,22 @@ test('the plugin entry point mounts the reply hook, the card route and the loop'
   assert.ok(events.includes('internal/service'), 'the loop still waits for its services')
   assert.equal(host.routes.length, 1, 'the card can ask whether there is a synthesizer')
 
-  // The switch is off in this configuration, so a closing turn does nothing.
+  // This host has no synthesizer, so the marked answer simply has no sound —
+  // the one honest outcome is a refusal that names the missing service.
   const session = fakeSession({ events: closingTurn(voiceDocument('Готово.')) })
   const outcome = await listenerOf(host).listener({ agent: { session }, turn: 9 })
-  assert.deepEqual([outcome.delivered, outcome.reason], [false, 'off'])
+  assert.deepEqual([outcome.delivered, outcome.reason], [false, 'no-tts'])
 })
 
-test('the two fields the card edits are volatile, the rest is ordinary configuration', () => {
-  assert.equal(Config.dict.speakReplies.meta.volatile, true)
+test('the two fields the card edits are volatile, and the debug switch is gone', () => {
+  assert.equal(Config.dict.mute.meta.volatile, true)
   assert.equal(Config.dict.maxChars.meta.volatile, true)
-  assert.equal(Config.dict.speakReplies.meta.default, false, 'the switch is off by default')
+  assert.equal(Config.dict.mute.meta.default, false, 'sound is on by default')
   assert.equal(Config.dict.maxChars.meta.default, DEFAULT_MAX_CHARS)
   // Ordinary configuration stays in the profile: it is not offered as a live field.
+  // The debug switch that spoke the first paragraph of any answer is removed, not
+  // merely hidden: a field nobody uses should not be loadable from a profile.
+  assert.equal('speakReplies' in Config.dict, false, 'no debug switch in the schema')
   for (const field of ['cacheDir', 'language', 'subagents', 'settleMs', 'prompt']) {
     assert.ok(Config.dict[field], `${field} is declared, or the Loader would reject it`)
     assert.equal(Config.dict[field].meta.volatile, undefined, `${field} is not a live field`)
@@ -473,7 +481,7 @@ test('the two fields the card edits are volatile, the rest is ordinary configura
 
 test('a bad limit stops the mount instead of surfacing on the first answer', () => {
   const host = stubHost()
-  assert.throws(() => installReply(host, { config: { speakReplies: true, maxChars: 0 } }), RangeError)
+  assert.throws(() => installReply(host, { config: { maxChars: 0 } }), RangeError)
   assert.equal(host.listeners.length, 0, 'nothing is mounted')
   assert.equal(host.sections.length, 0)
 })
@@ -494,36 +502,20 @@ test('the plugin tells the settings service it ships its own page', () => {
 test('a host without a settings service still speaks', async () => {
   const host = stubHost({ logger: fakeLogger() })
   delete host.inject
-  assert.doesNotThrow(() => installVoiceReply(host, { speakReplies: true }))
+  assert.doesNotThrow(() => installVoiceReply(host, {}))
   assert.ok(listenerOf(host), 'the hook is mounted all the same')
 })
 
 test('a volatile field with no saved value mounts instead of failing', () => {
   // The settings service answers `{}` for a volatile field nobody has set yet.
   // Treating that as a bad number stopped dsh-voice from mounting at all.
-  const settings = normalizeReplySettings({ speakReplies: false, maxChars: {} })
+  const settings = normalizeReplySettings({ mute: {}, maxChars: {} })
   assert.equal(settings.maxChars, 600)
-  assert.equal(settings.speakReplies, false)
+  assert.equal(settings.mute, false, 'an unset boolean reads as false, not as an error')
   // A schema placeholder is not a plain object either, so anything that is not a
   // number reads as unset; only a real number outside the range is an error.
   assert.equal(normalizeReplySettings({ maxChars: new Map() }).maxChars, 600)
   assert.throws(() => normalizeReplySettings({ maxChars: 0 }), /целым числом/u)
   assert.throws(() => normalizeReplySettings({ maxChars: 6000 }), /целым числом/u)
   assert.throws(() => normalizeReplySettings({ maxChars: 2.5 }), /целым числом/u)
-})
-
-test('the environment can turn voicing on when no switch is reachable', () => {
-  const before = process.env.DSH_VOICE_SPEAK_REPLIES
-  try {
-    process.env.DSH_VOICE_SPEAK_REPLIES = '1'
-    assert.equal(normalizeReplySettings({}).speakReplies, true)
-    process.env.DSH_VOICE_SPEAK_REPLIES = 'no'
-    assert.equal(normalizeReplySettings({}).speakReplies, false)
-    // An explicit setting still wins over nothing, and the env cannot turn it off.
-    process.env.DSH_VOICE_SPEAK_REPLIES = '1'
-    assert.equal(normalizeReplySettings({ speakReplies: false }).speakReplies, true)
-  } finally {
-    if (before === undefined) delete process.env.DSH_VOICE_SPEAK_REPLIES
-    else process.env.DSH_VOICE_SPEAK_REPLIES = before
-  }
 })

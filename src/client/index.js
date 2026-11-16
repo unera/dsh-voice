@@ -28,7 +28,7 @@ import { DICTIONARIES, NS } from './locales.js'
 
 export { DICTIONARIES, NS, VoiceSettingsPage, VoiceSettingsView }
 export {
-  LIMIT_DEFAULT, LIMIT_FIELD, LIMIT_MAX, LIMIT_MIN, SPEAK_FIELD,
+  LIMIT_DEFAULT, LIMIT_FIELD, LIMIT_MAX, LIMIT_MIN, MUTE_FIELD,
   availabilityOf, availabilityText, formFromProps, format, limitDraft, parseLimit, readValues, summaryLine,
   switchDisabled,
 } from './card.js'

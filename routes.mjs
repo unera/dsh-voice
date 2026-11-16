@@ -51,6 +51,12 @@ export function registerVoiceRoutes (connection, read = () => voiceState()) {
   return [connection.fetch.register({
     path: `${BASE_PATH}/state`,
     methods: ['GET'],
+    // Not boilerplate: without a declared body mode the shared `/api` bridge
+    // cannot classify the request, falls through to its streaming branch and
+    // hands a GET a stream body — the answer is an empty 400 and the card says
+    // it cannot learn whether a synthesizer exists. Every route in the harness
+    // declares this.
+    requestBody: 'buffered',
     fetch: async () => {
       try {
         return json(200, read())

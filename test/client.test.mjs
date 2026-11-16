@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 
 import {
-  LIMIT_DEFAULT, LIMIT_MAX, LIMIT_MIN, SPEAK_FIELD, LIMIT_FIELD,
+  LIMIT_DEFAULT, LIMIT_MAX, LIMIT_MIN, MUTE_FIELD, LIMIT_FIELD,
   availabilityOf, availabilityText, formFromProps, format, limitDraft, parseLimit, readValues, summaryLine,
   switchDisabled,
 } from '../src/client/model.js'
@@ -45,8 +45,8 @@ test('the card limits are the ones the Host enforces', () => {
 })
 
 test('the form values are read with the schema default behind them', () => {
-  const ready = readValues(formWith({ [SPEAK_FIELD]: true, [LIMIT_FIELD]: 250 }))
-  assert.deepEqual(ready, { status: 'ready', writable: true, known: true, speakReplies: true, maxChars: 250 })
+  const ready = readValues(formWith({ [LIMIT_FIELD]: 250 }))
+  assert.deepEqual(ready, { status: 'ready', writable: true, known: true, mute: false, maxChars: 250 })
 
   // Nothing accepted yet, or a host that cannot answer: the card shows nothing
   // to edit rather than a guess.
@@ -55,7 +55,7 @@ test('the form values are read with the schema default behind them', () => {
   assert.equal(readValues(formWith(undefined)).known, true)
   assert.equal(readValues(formWith(undefined)).maxChars, LIMIT_DEFAULT)
   assert.equal(readValues(formWith({ [LIMIT_FIELD]: 99_999 })).maxChars, LIMIT_DEFAULT, 'a value outside the range falls back')
-  assert.equal(readValues(formWith({ [SPEAK_FIELD]: false })).speakReplies, false)
+  assert.equal(readValues(formWith({ [MUTE_FIELD]: true })).mute, true, 'the mute switch is read')
 })
 
 test('the limit input is read in three distinct ways', () => {
@@ -88,8 +88,8 @@ test('a host without a synthesizer makes the switch inactive, not silent', () =>
 })
 
 test('the switch is disabled for both reasons, and only those', () => {
-  const writable = readValues(formWith({ [SPEAK_FIELD]: false }, { writable: true }))
-  const readOnly = readValues(formWith({ [SPEAK_FIELD]: false }, { writable: false }))
+  const writable = readValues(formWith({ [MUTE_FIELD]: false }, { writable: true }))
+  const readOnly = readValues(formWith({ [MUTE_FIELD]: false }, { writable: false }))
   assert.equal(switchDisabled(writable, { textToSpeech: true }), false)
   assert.equal(switchDisabled(writable, { textToSpeech: false }), true, 'no synthesizer, no switch')
   assert.equal(switchDisabled(writable, null), true, 'the check has not answered yet')
@@ -97,17 +97,19 @@ test('the switch is disabled for both reasons, and only those', () => {
 })
 
 test('the summary line says the state and the limit', () => {
-  assert.equal(summaryLine(t, { known: true, speakReplies: false, maxChars: 600 }), 'summary.off')
-  assert.equal(summaryLine(t, { known: true, speakReplies: true, maxChars: 250 }), 'summary.on')
-  assert.equal(summaryLine(t, { known: false, speakReplies: true, maxChars: 250 }), 'summary.unknown')
+  // Muted is the state a person reads first; the debug switch only adds a note.
+  assert.equal(summaryLine(t, { known: true, mute: true, maxChars: 600 }), 'summary.muted')
+  assert.equal(summaryLine(t, { known: true, mute: false, maxChars: 600 }),
+    'summary.on', 'without mute, marked replies sound')
+  assert.equal(summaryLine(t, { known: false, maxChars: 250 }), 'summary.unknown')
   assert.equal(format(t, 'summary.on', { limit: 250 }), 'summary.on', 'a key without holes is unchanged')
   assert.equal(format((key) => `до ${'{limit}'}`, 'summary.on', { limit: 250 }), 'до 250')
   assert.equal(format((key) => `x ${'{missing}'} y`, 'k', {}), 'x {missing} y')
 })
 
 test('formFromProps: the page form wins, the registered scope is the fallback, none is none', () => {
-  const owner = { state: { status: 'ready', writable: true, value: { speakReplies: true, maxChars: 200 } }, mutate: () => 'owner' }
-  const snapshot = { status: 'ready', writable: true, value: { speakReplies: false, maxChars: 600 } }
+  const owner = { state: { status: 'ready', writable: true, value: { mute: false, maxChars: 200 } }, mutate: () => 'owner' }
+  const snapshot = { status: 'ready', writable: true, value: { mute: true, maxChars: 600 } }
   const writes = []
   const scope = { getSnapshot: () => snapshot, subscribe: () => () => {}, mutate: (...ops) => { writes.push(ops); return 'settings' } }
 

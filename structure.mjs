@@ -29,6 +29,18 @@
 /** The line that opens the document and separates its two parts. */
 export const SEPARATOR = '---'
 
+/**
+ * The one mark that starts the spoken part.
+ *
+ * Two `---` lines alone say "a document", not "speech": a YAML multi-document, an
+ * answer that happens to start with a horizontal rule, anything with two rules in
+ * it would be voiced by accident. The speaker symbol is the signature: the first
+ * part is spoken exactly when the person who wrote the answer put it there, and a
+ * reader sees which part will be heard. One mark only — two spellings of the same
+ * intent would mean two formats to explain.
+ */
+export const SPOKEN_MARK = '🔊'
+
 /** Characters the spoken part may have when the configuration names no limit. */
 export const DEFAULT_MAX_CHARS = 600
 
@@ -62,14 +74,36 @@ function refusal (reason) {
 }
 
 /**
+ * Split a leading play mark off the spoken part.
+ *
+ * @param text - the first part of the document, as written.
+ * @returns `{marked, text}`: whether a mark was there, and the words without it.
+ */
+export function splitSpokenMark (text) {
+  const trimmed = String(text ?? '').replace(/^\s+/u, '')
+  if (!trimmed.startsWith(SPOKEN_MARK)) return { marked: false, text: trimmed.trim() }
+  return {
+    marked: true,
+    // `🔊ответ` and `🔊 ответ` are the same intent; a dash or colon after the sign
+    // is decoration and does not belong in the synthesis.
+    text: trimmed.slice(SPOKEN_MARK.length).replace(/^[\s:—–-]+/u, '').trim(),
+  }
+}
+
+/**
  * Read the three markers and the two parts they enclose.
  *
  * The document is valid only when all of this holds:
  *
- * 1. the first non-empty line is exactly `---`;
+ * 1. the first non-empty line is exactly `---`, after an optional Markdown quote
+ *    block that a reply may open with (a quotation is not part of the answer and
+ *    must not cost it its voice);
  * 2. exactly one more line after it is exactly `---` (a third one is a
  *    deviation, not a nested document);
- * 3. the spoken part and the remaining text are both non-empty after `trim()`.
+ * 3. the first part starts with a play mark ({@link SPOKEN_MARK}) — that is what
+ *    says "speak this", rather than an accidental pair of horizontal rules;
+ * 4. the spoken part and the remaining text are both non-empty after `trim()`
+ *    and after the mark itself is removed.
  *
  * There is no closing marker: YAML's `...` would read as "the document ends here",
  * which promises a following document that never comes, and a third `---` reads as
@@ -86,8 +120,16 @@ export function parseVoiceDocument (answer) {
   if (!source.trim()) return refusal('no-answer')
   const lines = linesOf(source)
 
-  const first = lines.findIndex((line) => line.trim() !== '')
+  let first = lines.findIndex((line) => line.trim() !== '')
   if (first === -1) return refusal('no-answer')
+
+  // A reply may open by quoting the message it answers: `>` lines, one or more,
+  // then the document. The quote is shown to the reader and is not spoken, so it
+  // is stepped over rather than treated as a broken format.
+  if (lines[first].trim().startsWith('>')) {
+    while (first < lines.length && (lines[first].trim() === '' || lines[first].trim().startsWith('>'))) first += 1
+    if (first >= lines.length) return refusal('not-a-document')
+  }
   if (lines[first] !== SEPARATOR) return refusal('not-a-document')
 
   // Every later `---` is a candidate separator; there must be exactly one.
@@ -99,12 +141,17 @@ export function parseVoiceDocument (answer) {
   if (separators.length > 1) return refusal('extra-marker')
   const separator = separators[0]
 
-  const spoken = lines.slice(first + 1, separator).join('\n').trim()
+  const written = lines.slice(first + 1, separator).join('\n').trim()
   const rest = lines.slice(separator + 1).join('\n').trim()
-  if (!spoken) return refusal('empty-spoken')
+  if (!written) return refusal('empty-spoken')
   if (!rest) return refusal('empty-rest')
+  // The play mark is what makes the first part speech rather than a paragraph
+  // that happens to sit between two rules.
+  const marked = splitSpokenMark(written)
+  if (!marked.marked) return refusal('no-mark')
+  if (!marked.text) return refusal('empty-spoken')
 
-  return { ok: true, reason: 'ok', spoken, rest }
+  return { ok: true, reason: 'ok', spoken: marked.text, rest }
 }
 
 /**
@@ -119,25 +166,30 @@ export function parseVoiceDocument (answer) {
  */
 export function replyContract ({ maxChars = DEFAULT_MAX_CHARS, enabled = true } = {}) {
   const state = enabled
-    ? 'Озвучка сейчас включена: первая часть действительно уйдёт голосом.'
-    : 'Озвучка сейчас выключена: формат остаётся допустимым ответом, но звука не будет, пока её не включат на странице плагина.'
+    ? 'Озвучка включена: первая часть уйдёт голосом, если ответ размечен.'
+    : 'Озвучка сейчас отключена галкой «Отключить озвучивание ответов»: разметку писать можно, звука не будет.'
   return `## Ответ голосом
 
-Ответ, который должен прозвучать, оформляется ровно так — двумя маркерами:
+Если ответ просят озвучить, он оформляется так:
 
 ---
 
-текст для голоса
+${SPOKEN_MARK}ответ голосом
 
 ---
 
-текст без звука
+расширенный ответ
 
-- первая непустая строка — \`---\`; ниже то, что произносят; затем ещё одна строка \`---\`; затем остальной текст; закрывающего маркера нет;
-- до и после каждого маркера ставь пустую строку: иначе markdown прочитает строку над \`---\` как заголовок, и первая часть ответа станет крупным текстом;
-- ровно два \`---\` на ответ: третий сделает ответ не документом, и звука не будет;
+конец файла
+
+- первая непустая строка — \`---\` (ровно три дефиса); ниже — то, что произносят, и эта строка обязана начинаться со значка ${SPOKEN_MARK}; затем ещё одна строка \`---\`; закрывающего маркера нет;
+- значок ${SPOKEN_MARK} — единственный признак «это произносить»: без него ответ не озвучивается, даже если маркеры на месте. Так не озвучивается случайный YAML-мультидокумент или просто ответ с двумя горизонтальными чертами;
+- до и после каждого маркера ставь пустую строку: иначе markdown прочитает строку над \`---\` как заголовок;
+- ровно два \`---\` на ответ: третий сделает ответ не документом;
+- ответ может начинаться с цитаты (\`>\` строки) — она не мешает: документ начинается со следующего \`---\`;
+- между значком и текстом пробел не обязателен, пробел или тире после значка в озвучку не попадут;
 - первая часть — не длиннее ${maxChars} символов, без markdown, ссылок и блоков кода;
-- обе части непустые; при любом отклонении от формата звука не будет — ответ уйдёт как есть;
+- обе части непустые; при любом отклонении звука не будет — ответ уйдёт как есть;
 - маркеры остаются в ответе, их видит человек;
 - ${state}`
 }

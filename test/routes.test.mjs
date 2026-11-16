@@ -27,6 +27,12 @@ test('the route answers JSON at the documented path', async () => {
 
   assert.equal(route.path, `${BASE_PATH}/state`)
   assert.deepEqual(route.methods, ['GET'])
+  // The shared `/api` bridge classifies a request by its declared body mode. A
+  // route that leaves it out reaches the bridge as streaming, a GET then gets a
+  // stream body, and the browser sees an empty 400 — exactly the failure that
+  // made the settings card report "cannot tell whether speech synthesis is
+  // installed".
+  assert.equal(route.requestBody, 'buffered', 'a route without a body mode answers 400 at the bridge')
   const answer = await call(route)
   assert.equal(answer.status, 200)
   assert.equal(answer.contentType.includes('application/json'), true)

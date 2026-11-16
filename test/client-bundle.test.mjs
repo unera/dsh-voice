@@ -134,6 +134,17 @@ function find (node, match) {
 }
 
 /** The page view, rendered: the view hands off to the page component. */
+function findAll (node, match, found = []) {
+  if (node === null || typeof node !== 'object') return found
+  if (Array.isArray(node)) {
+    for (const child of node) findAll(child, match, found)
+    return found
+  }
+  if (match(node)) found.push(node)
+  findAll(node.children ?? [], match, found)
+  return found
+}
+
 function pageOf (module, props) {
   const element = module.VoiceSettingsView(props)
   return typeof element.type === 'function' ? element.type(element.props) : element
@@ -189,15 +200,16 @@ test('the card takes the row page form when the page hands one', async () => {
   const ctx = clientContext(page)
   module.apply(ctx)
   const face = faceFor(ctx, 'plugins.row.config')
-  const owner = { state: { status: 'ready', writable: true, value: { speakReplies: true, maxChars: 250 } }, mutate: () => true }
+  const owner = { state: { status: 'ready', writable: true, value: { mute: true, maxChars: 250 } }, mutate: () => true }
 
   const tree = module.VoiceSettingsView({ view: 'summary', form: owner, ...face })
-  assert.equal(tree.children.join(''), 't:summary.on', 'the page owns the values it is rendering')
+  assert.equal(tree.children.join(''), 't:summary.muted',
+    'the page owns the values it is rendering')
 })
 
 test('without an owner form the card still shows its controls from the settings service', async () => {
   const { module } = await loadBundle()
-  const settings = settingsController({ speakReplies: true, maxChars: 480 })
+  const settings = settingsController({ mute: false, maxChars: 480 })
   const ctx = clientContext(settings)
   module.apply(ctx)
   const face = faceFor(ctx, 'plugins.bundle.config')
@@ -208,9 +220,14 @@ test('without an owner form the card still shows its controls from the settings 
   const tree = pageOf(module, props)
   assert.notEqual(tree.type, 'p', 'the card is a card, not the "form unavailable" line')
 
-  const box = find(tree, (node) => node.props?.type === 'checkbox')
-  assert.ok(box, 'the switch is on the page')
-  assert.equal(box.props.checked, true, 'it shows the value the host holds')
+  // The control is the Host's own switch: `button[role=switch]`, not a checkbox.
+  // A page that draws one native toggle and one checkbox beside it reads as two
+  // different products, and the checkbox is the one that looks wrong.
+  const switches = findAll(tree, (node) => node.type?.name === 'Switch')
+  assert.equal(switches.length, 1, 'one switch: the debug one was removed')
+  const [muteSwitch] = switches
+  assert.equal(muteSwitch.props.label, 't:mute.label', 'and it is the mute one')
+  assert.equal(muteSwitch.props.checked, false, 'nothing is muted here')
   const input = find(tree, (node) => node.props?.type === 'number')
   assert.ok(input, 'the character limit is on the page')
   assert.equal(input.props.value, '480')
@@ -218,9 +235,9 @@ test('without an owner form the card still shows its controls from the settings 
   assert.equal(input.props.max, 5000)
 
   // A press writes through the settings service, not into a local copy.
-  box.props.onChange({ target: { checked: false } })
+  muteSwitch.props.onChange(true)
   await new Promise((resolve) => setImmediate(resolve))
-  assert.deepEqual(settings.writes, [{ ops: [{ op: 'set', path: ['speakReplies'], value: false }], revision: undefined }])
+  assert.deepEqual(settings.writes, [{ ops: [{ op: 'set', path: ['mute'], value: true }], revision: undefined }])
 })
 
 test('a host whose settings service has no form warns and registers no card', async () => {
@@ -268,8 +285,8 @@ test('the summary view renders the state the form holds', async () => {
   // The summary is one inline element whose only child is the line.
   const line = (form) => module.VoiceSettingsView({ view: 'summary', form, t }).children.join('')
 
-  assert.equal(line(form({ speakReplies: false, maxChars: 600 })), 't:summary.off')
-  assert.equal(line(form({ speakReplies: true, maxChars: 250 })), 't:summary.on')
+  assert.equal(line(form({ mute: false, maxChars: 600 })), 't:summary.on')
+  assert.equal(line(form({ mute: true, maxChars: 600 })), 't:summary.muted')
   // A form the page could not read says so instead of claiming a state.
   assert.equal(line({ state: { status: 'loading' } }), 't:summary.unknown')
 })

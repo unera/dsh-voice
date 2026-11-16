@@ -14,13 +14,13 @@ import { createElement as h, useCallback, useEffect, useMemo, useState, useSyncE
 
 import { getState } from './api.js'
 import {
-  LIMIT_FIELD, LIMIT_MAX, LIMIT_MIN, LIMIT_DEFAULT, SPEAK_FIELD,
+  LIMIT_FIELD, LIMIT_MAX, LIMIT_MIN, LIMIT_DEFAULT, MUTE_FIELD,
   availabilityOf, availabilityText, formFromProps, format, limitDraft, parseLimit, readValues, summaryLine,
   switchDisabled,
 } from './model.js'
 
 export {
-  LIMIT_FIELD, LIMIT_MAX, LIMIT_MIN, LIMIT_DEFAULT, SPEAK_FIELD,
+  LIMIT_FIELD, LIMIT_MAX, LIMIT_MIN, LIMIT_DEFAULT, MUTE_FIELD,
   availabilityOf, availabilityText, formFromProps, format, limitDraft, parseLimit, readValues, summaryLine,
   switchDisabled,
 }
@@ -37,6 +37,73 @@ const styles = {
   error: { color: '#d05a4e', fontSize: 12, margin: '6px 0 0' },
   input: { padding: '5px 7px', width: 110 },
   retry: { padding: '2px 8px', cursor: 'pointer', fontSize: 12 },
+  // A setting of the page, drawn the way the Host draws its own: the label on the
+  // left, the control on the right, the explanation under both.
+  setting: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, margin: '10px 0 4px' },
+  settingLabel: { lineHeight: 1.4 },
+}
+
+/**
+ * The Host's own switch, rebuilt rather than imitated.
+ *
+ * `@deepseek-ai/dsh-web-frontend` draws every toggle as
+ * `<button role="switch" aria-checked><span class=thumb>` — 36×20, two pixels of
+ * padding, a 16 px thumb sliding 16 px, `--dsw-alias-brand-primary` when on and
+ * `--dsw-alias-border-l3` when off. The component itself is not exported to
+ * plugin bundles, so the markup and the geometry are copied here, token for
+ * token: a page with one native switch and one checkbox beside it looks like two
+ * different products, and the checkbox is the one that looks wrong.
+ *
+ * @param props.checked - whether the switch is on.
+ * @param props.disabled - when the Host cannot honour the setting at all.
+ * @param props.label - accessible name; the visible label sits beside it.
+ * @param props.onChange - called with the next state.
+ * @returns the switch element.
+ */
+export function Switch ({ checked, disabled = false, label = '', onChange }) {
+  return h('button', {
+    type: 'button',
+    role: 'switch',
+    'aria-checked': checked === true,
+    'aria-label': label,
+    title: label,
+    disabled,
+    onClick: () => onChange?.(checked !== true),
+    style: {
+      boxSizing: 'border-box',
+      position: 'relative',
+      flex: '0 0 auto',
+      display: 'inline-flex',
+      alignItems: 'center',
+      width: 36,
+      height: 20,
+      padding: 2,
+      border: 0,
+      borderRadius: 999,
+      background: checked === true
+        ? 'var(--dsw-alias-brand-primary, #4c6ef5)'
+        : 'var(--dsw-alias-border-l3, #4a4a4a)',
+      cursor: disabled ? 'default' : 'pointer',
+      opacity: disabled ? 0.5 : 1,
+      transition: 'background .12s ease',
+    },
+  }, h('span', {
+    key: 'thumb',
+    style: {
+      display: 'block',
+      width: 16,
+      height: 16,
+      borderRadius: '50%',
+      // The track is the brand colour when on and a border tone when off; the
+      // thumb flips with it — a foreground tone inside an enabled track, a muted
+      // one inside a disabled one. Copied from the Host's own rule pair.
+      background: checked === true
+        ? 'var(--dsw-alias-label-primary-foreground, #0f1115)'
+        : 'var(--dsw-alias-switch-thumb, #adb2b8)',
+      transition: 'transform .12s ease',
+      transform: checked === true ? 'translateX(16px)' : 'none',
+    },
+  }))
 }
 
 /** Read the host's answer once, and on demand again. */
@@ -131,9 +198,8 @@ export function VoiceSettingsPage ({ t, form, values }) {
     }
   }
 
-  const toggle = (event) => {
-    const next = event?.target?.checked === true
-    void write([{ op: 'set', path: [SPEAK_FIELD], value: next }])
+  const toggleMute = (next) => {
+    void write([{ op: 'set', path: [MUTE_FIELD], value: next === true }])
   }
 
   const commitLimit = () => {
@@ -152,17 +218,18 @@ export function VoiceSettingsPage ({ t, form, values }) {
   return h('div', { style: styles.box }, [
     h('h3', { style: styles.title, key: 'title' }, t('title')),
     h('p', { style: styles.intro, key: 'intro' }, t('intro')),
-    h('label', { style: styles.row, key: 'speak' }, [
-      h('input', {
-        type: 'checkbox',
-        key: 'box',
-        checked: values.speakReplies,
+    // The switch a person reaches for: silence, with the markup left alone.
+    h('div', { style: styles.setting, key: 'mute' }, [
+      h('span', { style: styles.settingLabel, key: 'label' }, t('mute.label')),
+      h(Switch, {
+        key: 'switch',
+        checked: values.mute,
         disabled: switchDisabled(values, availability),
-        onChange: toggle,
+        label: t('mute.label'),
+        onChange: toggleMute,
       }),
-      h('span', null, t('speak.label')),
     ]),
-    h('p', { style: styles.hint, key: 'speakHint' }, t('speak.hint')),
+    h('p', { style: styles.hint, key: 'muteHint' }, t('mute.hint')),
     status.code === 'ok'
       ? null
       : h('p', { style: styles.warn, key: 'availability' }, [
@@ -182,7 +249,19 @@ export function VoiceSettingsPage ({ t, form, values }) {
         value: draft,
         disabled: !values.writable,
         key: 'input',
-        onChange: (event) => { setTouched(true); setDraft(event.target.value) },
+        onChange: (event) => {
+          const raw = event.target.value
+          setTouched(true)
+          setDraft(raw)
+          // The Host is the source of truth and the field is a draft over it: a
+          // commit that waits for blur can carry a value the person already
+          // replaced. A valid number typed here is written at once; an invalid one
+          // waits for the error the commit path reports.
+          const parsed = parseLimit(raw)
+          if (parsed.ok && parsed.value !== values.maxChars) {
+            void write([{ op: 'set', path: [LIMIT_FIELD], value: parsed.value }])
+          }
+        },
         onBlur: commitLimit,
         onKeyDown: (event) => { if (event.key === 'Enter') commitLimit() },
       }),

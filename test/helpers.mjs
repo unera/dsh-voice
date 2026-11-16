@@ -205,5 +205,7 @@ export const turnStart = (turn) => ({ type: 'turn/start', data: { turn } })
  * hears, everything below the second `---` is read as text.
  */
 export function voiceDocument (spoken, rest = 'Детали ниже.') {
-  return `---\n${spoken}\n---\n${rest}\n...`
+  // The spoken part carries the speaker mark: that is what makes it speech rather
+  // than a paragraph between two horizontal rules.
+  return `---\n🔊 ${spoken}\n---\n${rest}\n...`
 }

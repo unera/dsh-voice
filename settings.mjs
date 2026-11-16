@@ -2,7 +2,7 @@
 //
 // A field marked `.volatile()` is a field the settings service can change in a
 // running Host without remounting the plugin; the Plugins page in the Web client
-// builds its form from exactly those fields. `speakReplies` and `maxChars` are
+// builds its form from exactly those fields. `mute` and `maxChars` are
 // volatile because they are the two a person decides by ear; everything else is
 // ordinary configuration, written in the profile and read at boot.
 //
@@ -35,8 +35,8 @@ export const Config = Schema.object({
   language: Schema.string().default('ru').description('Язык распознавания речи'),
   minSeconds: Schema.number().min(0).description('Короче этого — не речь, а нажатие кнопки'),
   runId: Schema.string().description('Имя каталога этого процесса внутри cacheDir'),
-  speakReplies: Schema.boolean().default(false).volatile()
-    .description('Озвучивать ответы: первая часть ответа между маркерами уходит голосом'),
+  mute: Schema.boolean().default(false).volatile()
+    .description('Отключить озвучивание ответов: разметка остаётся, плагин на неё не реагирует'),
   maxChars: Schema.number().step(1).min(1).max(MAX_CHARS_LIMIT).default(DEFAULT_MAX_CHARS).volatile()
     .description('Сколько символов озвучивать: длиннее — ответ уходит без звука'),
   timeoutMs: Schema.number().min(1).default(DEFAULT_TIMEOUT_MS)
@@ -69,10 +69,30 @@ export function defaultCacheDir (env = process.env, base = null) {
   return join(root, 'reply')
 }
 
-/** Whether the environment turns voicing on, for a Host with no reachable switch. */
-function envSwitch (env) {
-  const value = String(env?.DSH_VOICE_SPEAK_REPLIES ?? '').trim().toLowerCase()
-  return value === '1' || value === 'true' || value === 'yes' || value === 'on'
+/**
+ * The value behind a volatile field.
+ *
+ * A field declared `.volatile()` is owned by the settings service, and the Loader
+ * hands the plugin a live *accessor* for it — `{ get(), [cosmokit.volatile.write]() }`
+ * — not the value itself. Comparing that object with `=== true` is always false,
+ * which is how this plugin spent an evening convinced that a switch saved as on was
+ * off: the card said on, the profile said on, the prompt said off, and only the
+ * mount-time log line showed an accessor where a boolean was expected.
+ *
+ * A failing accessor is "not set", never a reason to refuse to mount.
+ *
+ * @param value - a configuration field as the Loader delivered it.
+ * @returns the plain value, or `undefined` when the accessor cannot answer.
+ */
+export function unwrapVolatile (value) {
+  if (value === null || typeof value !== 'object') return value
+  const read = value.get
+  if (typeof read !== 'function') return value
+  try {
+    return read.call(value)
+  } catch {
+    return undefined
+  }
 }
 
 /** A positive finite number, or the fallback. */
@@ -95,7 +115,9 @@ export function maxCharsSetting (value) {
   // voice loop down at mount. Everything else is checked strictly — a person types
   // a number here, and a string or an out-of-range number is a configuration
   // mistake that must be reported, not quietly replaced.
-  if (value === undefined || value === null) return DEFAULT_MAX_CHARS
+  const plain = unwrapVolatile(value)
+  if (plain === undefined || plain === null) return DEFAULT_MAX_CHARS
+  value = plain
   if (typeof value === 'object') return DEFAULT_MAX_CHARS
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > MAX_CHARS_LIMIT) {
     throw new RangeError(
@@ -128,26 +150,32 @@ export function settleSetting (value) {
  */
 export function normalizeReplySettings (config = {}) {
   const source = config !== null && typeof config === 'object' ? config : {}
-  const speed = typeof source.speed === 'number' && source.speed >= 0.5 && source.speed <= 2
-    ? source.speed
+  // Every field below may arrive as a live accessor (see `unwrapVolatile`).
+  const mute = unwrapVolatile(source.mute)
+  const maxChars = unwrapVolatile(source.maxChars)
+  const speedValue = unwrapVolatile(source.speed)
+  const speed = typeof speedValue === 'number' && speedValue >= 0.5 && speedValue <= 2
+    ? speedValue
     : null
   return {
     // `DSH_VOICE_SPEAK_REPLIES=1` is the escape hatch for a Host whose settings card
     // cannot be reached: the switch is the same switch, only the way in is a shell.
-    speakReplies: source.speakReplies === true || envSwitch(process.env),
-    maxChars: maxCharsSetting(source.maxChars),
-    timeoutMs: positive(source.timeoutMs, DEFAULT_TIMEOUT_MS),
+    // One switch: the markup stays in the answer and the plugin ignores it. A
+    // marked answer is spoken without any switch at all.
+    mute: mute === true,
+    maxChars: maxCharsSetting(maxChars),
+    timeoutMs: positive(unwrapVolatile(source.timeoutMs), DEFAULT_TIMEOUT_MS),
     speed,
     // One cache root for the plugin; the replies get their own subdirectory.
     cacheDir: defaultCacheDir(process.env, typeof source.cacheDir === 'string' ? source.cacheDir : null),
-    subagents: source.subagents === true,
-    prompt: source.prompt !== false,
-    description: typeof source.description === 'string' && source.description.trim()
-      ? source.description.trim()
+    subagents: unwrapVolatile(source.subagents) === true,
+    prompt: unwrapVolatile(source.prompt) !== false,
+    description: typeof unwrapVolatile(source.description) === 'string' && unwrapVolatile(source.description).trim()
+      ? unwrapVolatile(source.description).trim()
       : 'Озвучка ответа',
     // A negative or absurd budget is a configuration mistake, but it costs only
     // the wait: without it the record is still appended and the answer still goes out.
-    settleMs: settleSetting(source.settleMs),
+    settleMs: settleSetting(unwrapVolatile(source.settleMs)),
     logger: source.logger ?? null,
     // The synthesized engine, for a test that supplies its own; production reads
     // the `textToSpeech` service from the context at call time.

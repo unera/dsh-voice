@@ -13,7 +13,7 @@ Five things live here, and the package ships all of them:
 | the loop | record → transcribe → deliver → watch the turn → answer the device |
 | the prompt section | how a spoken answer is written, and what it may not contain |
 | the trace | one log line per stage of every exchange, one closing line with the reason |
-| the spoken reply | a switch in the Plugins page: the host synthesizes the part of a text-chat answer written between three markers and attaches the OGG to the turn |
+| the spoken reply | the host synthesizes the part of a text-chat answer that starts with the speaker mark 🔊 and attaches the OGG to the turn; a switch in the Plugins page can mute it |
 
 The device commands the answer travels by are `voice.chat` (`{role, text, speak,
 say, who, degraded}`) for the screen and `voice.answer` (`{id, text, speak, who,
@@ -77,13 +77,13 @@ The package ships `dsh.bundle.patch`, so the row mounts itself:
 | `language` | `ru` | the language the recognizer is asked for. Named, not inherited from the Host default: `auto` lets a short noisy take drift into another language, and the transcript then reaches the session as the person's own words |
 | `minSeconds` | `0.4` | below this a take is a button click, not speech: it never reaches the recognizer, the session is untouched, and the closing line says `reason=too-short` |
 | `runId` | `<pid>-<six hex>` | the directory name this process owns inside the cache, made once at boot. Normally left out: a host that sets it gets a stable name, and a test gets one it can predict. Anything unusable as one path segment is replaced, and an empty value gets a fresh id |
-| `speakReplies` | `false` | **the switch of the spoken reply**, editable live in Settings → Plugins → `@dr-co/dsh-voice`. Off means a closing turn does nothing at all — no synthesis, no file, and no prompt section telling the model about the format |
-| `maxChars` | `600` | how many **characters** the spoken part may have, editable live beside the switch. The range is `1..5000`: anything else is a configuration error, and the plugin refuses to mount rather than clamp the number to something the owner did not ask for |
+| `mute` | `false` | **the switch of the spoken reply**, editable live in Settings → Plugins → `@dr-co/dsh-voice`. On means a marked answer is left unsaid: the markup stays in the message, the plugin ignores it. Off is the normal state — a marked answer is spoken without any switch being pressed |
+| `maxChars` | `600` | how many **characters** the spoken part may have, editable live beside the switch. The range is `1..5000`: anything else is a configuration error, and the plugin refuses to mount rather than clamp the number the owner did not ask for |
 | `timeoutMs` | `20000` | how long a slow engine may hold the closing turn. A timeout costs the voice note, never the answer |
 | `speed` | the service's own | playback tempo for the attached voice note, `0.5..2`, applied with ffmpeg's `atempo` |
 | `description` | `Озвучка ответа` | the line the Web client shows beside the file |
 | `subagents` | `false` | whether subagent turns are spoken too |
-| `prompt` | `true` | whether the format is explained to the model while the switch is on |
+| `prompt` | `true` | whether the format is explained to the model. It is taught regardless of `mute`: a model that only learns the format after someone flips a switch can never produce one |
 | `settleMs` | `600` | how long the closing turn stays open while the channel copies the announced file. `dsh-im` accepts the record only while the turn is open and copies the file *after* it, re-checking the turn when the copy is done — a copy made after `turn/end` is dropped without a word, so this wait is what turns "declared" into "delivered". `0` disables it; `5000` is the ceiling. The wait ends as soon as the copy is there (tens of milliseconds for one voice note); the full budget is paid only when no channel is coming for the file — a Host with no `dsh-im` at all is decided in 150 ms, and a turn that has `dsh-im` but no channel consumer for it costs the budget |
 
 ### Where things live: two plugins, two directories
@@ -143,30 +143,34 @@ language here, and nothing to translate.
 
 ### The protocol
 
-An answer that wants to be heard is written as three markers:
+An answer that wants to be heard is written as two markers and one signature:
 
 ```text
 ---
-текст для голоса
+🔊текст для голоса
 ---
 текст без звука
-...
+
+конец файла
 ```
 
 | line | meaning |
 |---|---|
-| the first non-empty line | `---`, the document opens |
-| above the next `---` | the spoken part, spoken verbatim |
+| the first non-empty line | `---`, the document opens (a `>` quote block above it is allowed and is not spoken) |
+| the next line, starting with `🔊` | the spoken part, spoken verbatim without the mark. A space, a dash or a colon after the mark is decoration and is dropped |
 | exactly one more `---` | the separator |
-| below it, up to `...` | the text that is only read |
-| the last non-empty line | `...`, the document closes |
+| everything below it | the text that is only read |
+
+The speaker mark is the whole signature. Two `---` lines alone mean "a document",
+which is also what a YAML multi-document and any reply carrying two horizontal rules
+looks like: without `🔊` nothing is synthesized, and the log says `no-mark`.
 
 ### The four rules
 
 | rule | what the plugin does |
 |---|---|
 | the answer is the documented document | the first part is synthesized and the OGG is declared on the turn |
-| the answer is anything else — no markers, one marker, a third `---`, no `...`, an empty part, a `---` with a trailing space | the message is passed through **as is**: no audio, no change |
+| the answer is anything else — no markers, no `🔊`, one marker, a third `---`, an empty part, a `---` with a trailing space | the message is passed through **as is**: no audio, no change |
 | the first part is longer than `maxChars` **characters** | the same: as is, no audio, and the log says `too-long` |
 | otherwise | the first part goes to the synthesizer and the OGG is attached |
 
@@ -231,11 +235,12 @@ The formats do not fight, because they answer different questions:
 | question | format | who speaks |
 |---|---|---|
 | a request arrived by voice, the phone should answer aloud | `--- # say` / `--- # screen` | the device, or the host for `synth=host` |
-| a text answer should arrive as a voice note in the chat | `---` / `---` / `...` | the host, and the file is the message |
+| a text answer should arrive as a voice note in the chat | `---` / `🔊` / `---` | the host, and the file is the message |
 
 The first section belongs to the loop and is registered always; the second one is
-contributed only while `speakReplies` is on, so a Host with the switch off never
-tells the model about a format it would not act on.
+contributed while `prompt` is on, which is the default. `mute` does not remove it:
+the model must still know how to write the document, and the text then says the
+sound will not come.
 
 ## The screen sees both sides
 

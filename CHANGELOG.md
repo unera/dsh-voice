@@ -5,6 +5,93 @@ All notable changes to this package are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-11-17
+### Changed
+- **One signature: `🔊`.** The spoken part starts with the speaker symbol and nothing else
+  counts — no `▶`, no aliases. Two `---` lines alone mean "a document", which is also what a
+  YAML multi-document and any reply with two horizontal rules look like; the symbol is the
+  difference between "shown" and "said out loud".
+- **The debug switch is gone, with its code.** `speakReplies`, `firstParagraph()` and the
+  `DSH_VOICE_SPEAK_REPLIES` escape hatch are removed: one way in, the markup, and one switch,
+  mute. A marked reply is spoken by default.
+- A reply may open with a Markdown quote (`>` lines) before the document; the quote is shown,
+  never spoken, and no longer costs the answer its voice.
+- The speaker symbol may sit right against the words (`🔊ответ`); a space, a dash or a colon
+  after it is decoration and is never synthesized.
+### Added
+- A marked reply with no synthesizer on the Host logs why: `ответ размечен, но синтеза речи
+  на хосте нет` with the service name. Silence that looks like "the feature is off" is not
+  an answer.
+
+## [0.5.0] - 2026-11-17
+### Changed
+- **The spoken part is marked with a play sign.** The document is `---`, then a line that
+  starts with `▶` (also accepted: `▶️`, `▶︎`, `🔊`, `🔈`), then `---`. Two horizontal rules
+  alone no longer mean "speak this": any answer that happened to start with a rule and
+  contain another one was voiced by accident, and nothing in the message told the reader
+  which part would be heard. Without the mark the answer travels as it is — `no-mark` in
+  the log.
+- **A marked answer is spoken by default.** The old switch meant "speak replies", which in
+  practice meant "speak everything", and having it off silenced the whole feature. It is now
+  the debug switch `speakReplies` — "speak every reply (debug mode)" — which speaks even an
+  answer without the document, using its first paragraph (headings skipped, code fences
+  dropped, cut at the limit).
+### Added
+- `mute` (volatile): "disable spoken replies". The markup stays in the answer and the plugin
+  ignores it — one switch, no format change, for the person who wants silence right now.
+- `firstParagraph()` in `structure.mjs`: what the debug mode speaks when the answer carries
+  no document.
+
+## [0.4.9] - 2026-11-17
+### Fixed
+- The switch's thumb follows the Host's rule pair: `--dsw-alias-label-primary-foreground`
+  inside an enabled track and `--dsw-alias-switch-thumb` inside a disabled one. With a
+  single colour the thumb stayed grey on a white track, which read as a third state next to
+  the Host's own switches.
+
+## [0.4.8] - 2026-11-17
+### Changed
+- The "speak replies" control is the Host's own switch, not a checkbox: the same
+  `button[role=switch]` with a 16 px thumb in a 36×20 track, `--dsw-alias-brand-primary`
+  when on and `--dsw-alias-border-l3` when off, with the label on the left and the control
+  on the right like every other setting on the page. The component lives in
+  `@deepseek-ai/dsh-web-frontend` and is not exported to plugin bundles, so the markup and
+  the design tokens are reproduced here, and a test pins the control to `role="switch"`.
+- The character limit is written as it is typed instead of on blur: a commit that waited
+  carried whatever the field held when the focus left, which is how the stored limit moved
+  on its own between page loads.
+
+## [0.4.7] - 2026-11-17
+### Fixed
+- **The switch now actually reaches the plugin.** A field declared `.volatile()` is handed
+  over by the Loader as a live accessor — `{ get(), [cosmokit.volatile.write]() }` — not as
+  the value, and `config.speakReplies === true` was therefore always false. The card showed
+  the switch on, the profile said `speakReplies: true`, and the prompt section said voicing
+  was off: everyone was right except the comparison. Everything scalar (`speakReplies`,
+  `maxChars`, `timeoutMs`, `settleMs`, `speed`, `subagents`, `prompt`, `description`) is now
+  read through `unwrapVolatile`, an accessor that cannot answer counts as "unset", and two
+  regression tests pin the accessor shape.
+
+## [0.4.6] - 2026-11-17
+### Added
+- The effective "speak replies" switch is logged once at mount, with the raw value the
+  Loader handed over, the value the plugin really uses, the config keys it saw and the
+  emergency environment variable. `speakReplies` is a volatile field: its owner is the
+  settings service, so a value written by hand into a profile can differ from the one the
+  plugin reads — and without this line the difference is invisible from both sides.
+
+## [0.4.5] - 2026-11-17
+### Fixed
+- The settings card can reach its own host route again. `ctx.connection.fetch.register`
+  was called without `requestBody`, and the shared `/api` bridge classifies a request by
+  that declared mode: an undeclared one falls through to the streaming branch, where a GET
+  is handed a stream body and the browser gets an empty `400`. The card therefore always
+  said "cannot tell whether speech synthesis is installed", which is the one fact that
+  decides whether the switch may be pressed. The route now declares
+  `requestBody: 'buffered'`, and a regression test states why the field is not boilerplate.
+- Mounting the route is no longer silent: one `info` line when it is mounted, one `warn`
+  naming the reason when the host has no `connection.fetch.register` or the mount throws.
+
 ## [0.4.4] - 2026-11-16
 
 ### Fixed

@@ -7,9 +7,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { DEFAULT_MAX_CHARS, MAX_CHARS_LIMIT, charCount, parseVoiceDocument, replyContract } from '../structure.mjs'
+import { DEFAULT_MAX_CHARS, MAX_CHARS_LIMIT, SPOKEN_MARK, charCount, parseVoiceDocument, replyContract } from '../structure.mjs'
 
-const valid = '---\n\nГотово, всё поднялось.\n\n---\n\nСервис поднят, порт 8080.'
+const valid = '---\n\n🔊 Готово, всё поднялось.\n\n---\n\nСервис поднят, порт 8080.'
 
 test('a well-formed document gives both parts, spoken first', () => {
   assert.deepEqual(parseVoiceDocument(valid), {
@@ -35,48 +35,74 @@ test('CRLF line endings are a line ending, not a format deviation', () => {
 })
 
 test('the spoken part keeps its own line breaks and loses only outer space', () => {
-  const parsed = parseVoiceDocument('---\n\n  Первая строка.\n\nВторая строка.  \n\n---\nхвост')
+  const parsed = parseVoiceDocument('---\n\n🔊 Первая строка.\n\nВторая строка.  \n\n---\nхвост')
   assert.equal(parsed.spoken, 'Первая строка.\n\nВторая строка.')
 })
 
 test('without markers the answer is not a document', () => {
-  assert.deepEqual(parseVoiceDocument('Готово, всё поднялось.\n\n---\n\nДетали.'), {
+  assert.deepEqual(parseVoiceDocument('🔊 Готово, всё поднялось.\n\n---\n\nДетали.'), {
     ok: false, reason: 'not-a-document', spoken: '', rest: '',
   })
 })
 
 test('a word or a fence above the marker breaks the format', () => {
   // Strictness is the point: "похоже" is not the protocol.
-  assert.equal(parseVoiceDocument('Ответ:\n---\nт\n---\nр').reason, 'not-a-document')
-  assert.equal(parseVoiceDocument('```\n---\nт\n---\nр\n...\n```').reason, 'not-a-document')
+  assert.equal(parseVoiceDocument('Ответ:\n---\n🔊 т\n---\nр').reason, 'not-a-document')
+  assert.equal(parseVoiceDocument('```\n---\n🔊 т\n---\nр\n...\n```').reason, 'not-a-document')
 })
 
 test('the markers must be exactly the markers', () => {
   // Trailing space, extra dashes, a heading: all deviations, all AS IS.
-  assert.equal(parseVoiceDocument('--- \nт\n---\nр').reason, 'not-a-document')
-  assert.equal(parseVoiceDocument('----\nт\n---\nр').reason, 'not-a-document')
-  assert.equal(parseVoiceDocument('--- # say\nт\n---\nр').reason, 'not-a-document')
-  assert.equal(parseVoiceDocument('---\nт\n--- \nр').reason, 'one-marker')
+  assert.equal(parseVoiceDocument('--- \n🔊 т\n---\nр').reason, 'not-a-document')
+  assert.equal(parseVoiceDocument('----\n🔊 т\n---\nр').reason, 'not-a-document')
+  assert.equal(parseVoiceDocument('--- # say\n🔊 т\n---\nр').reason, 'not-a-document')
+  assert.equal(parseVoiceDocument('---\n🔊 т\n--- \nр').reason, 'one-marker')
   // No closing marker exists in the format, so trailing prose is just the rest.
-  assert.equal(parseVoiceDocument('---\nт\n---\nр\n......').ok, true)
+  assert.equal(parseVoiceDocument('---\n🔊 т\n---\nр\n......').ok, true)
+})
+
+test('the spoken part must start with the speaker mark, and only that mark counts', () => {
+  // Two `---` lines alone say "a document", not "speech": a YAML multi-document or
+  // any answer with two rules in it would otherwise be voiced by accident.
+  assert.equal(parseVoiceDocument('---\n\nПросто текст.\n\n---\n\nОстальное.').reason, 'no-mark')
+  assert.equal(SPOKEN_MARK, '🔊', 'one signature, no spellings')
+  assert.equal(parseVoiceDocument('---\n▶ Скажу вслух.\n---\nТекст.').reason, 'no-mark',
+    'the old sign means nothing now')
+  // The sign may sit right against the words, and decoration after it is dropped.
+  assert.equal(parseVoiceDocument('---\n🔊Скажу вслух.\n---\nТекст.').spoken, 'Скажу вслух.')
+  assert.equal(parseVoiceDocument('---\n🔊 — Скажу вслух.\n---\nТекст.').spoken, 'Скажу вслух.')
+  // A mark alone is an empty spoken part.
+  assert.equal(parseVoiceDocument('---\n🔊\n---\nТекст.').reason, 'empty-spoken')
+})
+
+test('a quoted message above the document does not cost it its voice', () => {
+  // The model may open a reply by quoting what it answers; the quote is shown,
+  // never spoken, and the document starts at the next `---`.
+  const quoted = '> цитируемый текст\n> возможно, в несколько строк\n---\n🔊ответ голосом\n---\nрасширенный ответ'
+  const parsed = parseVoiceDocument(quoted)
+  assert.equal(parsed.ok, true)
+  assert.equal(parsed.spoken, 'ответ голосом')
+  assert.equal(parsed.rest, 'расширенный ответ')
+  // A quote with no document under it is simply not a document.
+  assert.equal(parseVoiceDocument('> только цитата').reason, 'not-a-document')
 })
 
 test('one separator instead of two is refused with its own reason', () => {
-  assert.equal(parseVoiceDocument('---\nт\nр').reason, 'one-marker')
+  assert.equal(parseVoiceDocument('---\n🔊 т\nр').reason, 'one-marker')
 })
 
 test('a third separator is refused, not read as a nested document', () => {
-  assert.equal(parseVoiceDocument('---\nт\n---\nр\n---\nещё').reason, 'extra-marker')
+  assert.equal(parseVoiceDocument('---\n🔊 т\n---\nр\n---\nещё').reason, 'extra-marker')
 })
 
 test('a document needs no closing marker, and trailing dots are just text', () => {
   // YAML's `...` promised a following document that never comes; two markers say
   // exactly what is true. Anything after them belongs to the part without sound.
-  const withoutEnd = parseVoiceDocument('---\nт\n---\nр')
+  const withoutEnd = parseVoiceDocument('---\n🔊 т\n---\nр')
   assert.equal(withoutEnd.ok, true)
   assert.equal(withoutEnd.spoken, 'т')
   assert.equal(withoutEnd.rest, 'р')
-  assert.equal(parseVoiceDocument('---\nт\n---\nр\n..').rest, 'р\n..')
+  assert.equal(parseVoiceDocument('---\n🔊 т\n---\nр\n..').rest, 'р\n..')
 })
 
 test('an empty or blank part makes the document invalid', () => {
@@ -84,7 +110,7 @@ test('an empty or blank part makes the document invalid', () => {
   assert.equal(parseVoiceDocument('---\nт\n---\n\n   ').reason, 'empty-rest')
   // Nothing may follow the separator: `...` used to close a document and is now
   // ordinary text, so it is a real (unwanted) second part, not an empty one.
-  assert.equal(parseVoiceDocument('---\nт\n---\n...').rest, '...')
+  assert.equal(parseVoiceDocument('---\n🔊 т\n---\n...').rest, '...')
 })
 
 test('an empty answer is not a document either', () => {

@@ -364,19 +364,34 @@ async function speakClosingTurn ({ agent, turn, signal }, settings, { ctx, log }
   const events = session.snapshotEvents()
   if (hasVoiceDeliverable(events, turn)) return { delivered: false, reason: 'already-presented' }
 
-  // Rules 1 and 2: only the documented structure can be spoken, and an answer
-  // that is not one passes through exactly as written.
-  const document = parseVoiceDocument(finalAnswerText(events, turn))
+  // The switch a person actually uses: the markup stays in the answer, nothing
+  // is spoken. Not a format refusal — the answer is deliberately left alone.
+  if (settings.mute) return { delivered: false, reason: 'muted' }
+
+  const answer = finalAnswerText(events, turn)
+
+  // Only a document whose first part starts with the speaker mark is spoken; an
+  // answer that is not one passes through exactly as written.
+  const document = parseVoiceDocument(answer)
   if (!document.ok) return { delivered: false, reason: document.reason, asIs: true }
+  const spoken = document.spoken
 
   // Rule 3: the limit is in characters, not bytes.
-  const chars = charCount(document.spoken)
+  const chars = charCount(spoken)
   if (chars > settings.maxChars) {
     return { delivered: false, reason: 'too-long', asIs: true, chars, limit: settings.maxChars }
   }
 
   const engine = settings.service ?? service(ctx, 'textToSpeech')
   if (typeof engine?.synthesize !== 'function' || typeof engine?.resolve !== 'function') {
+    // The answer is marked and could be spoken, but this Host has no synthesizer
+    // registered. Silence here would be indistinguishable from "the feature is
+    // off", so the reason goes to the log where it can be found.
+    log.warn?.('[dsh-voice] ответ размечен, но синтеза речи на хосте нет: нет сервиса textToSpeech (или у него нет synthesize/resolve)', {
+      turn,
+      hasService: engine !== null && engine !== undefined,
+      reason: 'no-tts',
+    })
     return { delivered: false, reason: 'no-tts' }
   }
 
@@ -390,7 +405,7 @@ async function speakClosingTurn ({ agent, turn, signal }, settings, { ctx, log }
     session,
     turn,
     // Rule 4: the first part is spoken as written; synthesis cleans nothing.
-    text: document.spoken,
+    text: spoken,
     cacheDir,
     speed,
     description: settings.description,
@@ -477,7 +492,7 @@ export function installReply (ctx, { config = {}, logger = null, service: engine
           // only learns the format after the switch flips can never produce one,
           // and the switch is exactly what a person reaches for second. The text
           // itself says what happens while voicing is off.
-          return replyContract({ maxChars: settings.maxChars, enabled: settings.speakReplies })
+          return replyContract({ maxChars: settings.maxChars, enabled: !settings.mute })
         } catch {
           return ''
         }
@@ -499,7 +514,9 @@ export function installReply (ctx, { config = {}, logger = null, service: engine
   const listener = async (payload) => {
     try {
       const settings = settingsNow()
-      if (!settings.speakReplies) return { delivered: false, reason: 'off' }
+      // The gate is the mute switch, not the debug one: a marked answer is spoken
+      // by default, and "off" is the switch a person pressed.
+      if (settings.mute) return { delivered: false, reason: 'muted' }
       const outcome = await speakClosingTurn(payload ?? {}, settings, { ctx, log })
       if (outcome.delivered) {
         // One line with everything needed to compare this delivery with what the

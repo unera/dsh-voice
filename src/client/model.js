@@ -6,7 +6,7 @@
 // paint the result; `test/client.test.mjs` checks the decisions themselves.
 
 /** The field names, exactly as the Host schema spells them. */
-export const SPEAK_FIELD = 'speakReplies'
+export const MUTE_FIELD = 'mute'
 export const LIMIT_FIELD = 'maxChars'
 
 /** The range the Host enforces; the card refuses to send anything else. */
@@ -34,7 +34,7 @@ export function format (t, key, vars = {}) {
  * empty input: the person then sees what the Host will use.
  *
  * @param form - `{state, mutate}` as the Plugins page passes it.
- * @returns `{status, writable, known, speakReplies, maxChars}`.
+ * @returns `{status, writable, known, mute, maxChars}`.
  */
 export function readValues (form) {
   const state = form?.state ?? null
@@ -46,7 +46,7 @@ export function readValues (form) {
     status,
     writable: state?.writable === true,
     known: status === 'ready',
-    speakReplies: value?.[SPEAK_FIELD] === true,
+    mute: value?.[MUTE_FIELD] === true,
     maxChars,
   }
 }
@@ -124,7 +124,8 @@ export function availabilityOf (answer) {
  */
 export function summaryLine (t, values) {
   if (!values.known) return typeof t === 'function' ? t('summary.unknown') : 'summary.unknown'
-  return values.speakReplies ? format(t, 'summary.on', { limit: values.maxChars }) : t('summary.off')
+  if (values.mute) return t('summary.muted')
+  return format(t, 'summary.on', { limit: values.maxChars })
 }
 
 /**
