@@ -5,6 +5,13 @@ All notable changes to this package are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2] - 2026-11-17
+### Changed
+- The contract states the way in one sentence instead of warning about a tool: "if the answer is
+  asked for by voice, this document *is* the way — the host synthesizes it, no tool is needed".
+  With `dsh-text-to-speech` no longer contributing a prompt section of its own, the warning had
+  nothing left to warn about.
+
 ## [0.6.1] - 2026-11-17
 ### Fixed
 - The contract now says what the tool section used to contradict: for a reply in a chat, do not
