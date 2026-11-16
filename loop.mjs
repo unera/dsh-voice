@@ -7,7 +7,7 @@
 //
 // Every outside world dependency is passed in, so the whole loop can be exercised on stubs:
 // no device, no model, no speech service.
-import { lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { copyFileSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join, resolve, sep } from 'node:path'
 import { randomBytes, randomUUID } from 'node:crypto'
 
@@ -51,30 +51,31 @@ const DEFAULT_LANGUAGE = 'ru'
  */
 const MIN_SECONDS = 0.4
 /**
- * What happens to a recording once the exchange is over.
+ * Where `dsh-nodes` leaves an upload: `<cacheDir>/incoming/<any layout>/<id>.wav`.
  *
- * `last` keeps the newest take of every node, so "what was actually heard" can be listened to
- * afterwards; `none` is the old behaviour, where the file went as soon as it was used.
+ * This tree belongs to that plugin, not to us: we read one file out of it, copy it into our own
+ * `work/`, and remove the original at once. Nothing else here may be touched.
  */
-export const KEEP_LAST = 'last'
-export const KEEP_NONE = 'none'
-/** How long a kept recording lives: a day is enough to go back and listen to it. */
-export const RECORDING_TTL_MS = 24 * 60 * 60 * 1000
-/** The age sweep runs once a boot and then once a day: nothing else has to hold the timer. */
-const SWEEP_INTERVAL_MS = RECORDING_TTL_MS
-/** Where the device uploads land: `<cacheDir>/incoming/<run>/<node>/<id>.wav`. */
 const INCOMING_DIR = 'incoming'
+/**
+ * Where our own copy of a take lives: `<cacheDir>/work/<run>/<id>.wav`.
+ *
+ * Everything below this is ours — written by this loop, read by this loop, and removed by this
+ * loop. No path checks are needed for a file we made ourselves.
+ */
+const WORK_DIR = 'work'
 /** Where a synthesized answer waits for the device: `<cacheDir>/out/<run>/<id>.ogg`. */
 const OUTPUT_DIR = 'out'
 /**
- * How long the leftovers of a finished run may stay on disk before a boot removes them.
+ * How long one of our own files may stay on disk before a sweep removes it.
  *
- * Age is the rule, not ownership: a second process may share this cache, and a file may still be
- * read or downloaded right after a restart, so "everything that is not mine" would delete live
- * work. An hour is longer than any take or answer lives here, and it is the same grace a rendered
- * answer gets while the device fetches it.
+ * A copy lives for the seconds between the copy and the recognition, so a file of this age is the
+ * leftover of a crash in the middle of an exchange. An hour is far longer than any take or answer
+ * lives here, and it is the same grace a rendered answer gets while the device fetches it.
  */
-export const RUN_STALE_MS = 60 * 60 * 1000
+export const STALE_MS = 60 * 60 * 1000
+/** The sweep runs once at boot and then once a day: nothing else has to hold the timer. */
+const SWEEP_INTERVAL_MS = 24 * 60 * 60 * 1000
 
 /**
  * A fresh identifier for one run of the loop: `<pid>-<six hex>`.
@@ -148,29 +149,38 @@ function realPath (path) {
 }
 
 /**
- * Do these two paths name the same file, however each was spelled?
+ * Is this path inside the directory `dsh-nodes` uploads into?
  *
- * Both sides are already known to be inside the cache, so they resolve; a path that does not is
- * not the same file as anything.
+ * A recording path arrives in an event, and the file is **removed** as soon as it has been
+ * copied — so the boundary is the whole `incoming/` tree: that plugin's directory, and nothing
+ * else may be read or unlinked. The cache root holds `sessions.json`, `out/` holds the answers
+ * waiting for the device, and a symlink is a string that looks local while pointing anywhere.
  *
- * @param a - one path.
- * @param b - the other path.
- * @returns true when both resolve to the same real path.
+ * The layout below `incoming/` is not checked: `dsh-nodes` names the directory after the node
+ * number, older code after the node name, and both are its own business. We only need to know
+ * that the file is its file before we delete it.
+ *
+ * @param path - the path from the event.
+ * @param cacheDir - the voice cache.
+ * @returns true only for a path strictly under `<cacheDir>/incoming/`.
  */
-function sameFile (a, b) {
-  const left = realPath(a)
-  return Boolean(left) && left === realPath(b)
+export function insideIncoming (path, cacheDir) {
+  if (typeof path !== 'string' || !path) return false
+  return underReal(path, join(cacheDir, INCOMING_DIR))
 }
 
 /**
- * Is this path strictly under that directory, with symlinks resolved on both sides?
+ * The copies of one run: `<cacheDir>/work/<run>`.
  *
- * @param path - the path from an event.
- * @param root - the directory it has to be inside.
- * @returns true only for a real path strictly under the real root.
+ * This is our own directory, and the copy in it is our own file: nothing here is checked against
+ * anything, and the only rule a file in it obeys is that it is removed once it has been read.
+ *
+ * @param cacheDir - the voice cache.
+ * @param runId - the run.
+ * @returns the run's work directory.
  */
-function underReal (path, root) {
-  return underResolved(realPath(path), realPath(root))
+export function workDir (cacheDir, runId) {
+  return join(cacheDir, WORK_DIR, runId)
 }
 
 /**
@@ -186,80 +196,14 @@ function underResolved (target, base) {
 }
 
 /**
- * Is this path a recording the loop may read and delete?
+ * Is this path strictly under that directory, with symlinks resolved on both sides?
  *
- * A recording path arrives in an event, and the file is read and then removed: `keepRecording:
- * none` unlinks it, `last` prunes its directory whole. The event source is internal, but the
- * boundary belongs to this plugin, so every path is checked before it is touched — against this
- * run's `incoming/`, never against the cache root: the root holds `sessions.json`, and pruning
- * "the directory of the take" there deletes the node → session bindings.
- *
- * @param path - the path from the event.
- * @param cacheDir - the voice cache.
- * @param runId - the run whose uploads may be touched.
- * @returns true only for a path strictly under `<cacheDir>/incoming/<run>/`.
+ * @param path - the path from an event.
+ * @param root - the directory it has to be inside.
+ * @returns true only for a real path strictly under the real root.
  */
-export function insideCache (path, cacheDir, runId) {
-  if (typeof path !== 'string' || !path) return false
-  return underReal(path, runIncomingDir(cacheDir, runId))
-}
-
-/**
- * Which node directory a path belongs to, and which of the two layouts matched.
- *
- * The device event carries both the node number and its name, and `dsh-nodes` names the
- * directory after the number while older code used the name. A check against one of them
- * refuses a perfectly good recording, so both are tried.
- *
- * The directory that really holds the file is returned with the segment, not just the segment:
- * a caller that removes or prunes decides by the path that matched, and the two layouts differ
- * in depth (`<incoming>/<node>/` against `<incoming>/<run>/<node>/`). Composing the directory
- * from the segment is how the cleanup kept looking in a place where the file never was.
- *
- * @param path - the path from the event.
- * @param cacheDir - the voice cache.
- * @param segments - candidate directory names, in order of preference.
- * @param runId - the run whose uploads may be touched; another run's directory never matches.
- * @returns `{segment, dir, path}` with `dir` resolved, or null when no layout matched.
- */
-export function matchNodeDir (path, cacheDir, segments, runId) {
-  if (typeof path !== 'string' || !path) return null
-  const target = realPath(path)
-  if (!target) return null
-  for (const segment of segments) {
-    if (typeof segment !== 'string' || !segment) continue
-    // Our own per-run layout first, then the one `dsh-nodes` writes and knows nothing about.
-    // Both are genuine: refusing the other one is how the voice chat went silent twice.
-    for (const candidate of [nodeDir(cacheDir, segment, runId), nodeDir(cacheDir, segment)]) {
-      const base = realPath(candidate)
-      if (underResolved(target, base)) return { segment, dir: base, path: target }
-    }
-  }
-  return null
-}
-
-/**
- * Which node segment of this run a path belongs to, if any.
- *
- * @param path - the path from the event.
- * @param cacheDir - the voice cache.
- * @param segments - candidate directory names, in order of preference.
- * @param runId - the run whose uploads may be touched; another run's directory never matches.
- * @returns the segment that matched, or null.
- */
-export function matchNodeSegment (path, cacheDir, segments, runId) {
-  return matchNodeDir(path, cacheDir, segments, runId)?.segment ?? null
-}
-
-/**
- * The uploads of one run: `<cacheDir>/incoming/<run>`.
- *
- * @param cacheDir - the voice cache.
- * @param runId - the run.
- * @returns the run's incoming directory.
- */
-export function runIncomingDir (cacheDir, runId) {
-  return join(cacheDir, INCOMING_DIR, runId)
+function underReal (path, root) {
+  return underResolved(realPath(path), realPath(root))
 }
 
 /**
@@ -271,57 +215,6 @@ export function runIncomingDir (cacheDir, runId) {
  */
 export function runOutputDir (cacheDir, runId) {
   return join(cacheDir, OUTPUT_DIR, runId)
-}
-
-/**
- * The directory of one node inside one run.
- *
- * The node name comes from an event and becomes a path segment, so anything that is not a plain
- * name character is replaced instead of being read as a separator.
- *
- * @param cacheDir - the voice cache.
- * @param nodeName - the device name.
- * @param runId - the run.
- * @returns `<cacheDir>/incoming/<run>/<safe node>`.
- */
-export function nodeDir (cacheDir, nodeName, runId) {
-  const safe = String(nodeName ?? '').replace(/[^A-Za-z0-9._-]/g, '_') || '_'
-  // Without a run there is no run segment: that is the layout `dsh-nodes` writes, and the
-  // guard has to understand it as well as our own.
-  if (runId === undefined || runId === null || runId === '') return join(cacheDir, INCOMING_DIR, safe)
-  return join(runIncomingDir(cacheDir, runId), safe)
-}
-
-/**
- * Read the `keepRecording` setting.
- *
- * Anything other than `none` means `last`: a typo must not silently throw the takes away, and
- * keeping a recording is the harmless direction for a mistake to lean.
- *
- * @param value - the value from the plugin config.
- * @returns `last` or `none`.
- */
-export function resolveKeepRecording (value) {
-  return typeof value === 'string' && value.trim().toLowerCase() === KEEP_NONE ? KEEP_NONE : KEEP_LAST
-}
-
-/** Files of one directory, with the mtime the retention rules look at. */
-function filesIn (dir) {
-  let names
-  try {
-    names = readdirSync(dir)
-  } catch {
-    return []
-  }
-  const files = []
-  for (const name of names) {
-    const path = join(dir, name)
-    try {
-      const stat = statSync(path)
-      if (stat.isFile()) files.push({ path, mtimeMs: stat.mtimeMs })
-    } catch {}
-  }
-  return files
 }
 
 /**
@@ -352,86 +245,6 @@ function entriesIn (dir) {
 }
 
 /**
- * Every file under a directory, down to `depth` levels.
- *
- * The cache nests `<incoming>/<run>/<node>/<id>` and `<out>/<run>/<id>`, so two walks replace the
- * two hard-coded levels the sweep used to know about.
- *
- * @param dir - the directory to read.
- * @param depth - how many levels below `dir` to look.
- * @returns the files, with their mtimes.
- */
-function filesUnder (dir, depth) {
-  if (depth <= 0) return []
-  const files = []
-  for (const entry of entriesIn(dir)) {
-    if (entry.isDirectory) files.push(...filesUnder(entry.path, depth - 1))
-    else files.push({ path: entry.path, mtimeMs: entry.mtimeMs })
-  }
-  return files
-}
-
-/**
- * Remove every recording of one node directory except the newest one.
- *
- * The take that has just been used is passed as `prefer`: it is the last one by construction, and
- * on an equal mtime (two files written inside the same millisecond) it is the one meant to stay.
- *
- * @param dir - the node directory.
- * @param options - `prefer`, the path that must survive; `log` for a failed unlink.
- * @returns the path that was kept, or null for an empty or missing directory.
- */
-export function pruneRecordings (dir, { prefer = null, log = null } = {}) {
-  const files = filesIn(dir)
-  if (files.length === 0) return null
-  let keep = files[0]
-  for (const file of files.slice(1)) {
-    const newer = file.mtimeMs > keep.mtimeMs
-    const sameAndPreferred = file.mtimeMs === keep.mtimeMs && file.path === prefer
-    if (newer || sameAndPreferred) keep = file
-  }
-  for (const file of files) {
-    if (file.path === keep.path) continue
-    try {
-      rmSync(file.path, { force: true })
-    } catch (error) {
-      log?.warn?.('[dsh-voice] could not remove an old recording:', error?.message ?? error)
-    }
-  }
-  return keep.path
-}
-
-/**
- * Delete recordings older than the retention window, in every run directory.
- *
- * A plain mtime sweep: no bookkeeping file, so a take left behind by a crash is removed by the
- * same rule as one that was kept on purpose. It is the insurance policy for a process that lives
- * for weeks — the boot cleanup (below) is what handles the leftovers of a process that is gone.
- *
- * @param cacheDir - the voice cache, whose `incoming/` holds the uploads.
- * @param options - `now`, `maxAgeMs` and `log`, all for tests and for a quiet failure.
- * @returns the removed paths.
- */
-export function sweepRecordings (cacheDir, { now = Date.now(), maxAgeMs = RECORDING_TTL_MS, log = null } = {}) {
-  const removed = []
-  const expire = (file) => {
-    if (now - file.mtimeMs <= maxAgeMs) return
-    try {
-      rmSync(file.path, { force: true })
-      removed.push(file.path)
-    } catch (error) {
-      log?.warn?.('[dsh-voice] could not remove an expired recording:', error?.message ?? error)
-    }
-  }
-  // A rendered answer is removed as soon as the device takes it, with a two-minute guard for a
-  // device that never answers. A crash between the two leaves an orphan, and this sweep is what
-  // keeps it from living forever; the age window is the recording one, the guard is the fast path.
-  for (const file of filesUnder(join(cacheDir, OUTPUT_DIR), 3)) expire(file)
-  for (const file of filesUnder(join(cacheDir, INCOMING_DIR), 3)) expire(file)
-  return removed
-}
-
-/**
  * The mtime of a directory, or infinity when it cannot be read.
  *
  * Infinity keeps an unreadable directory: a failed `stat` is not evidence of age.
@@ -450,23 +263,22 @@ function mtimeOf (path) {
 /**
  * Remove the files of one tree that are older than the window, and the directories they empty.
  *
- * The age that decides is the file's own. Both writers — the loop and `dsh-nodes` — update the
- * mtime of `<node>/` when a take lands, and neither touches `<run>/`: a fresh recording can sit in
- * a run directory that looks two hours old, and a decision made at directory level deletes the
- * words a neighbour has just put there.
+ * The age that decides is the file's own. A copy is written into `<run>/` and `<run>/` is not
+ * touched by that, so a run directory that looks hours old may still hold a file written a minute
+ * ago — a decision made at directory level would throw away live work.
  *
  * An empty directory goes only when it is old itself or when this pass has just emptied it: a
- * neighbour may have created it a second ago and be about to write its first take.
+ * directory created a second ago may be about to receive its first file.
  *
  * @param dir - the directory to sweep.
- * @param ctx - `now`, `maxAgeMs`, `log` and the `removed` list to fill.
+ * @param ctx - `now`, `maxAgeMs` and the `remove` callback.
  * @returns true when the directory itself is now empty and may be removed.
  */
-function sweepStaleTree (dir, ctx) {
+function sweepTree (dir, ctx) {
   let emptied = false
   for (const entry of entriesIn(dir)) {
     if (entry.isDirectory) {
-      if (!sweepStaleTree(entry.path, ctx)) continue
+      if (!sweepTree(entry.path, ctx)) continue
       ctx.remove(entry.path)
       emptied = true
       continue
@@ -480,50 +292,39 @@ function sweepStaleTree (dir, ctx) {
 }
 
 /**
- * Remove what earlier runs left behind, before this one talks to anybody.
+ * Remove our own leftovers older than the window, at boot and then once a day.
  *
- * The rule is age, not ownership. Another process may share this `cacheDir`, and a recording or an
- * answer may still be read or downloading right after a restart; deleting "everything that is not
- * mine" would delete live work of a neighbour. An hour of age is the safe signal, and it is the
- * same grace the device gets to fetch a rendered answer.
+ * Only the two trees this plugin writes are swept: `work/` holds the copies of takes, `out/` holds
+ * the rendered answers waiting for the device. Every file in them is ours, so age alone decides,
+ * and nothing below `incoming/` is touched — that tree belongs to `dsh-nodes`.
  *
- * Age is measured on the files, not on the directories that hold them: writing a take updates
- * `<node>/` and nothing above it, so a run started this morning can hold a file written a minute
- * ago. What is left empty behind the removed files is swept as well. The directories of this run
- * are never touched, however old the clock says they are — this process is the one using them.
+ * A copy is removed as soon as it has been read, and an answer as soon as the device takes it, so
+ * a file of an hour is the leftover of a crash in the middle of an exchange. That is the whole
+ * insurance policy: there is no retention window and nothing is kept on purpose.
  *
  * @param cacheDir - the voice cache.
- * @param runId - the run that is starting.
  * @param options - `now`, `maxAgeMs` and `log`, for tests and a quiet failure.
  * @returns the removed paths.
  */
-export function cleanRunCache (cacheDir, runId, { now = Date.now(), maxAgeMs = RUN_STALE_MS, log = null } = {}) {
+export function sweepLeftovers (cacheDir, { now = Date.now(), maxAgeMs = STALE_MS, log = null } = {}) {
   const removed = []
   const remove = (path) => {
     try {
       rmSync(path, { recursive: true, force: true })
       removed.push(path)
     } catch (error) {
-      log?.warn?.('[dsh-voice] could not remove a stale cache entry:', error?.message ?? error)
+      log?.warn?.('[dsh-voice] could not remove a stale file:', error?.message ?? error)
     }
   }
-  const ctx = { now, maxAgeMs, log, remove }
-  // A symlink is compared by its target: a link in `incoming/` that points into this run would
-  // otherwise let the sweep walk straight into the directories it must never touch.
-  const mine = new Set([runIncomingDir(cacheDir, runId), runOutputDir(cacheDir, runId)].map((dir) => realPath(dir)))
-  // The run's own directory is created here, before the first exchange and before any timer: a
-  // device may write into it at any moment, and an empty directory is cheaper to explain than a
-  // missing one.
-  mkdirSync(runIncomingDir(cacheDir, runId), { recursive: true })
-  for (const root of [join(cacheDir, INCOMING_DIR), join(cacheDir, OUTPUT_DIR)]) {
+  const ctx = { now, maxAgeMs, remove }
+  for (const root of [join(cacheDir, WORK_DIR), join(cacheDir, OUTPUT_DIR)]) {
     for (const entry of entriesIn(root)) {
-      if (mine.has(realPath(entry.path))) continue
-      // A stray file directly under `incoming/` or `out/`: the same age rule, one level less.
+      // A stray file directly under `work/` or `out/`: the same age rule, one level less.
       if (!entry.isDirectory) {
         if (now - entry.mtimeMs > maxAgeMs) remove(entry.path)
         continue
       }
-      if (sweepStaleTree(entry.path, ctx)) remove(entry.path)
+      if (sweepTree(entry.path, ctx)) remove(entry.path)
     }
   }
   return removed
@@ -664,16 +465,15 @@ export function assistantTextOf (event) {
  *   still found and a missing one degrades instead of stopping the loop.
  * @param deps.sessions - the session service (`flush`).
  * @param deps.sessionController - resolves and creates sessions.
- * @param {string} deps.cacheDir - where a recording is kept on the host while it is used.
+ * @param {string} deps.cacheDir - the voice cache: `incoming/` from `dsh-nodes`, `work/` for our
+ *   copies, `out/` for the answers, `sessions.json` for the bindings.
  * @param {object} [deps.log] - `{info, warn, debug}`; console-like.
  * @param {Function} [deps.createUserMessage] - DSH message constructor, for `source`.
  * @param {Function} [deps.on] - subscription for session events.
- * @param {string} [deps.keepRecording] - `last` (default) keeps the newest take of every node,
- *   `none` removes every take once it is used.
  * @param {number} [deps.warmupDebounceMs] - how long one node's warmup holds; a test value.
  * @param {string} [deps.runId] - the name of this process inside the cache; a fresh
  *   `<pid>-<6 hex>` when it is not given.
- * @returns `{ handle, handleUpload, observeSessionEvent, runId, pending, dispose }`
+ * @returns `{ handle, handleUpload, observeSessionEvent, runId, work, dispose }`
  */
 export function createVoiceLoop ({
   nodes,
@@ -693,7 +493,6 @@ export function createVoiceLoop ({
   exchangeTimeoutMs = EXCHANGE_TIMEOUT_MS,
   language = DEFAULT_LANGUAGE,
   minSeconds = MIN_SECONDS,
-  keepRecording = KEEP_LAST,
   warmupDebounceMs = WARMUP_DEBOUNCE_MS,
   // The directory this process owns inside the cache. Left out, a fresh one is made here; a test
   // (or a host that wants a stable name) may pass its own.
@@ -709,13 +508,12 @@ export function createVoiceLoop ({
   const stt = () => (typeof serviceFor === 'function' ? serviceFor('speechToText') : speechToText)
   const tts = () => (typeof serviceFor === 'function' ? serviceFor('textToSpeech') : textToSpeech)
 
-  /** `last` or `none`, decided once: the config cannot change under a running loop. */
-  const keeping = resolveKeepRecording(keepRecording)
   /**
-   * This process's own directory inside the cache: decided once, at build time.
+   * The name of this process inside the cache: decided once, at build time.
    *
-   * Everything the loop writes goes under it, so the files of one run are never confusable with
-   * those of another and a boot can tell whom a leftover belongs to.
+   * Everything the loop writes goes under it (`work/<run>/` and `out/<run>/`), so the files of one
+   * run are never confusable with those of another, and a copy of a take is ours from the moment
+   * it is written.
    */
   const run = resolveRunId(runId)
   /** One entry per node that is currently being talked to. */
@@ -724,8 +522,6 @@ export function createVoiceLoop ({
   const bindings = loadBindings(cacheDir, log)
   /** Serialise binding writes: two exchanges may finish at once. */
   let saving = Promise.resolve()
-  /** node → tail of its exchange queue: one press, one answer, in order. */
-  const queues = new Map()
   /** session id → { node, mode } for the turns whose answer must be spoken. */
   const awaiting = new Map()
   /** assistant text collected for the turn being awaited, keyed by session id. */
@@ -749,25 +545,6 @@ export function createVoiceLoop ({
 
   /** When each node last warmed the synthesizer up, for the debounce. */
   const warmups = new Map()
-
-  /** Recording ids already delivered: a retry must not become a second answer. */
-  const seen = new Map()
-  const SEEN_LIMIT = 200
-  /**
-   * Recording ids whose exchange is running right now.
-   *
-   * The id used to be remembered only after a delivery, so two copies of one recording that
-   * arrived while the first was still waiting for the model (up to three minutes) both passed the
-   * check and the person was answered twice. The reservation is taken when the event is accepted
-   * and released when the exchange ends, whatever the outcome — a failed exchange must leave the
-   * id free, because the client re-sends it on purpose.
-   *
-   * The value is the path that exchange is reading. A retry of one id is written to the same
-   * `<cacheDir>/incoming/<node>/<id>.wav`, so "drop the duplicate's file" would delete the take
-   * the running exchange still has to read — and with `keepRecording: last` the person's
-   * recording was gone after a perfectly normal retry.
-   */
-  const inFlight = new Map()
 
   /**
    * Show one line on the device screen.
@@ -833,72 +610,60 @@ export function createVoiceLoop ({
   }
 
   /**
-   * Put a used recording away.
+   * Take a copy of a recording that arrived from another plugin, and give up the original.
    *
-   * `keepRecording: last` leaves the take in place — the question "what did it actually hear"
-   * can only be answered while the file exists — and removes the node's older ones, so the
-   * directory holds exactly one file. `none` is the old behaviour: the file goes at once.
+   * The source belongs to `dsh-nodes`: it is read exactly once, here, and removed as soon as the
+   * copy exists — not after recognition, not when the exchange ends. A crash anywhere later must
+   * not leave the other plugin's file on disk forever, and answering "was it copied?" is the only
+   * question the original can still help with.
    *
-   * The question asked here is the one the receiving path asks, through the same check: both
-   * layouts of a take are genuine, `<incoming>/<run>/<node>/` when the loop wrote it and
-   * `<incoming>/<node>/` when `dsh-nodes` did. A single-layout guard refused the second one, so
-   * `none` left the file on disk and `last` never pruned it — and every upload logged a false
-   * "refusing to touch a file outside the voice cache".
+   * The copy is ours: `work/<run>/<id>.wav`, no checks, removed once it has been read.
    *
-   * @param path - the recording the exchange just used.
-   * @param nodeName - the device the exchange belongs to; when known the take must sit in its
-   *   directory, because `last` prunes the whole directory the file is really in.
-   * @returns the kept path, or null when it was removed.
+   * @param source - the path from the event, already known to be inside `incoming/`.
+   * @param name - the exchange id, made safe as one path segment.
+   * @returns the copy's path, or null when it could not be written.
    */
-  function discardRecording (path, nodeName = null) {
-    // The directory comes from the path that matched, never from the segment: the flat layout has
-    // one level fewer, so a directory composed from the name is a place the file is not.
-    const known = nodeName !== null && nodeName !== undefined && nodeName !== ''
-    const matched = known
-      ? matchNodeDir(path, cacheDir, [nodeName], run)
-      : (insideCache(path, cacheDir, run) ? { dir: dirname(path) } : null)
-    if (!matched) {
-      // A path that is not ours is neither read nor removed: `none` would unlink an arbitrary
-      // file, and `last` would prune a directory belonging to somebody else — `cacheDir` itself
-      // included, which is where `sessions.json` lives.
-      log.warn?.('[dsh-voice] refusing to touch a file outside the voice cache', { path, node: nodeName })
-      return null
-    }
-    if (keeping !== KEEP_LAST) {
-      cleanup([path])
-      return null
-    }
+  function takeCopy (source, name) {
+    const dir = workDir(cacheDir, run)
+    const safe = String(name ?? '').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 120) || `take-${Date.now()}`
+    const target = join(dir, `${safe}.wav`)
     try {
-      return pruneRecordings(matched.dir, { prefer: path, log })
+      mkdirSync(dir, { recursive: true })
+      copyFileSync(source, target)
     } catch (error) {
-      log.warn?.('[dsh-voice] could not tidy the recordings:', error?.message ?? error)
-      return path
+      log.warn?.('[dsh-voice] could not copy the recording:', { path: source, error: `${error?.message ?? error}` })
+      return null
     }
+    // The copy exists, so the responsibility has moved: the source goes now.
+    cleanup([source])
+    return target
   }
 
-  // The previous process is gone, and its directories are litter — but only once they are old
-  // enough that no neighbour sharing this cache and no half-finished download can still be using
-  // them. Nothing here runs on a timer, and nothing speaks to a device before it has finished.
-  try {
-    const cleaned = cleanRunCache(cacheDir, run, { log })
-    if (cleaned.length > 0) log.info?.('[dsh-voice] removed what an earlier run left', { count: cleaned.length, run })
-  } catch (error) {
-    log.warn?.('[dsh-voice] the startup cleanup failed:', error?.message ?? error)
-  }
-
-  // A kept recording must not live forever: one sweep at boot, then once a day. The timer is
-  // unref'd, so it never keeps a process alive on its own.
+  // What an earlier process left in `work/` or `out/` is litter, but only once it is old enough
+  // that no live exchange and no half-finished download can still be using it. The directory of
+  // this run is made after the sweep, so its own age is never in question.
   const sweep = () => {
     try {
-      const removed = sweepRecordings(cacheDir, { log })
-      if (removed.length > 0) log.info?.('[dsh-voice] removed expired recordings', { count: removed.length })
+      const removed = sweepLeftovers(cacheDir, { log })
+      if (removed.length > 0) log.info?.('[dsh-voice] removed what an earlier run left', { count: removed.length, run })
     } catch (error) {
-      log.warn?.('[dsh-voice] the recording sweep failed:', error?.message ?? error)
+      log.warn?.('[dsh-voice] the leftover sweep failed:', error?.message ?? error)
     }
   }
   sweep()
+  // The boot sweep is enough for a crash that happened while this process was down; the timer is
+  // the insurance policy for a process that lives for weeks. It is unref'd, so it never keeps a
+  // process alive on its own.
   const sweepTimer = setInterval(sweep, SWEEP_INTERVAL_MS)
   if (typeof sweepTimer?.unref === 'function') sweepTimer.unref()
+
+  // Created before the first exchange and before any timer: a copy is written here at any moment,
+  // and an empty directory is cheaper to explain than a missing one.
+  try {
+    mkdirSync(workDir(cacheDir, run), { recursive: true })
+  } catch (error) {
+    log.warn?.('[dsh-voice] could not create the work directory:', error?.message ?? error)
+  }
 
   /** Say something short on the device through its own engine, best effort. */
   async function say (node, text) {
@@ -1031,45 +796,21 @@ export function createVoiceLoop ({
   /**
    * One full exchange: ask for a recording, transcribe, deliver, wait, speak.
    *
+   * Two presses are two exchanges, running side by side and in no promised order: the queue that
+   * used to serialise them is gone on purpose. A person who presses twice gets two answers, or
+   * one, or none — whichever the model manages — and never waits behind a turn that is stuck.
+   *
    * @param want - `{node, nodeName, mode, sessionId}` from the device event.
    * @returns a short outcome for the caller (and for the log).
    */
   async function handle (want) {
     const nodeName = want?.nodeName ?? String(want?.node ?? '')
-    /** The directory key: the node number when there is one, the name only for old events. */
-    const nodeKey = want?.node === undefined || want?.node === null ? nodeName : String(want.node)
-    // A press is a promise: it must end in an answer, even while the previous
-    // exchange is still waiting for the model. Refusing it as "busy" used to drop
-    // the press, park its take, and then answer the previous question only when
-    // the *next* press asked for a recording — the words arrived one message late
-    // and the delay grew with every press.
-    return await enqueue(nodeName, async () => await exchange(want, nodeName, nodeKey))
-  }
-
-  /**
-   * Run one exchange behind whatever this node is already doing.
-   *
-   * The queue is keyed by a name that comes from an event: a key that is never removed is one
-   * entry per device ever seen, held for the lifetime of the host. It is dropped once its chain
-   * is the current one again and nothing waits behind it.
-   *
-   * @param nodeName - the node the exchange talks to.
-   * @param run - the exchange itself.
-   * @param label - the warning for a failure that escaped the exchange.
-   * @returns what the exchange returned, or `{status: 'failed'}`.
-   */
-  function enqueue (nodeName, run, label = 'voice exchange failed') {
-    const chain = queues.get(nodeName) ?? Promise.resolve()
-    const mine = chain.then(run).catch((error) => {
-      log.warn?.(`[dsh-voice] ${label}:`, error?.message ?? error)
+    try {
+      return await exchange(want, nodeName)
+    } catch (error) {
+      log.warn?.('[dsh-voice] voice exchange failed:', error?.message ?? error)
       return { status: 'failed' }
-    })
-    const settled = mine.then(() => {}).catch(() => {})
-    queues.set(nodeName, settled)
-    void settled.then(() => {
-      if (queues.get(nodeName) === settled) queues.delete(nodeName)
-    })
-    return mine
+    }
   }
 
   /**
@@ -1093,13 +834,13 @@ export function createVoiceLoop ({
   }
 
   /**
-   * Run one exchange, now that the queue reached it.
+   * Run one exchange on the pull path.
    *
    * @param want - the device event that asked for it.
    * @param nodeName - the node to talk to.
    * @returns a short outcome for the log.
    */
-  async function exchange (want, nodeName, nodeKey = nodeName) {
+  async function exchange (want, nodeName) {
     const trace = createTrace({ id: `pull-${nodeName}-${Date.now()}`, node: nodeName, log })
     trace.mark('received')
     active.set(nodeName, { sessionId: want?.sessionId ?? bindings.get(nodeName) ?? null })
@@ -1120,9 +861,9 @@ export function createVoiceLoop ({
       return { status: 'no-recording', code: record?.code ?? null }
     }
     const devicePath = record.payload.path
-    // The take lands in the node's own directory, the same one a pushed recording uses: then
-    // `keepRecording` and the age sweep treat both paths alike.
-    const localPath = join(nodeDir(cacheDir, nodeKey, run), `take-${Date.now()}-${basename(devicePath)}`)
+    // The device copies the take straight into our own directory, so the file is ours from the
+    // first byte and there is no second copy of somebody else's file to give up.
+    const localPath = join(workDir(cacheDir, run), `take-${Date.now()}-${basename(devicePath)}`)
     mkdirSync(dirname(localPath), { recursive: true })
     const copy = await callNode(nodeName, 'files', 'copyFromDevice', { path: devicePath, hostPath: localPath })
     // The take belongs to the person's words: once it is here, the device copy is litter.
@@ -1138,7 +879,7 @@ export function createVoiceLoop ({
     const recordedSeconds = Number(record.payload.seconds)
     if (Number.isFinite(recordedSeconds) && recordedSeconds > 0 && recordedSeconds < minSeconds) {
       releaseNode(nodeName)
-      discardRecording(localPath, nodeKey)
+      cleanup([localPath])
       trace.done('too-short', { language, seconds: recordedSeconds })
       return { status: 'too-short', code: 'too-short' }
     }
@@ -1150,6 +891,10 @@ export function createVoiceLoop ({
     } catch (error) {
       failure = error
       log.warn?.('[dsh-voice] transcription failed:', error?.message ?? error)
+    } finally {
+      // The copy exists for the recognition and nothing else: once it has been read it goes, even
+      // when the recognizer failed. A file that outlives that is the leftover of a crash.
+      cleanup([localPath])
     }
     trace.mark('transcribed')
     // The screen shows what the person said before the model sees it: a long silence is
@@ -1157,7 +902,6 @@ export function createVoiceLoop ({
     if (text) pushChat({ node: nodeName, role: 'user', text, trace })
     if (!text) {
       releaseNode(nodeName)
-      discardRecording(localPath, nodeKey)
       // "I did not hear you" is a lie when there is no recognizer at all: the reason is named.
       const noRecognizer = failure?.code === 'no_speech'
       await say(nodeName, noRecognizer ? NO_TRANSCRIBER : NOT_HEARD)
@@ -1171,7 +915,6 @@ export function createVoiceLoop ({
       // This used to disappear into the outer catch: the words were never delivered, nothing was
       // said, and no closing line was written.
       releaseNode(nodeName)
-      discardRecording(localPath, nodeKey)
       log.warn?.('[dsh-voice] could not get a session:', error?.message ?? error)
       await say(nodeName, 'Не смог начать новую сессию.')
       trace.done('no-session', { language })
@@ -1190,152 +933,106 @@ export function createVoiceLoop ({
       trace.mark('delivered')
     } catch (error) {
       releaseNode(nodeName)
-      discardRecording(localPath, nodeKey)
       awaiting.delete(sessionId)
       log.warn?.('[dsh-voice] delivery failed:', error?.message ?? error)
       await say(nodeName, 'Не смог передать запрос.')
       trace.done('no-session', { language })
       return { status: 'no-session' }
     }
-    discardRecording(localPath, nodeKey)
     return { status: 'delivered', session: sessionId, text }
-  }
-
-  /**
-   * Remember one delivered recording id.
-   *
-   * A device that retries must not be answered twice: the id is the identity of one
-   * exchange, not of one request. Old ids are dropped in insertion order, so the map cannot
-   * grow for the lifetime of the host.
-   *
-   * This memory is deliberately not written to disk. A restart kills every exchange in flight,
-   * so the client's retry of one has to be handled again — persisting the id would turn that
-   * retry into "already answered" and lose the person's words, which is the worse failure. The
-   * only case a file would cover is a delivery whose answer never reached the client, and that
-   * one is better answered twice than never.
-   *
-   * @param id - the recording id, already keyed by node.
-   * @returns true the first time this id is seen.
-   */
-  function rememberId (id) {
-    if (seen.has(id)) return false
-    seen.set(id, Date.now())
-    while (seen.size > SEEN_LIMIT) seen.delete(seen.keys().next().value)
-    return true
   }
 
   /**
    * Handle a recording the device pushed itself: no command, the file is already here.
    *
+   * The file at `event.path` belongs to `dsh-nodes`. It is read exactly once — copied into our own
+   * `work/<run>/<id>.wav` — and removed the moment the copy exists. Everything after that works on
+   * the copy alone, which is ours: no path checks, no retention, removed as soon as it is read.
+   *
+   * Nothing is deduplicated. A repeat of one id is a second exchange, on purpose: when the link is
+   * flaky the model answers twice or does not answer at all, and both are accepted. A retry
+   * swallowed as "already answered" loses the person's words, which is the worse failure.
+   *
    * @param event - `{node, nodeName, id, path, bytes, seconds}` from `dsh-nodes/voice`.
-   * @returns a short outcome: `delivered`, `already`, `empty`, `no-file`.
+   * @returns a short outcome: `delivered`, `empty`, `no-file`, `no-copy`, `refused-path`.
    */
   async function handleUpload (event) {
     const id = String(event?.id ?? '')
     const path = typeof event?.path === 'string' ? event.path : ''
     if (!path) return { status: 'no-file' }
     const nodeName = event?.nodeName ?? String(event?.node ?? '')
-    // The device number and the device name are both legitimate directory names: `dsh-nodes`
-    // uses the number, older code used the name. Trying only one of them refused every real
-    // recording once the two disagreed, so both are tried and the match decides the directory.
-    // The number is the key; the name is only a fallback for recordings written by older
-    // versions, which named the directory after the device.
-    const segments = [event?.node, event?.nodeName].map((value) => (value === undefined || value === null ? '' : String(value))).filter(Boolean)
-    const segment = matchNodeSegment(path, cacheDir, segments, run) ?? (segments.length === 0 ? (insideCache(path, cacheDir, run) ? '' : null) : null)
-    // Symlinks are resolved, and the path has to be inside this node's own upload directory:
-    // `cacheDir` itself and its `out/` are not recordings, and pruning "their" directory would
-    // delete `sessions.json` and the answers waiting for the device.
-    const mine = segment !== null
-    if (!mine) {
-      // This path is read and then removed: `keepRecording: none` unlinks it, `last` prunes its
-      // directory. The event source is internal, and this is the plugin's own boundary — one
-      // event with a strange path must not delete files anywhere else, so it is refused whole.
-      log.warn?.('[dsh-voice] refusing a recording outside the voice cache of this run', {
+    // The original is removed once it has been copied, so it has to be `dsh-nodes`' file and
+    // nothing else: the cache root holds `sessions.json`, `out/` holds the answers waiting for the
+    // device, and a symlink is a string that looks local while pointing anywhere. The layout
+    // inside `incoming/` is that plugin's business — `<node>/<id>` and `<run>/<node>/<id>` are
+    // both real, and neither is ours to judge.
+    if (!insideIncoming(path, cacheDir)) {
+      log.warn?.('[dsh-voice] refusing a recording outside the incoming directory', {
         path,
         node: nodeName,
         id: id || null,
-        stack: new Error('a recording path outside the voice cache of this run').stack,
+        stack: new Error('a recording path outside the incoming directory').stack,
       })
       const refused = createTrace({ id: event?.id ?? null, node: nodeName, at: event?.at ?? null, log })
       refused.mark('received')
       refused.done('refused-path', { language })
       return { status: 'refused-path', id: event?.id ?? null }
     }
-    // Two devices may well produce the same id: the key is the pair. The number is the identity,
-    // not the name — a name is edited by hand and two devices can carry the same one, so keying by
-    // the name glued the words of the second device onto an `already` of the first. The upload
-    // directory has been named after the number since 0.1.20 for the same reason.
-    const key = `${event?.node ?? nodeName}:${id}`
-    if (id && (seen.has(key) || inFlight.has(key))) {
-      // A retry of something already answered, or of one still being worked on. The server has
-      // just written a fresh file for it, and leaving every repeat behind would grow the cache
-      // without end: after a delivery the repeat becomes the node's one kept recording and its
-      // predecessors go.
-      // While the first exchange runs, only a *different* file is litter. A retry of the same id
-      // is written to the same `<node>/<id>.wav`, so removing "the duplicate" would delete the
-      // take the running exchange is about to read — the person's recording then disappeared
-      // under `keepRecording: last`, and a synchronous double delivery ended as `empty`.
-      const held = inFlight.get(key)
-      if (inFlight.has(key)) {
-        if (!held || !sameFile(held, path)) cleanup([path])
-      } else discardRecording(path, segment || nodeName)
-      log.info?.('[dsh-voice] the same recording arrived again, ignoring', {
-        id,
-        node: nodeName,
-        inFlight: inFlight.has(key),
-      })
-      return { status: 'already', id }
+    const copy = takeCopy(path, id || `take-${Date.now()}`)
+    if (!copy) {
+      const failed = createTrace({ id: event?.id ?? null, node: nodeName, at: event?.at ?? null, log })
+      failed.mark('received')
+      failed.done('no-copy', { language })
+      return { status: 'no-copy', id: event?.id ?? null }
     }
-    // The id is taken now, not when the answer is delivered: the model may take three minutes,
-    // and a second copy of the same recording arriving meanwhile must not become a second answer.
-    if (id) inFlight.set(key, path)
-    // The same per-node order as a press: two takes cannot overtake each other, and the
-    // second waits instead of being dropped.
-    return await enqueue(nodeName, async () => {
-      try {
-        const outcome = await exchangeFromFile(event, nodeName, segment)
-        // Only a delivered turn owns the id. A failure — recognition, delivery, an empty take —
-        // must leave the retry path open: the client re-sends the same id on purpose.
-        if (id && outcome?.status === 'delivered') rememberId(key)
-        return outcome
-      } finally {
-        if (id) inFlight.delete(key)
-      }
-    }, 'uploaded exchange failed')
+    try {
+      return await exchangeFromFile(event, nodeName, copy)
+    } catch (error) {
+      // Rethrowing would only reach the Host's event listener: one line here says which exchange
+      // broke, and the person is told what happened by the exchange itself.
+      log.warn?.('[dsh-voice] uploaded exchange failed:', error?.message ?? error)
+      return { status: 'failed', id: event?.id ?? null }
+    } finally {
+      // The copy is normally gone after the recognition; this is the belt for the braces, so a
+      // failure cannot leave a file that only the hourly sweep would find.
+      cleanup([copy])
+    }
   }
 
   /**
-   * Transcribe a file that is already on disk and answer it.
+   * Transcribe our copy of a recording and answer it.
    *
-   * @param event - the upload event.
+   * @param event - the upload event, for the id and the client's timings.
    * @param nodeName - the node to speak to.
+   * @param copyPath - the copy in `work/<run>/`, ours to read and to remove.
    * @returns a short outcome for the log.
    */
-  async function exchangeFromFile (event, nodeName, segment = '') {
+  async function exchangeFromFile (event, nodeName, copyPath) {
     const trace = createTrace({ id: event?.id ?? null, node: nodeName, at: event?.at ?? null, log })
     trace.mark('received')
     const seconds = Number(event?.seconds)
     if (Number.isFinite(seconds) && seconds > 0 && seconds < minSeconds) {
       // Nothing worth recognizing: the session stays untouched and the device is told nothing —
-      // the person knows they only brushed the button. The take itself is kept like any other,
-      // because a click that was heard as words is exactly what one wants to listen to.
-      discardRecording(event.path, segment || nodeName)
+      // the person knows they only brushed the button.
       trace.done('too-short', { language, seconds })
       return { status: 'too-short', id: event?.id ?? null, seconds }
     }
     let text = ''
     let failure = null
     try {
-      const transcript = await transcribe(event.path, trace)
+      const transcript = await transcribe(copyPath, trace)
       text = String(typeof transcript === 'string' ? transcript : transcript?.text ?? '').trim()
     } catch (error) {
       failure = error
       log.warn?.('[dsh-voice] transcription failed:', error?.message ?? error)
+    } finally {
+      // The copy existed for the recognition: once it has been read it goes, even when the
+      // recognizer failed. A file outliving that is the leftover of a crash, not a recording.
+      cleanup([copyPath])
     }
     trace.mark('transcribed')
     if (text) pushChat({ node: nodeName, role: 'user', text, id: event?.id ?? null, trace })
     if (!text) {
-      discardRecording(event.path, segment || nodeName)
       const noRecognizer = failure?.code === 'no_speech'
       await say(nodeName, noRecognizer ? NO_TRANSCRIBER : NOT_HEARD)
       trace.done(noRecognizer ? 'no-stt' : 'empty', { language })
@@ -1346,7 +1043,6 @@ export function createVoiceLoop ({
       sessionId = await sessionFor(nodeName, event?.sessionId ?? null, event?.node ?? null)
     } catch (error) {
       // The exception used to reach the outer catch: no answer, no words, and no closing line.
-      discardRecording(event.path, segment || nodeName)
       log.warn?.('[dsh-voice] could not get a session:', error?.message ?? error)
       await say(nodeName, 'Не смог начать новую сессию.')
       trace.done('no-session', { language })
@@ -1365,15 +1061,11 @@ export function createVoiceLoop ({
     } catch (error) {
       awaiting.delete(sessionId)
       releaseNode(nodeName)
-      discardRecording(event.path, segment || nodeName)
       log.warn?.('[dsh-voice] delivery failed:', error?.message ?? error)
       await say(nodeName, 'Не смог передать запрос.')
       trace.done('no-session', { language })
       return { status: 'no-session' }
     }
-    // The recording has done its job: the newest take stays (unless keepRecording says `none`),
-    // the node's older ones do not.
-    discardRecording(event.path, segment || nodeName)
     return { status: 'delivered', session: sessionId, text, id: event?.id ?? null }
   }
 
@@ -1814,8 +1506,8 @@ export function createVoiceLoop ({
     /** The directory name this run owns inside the cache. */
     runId: run,
     awaiting,
-    /** The per-node exchange queues: exposed so a test can see that none is left behind. */
-    queues,
+    /** The directory this run owns for its copies: exposed so a test can look inside. */
+    work: workDir(cacheDir, run),
     /** When each node last warmed the synthesizer up: the same, for the debounce map. */
     warmups,
     dispose () {
@@ -1824,7 +1516,6 @@ export function createVoiceLoop ({
       awaiting.clear()
       drafts.clear()
       active.clear()
-      queues.clear()
       warmups.clear()
     },
   }

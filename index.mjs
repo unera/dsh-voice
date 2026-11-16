@@ -19,7 +19,7 @@ import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 
 import { readVoiceMarkup } from './markup.mjs'
-import { createVoiceLoop, resolveKeepRecording } from './loop.mjs'
+import { createVoiceLoop } from './loop.mjs'
 
 export const name = 'dsh-voice'
 
@@ -212,7 +212,7 @@ function cacheDirectory (config) {
  * quiet when a press arrives.
  *
  * @param ctx - owning Host context.
- * @param config - `cacheDir`, `logger`, `keepRecording`.
+ * @param config - `cacheDir`, `logger`, `language`, `minSeconds`, `runId`.
  * @returns a disposer.
  */
 export function installLoop (ctx, config = {}) {
@@ -268,9 +268,6 @@ function startLoop (ctx, config) {
     // Named, not inherited from the host default: `auto` lets a short noisy take drift into
     // another language, and the transcript then reaches the session as the person's own words.
     language: typeof config.language === 'string' && config.language.trim() ? config.language.trim() : 'ru',
-    // `last` (default) keeps the newest take of every node so it can be listened to afterwards;
-    // `none` removes it once used. Anything else reads as `last`: a typo must not throw takes away.
-    keepRecording: resolveKeepRecording(config.keepRecording),
     ...typeof config.minSeconds === 'number' && config.minSeconds > 0 ? { minSeconds: config.minSeconds } : {},
     // The directory this process owns inside the cache. Normally left out and made fresh at every
     // boot; a host that wants a stable name can say so, and the value is made safe as a segment.
@@ -366,7 +363,7 @@ function startLoop (ctx, config) {
 /**
  * Plugin entry point.
  * @param ctx - owning Host context.
- * @param config - `cacheDir` for recordings, `logger`, `keepRecording`.
+ * @param config - `cacheDir` for the cache, `logger`, `language`.
  */
 export function apply (ctx, config = {}) {
   install(ctx, config)

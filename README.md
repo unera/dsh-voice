@@ -76,39 +76,42 @@ The package ships `dsh.bundle.patch`, so the row mounts itself:
 | `language` | `ru` | the language the recognizer is asked for. Named, not inherited from the Host default: `auto` lets a short noisy take drift into another language, and the transcript then reaches the session as the person's own words |
 | `minSeconds` | `0.4` | below this a take is a button click, not speech: it never reaches the recognizer, the session is untouched, and the closing line says `reason=too-short` |
 | `runId` | `<pid>-<six hex>` | the directory name this process owns inside the cache, made once at boot. Normally left out: a host that sets it gets a stable name, and a test gets one it can predict. Anything unusable as one path segment is replaced, and an empty value gets a fresh id |
-| `keepRecording` | `last` | `last` keeps the newest take of every node (older ones go), `none` removes a take as soon as it is used. Anything that is not `none` reads as `last`: a typo must not throw a recording away |
 
-### Where things live, and what a boot removes
+### Where things live: two plugins, two directories
+
+The cache is shared with `dsh-nodes`, and since 0.2.0 the two never write into the same directory.
+A recording is copied in, and from then on only the copy is read: the original belongs to
+`dsh-nodes` and is deleted the moment the copy exists.
 
 Every run of the loop owns one name: `<pid>-<six hex>`, made once when the loop is built (the
-`runId` option overrides it; a test uses its own). The pair is what counts, not the pid alone —
-the kernel reuses a number, and a directory left by a cancelled process with that number would
-look like this one's own. The name stays one path segment, so the files of two processes sharing
-a `cacheDir` never mix:
+`runId` option overrides it; a test uses its own). Everything the loop writes goes under it, so
+the files of two processes sharing a `cacheDir` never mix:
 
-| what | where |
-|---|---|
-| a recording — uploaded by the device, or pulled in | `<cacheDir>/incoming/<run>/<node>/<id>.<ext>` |
-| a rendered answer waiting for the device | `<cacheDir>/out/<run>/<id>.ogg` |
-| the node → session bindings | `<cacheDir>/sessions.json` — deliberately not per run |
+| who writes | where | who removes it, and when |
+|---|---|---|
+| `dsh-nodes` | `<cacheDir>/incoming/<any layout>/<id>.wav` — the device uploads it and names the directory after the node number or its name | the voice loop, **immediately after copying it** |
+| `dsh-voice` | `<cacheDir>/work/<run>/<id>.wav` — our copy, named after the exchange id | the voice loop, **right after it has been read** by the recognizer |
+| `dsh-voice` | `<cacheDir>/out/<run>/<id>.ogg` — a rendered answer waiting for the device | the device, once it has fetched it (a two-minute guard covers one that never does) |
+| `dsh-voice` | `<cacheDir>/sessions.json` — the node → session bindings | nobody; a boot never touches it |
 
-A boot cleans up after the runs that are gone, and the only signal it trusts is age:
+The copy is the point of the split. The event carries a path inside `incoming/`, and that is the
+only thing checked about it: the file is ours to read once and to delete, so it has to be
+`dsh-nodes`' file and nothing else — not the cache root with `sessions.json`, not `out/` with the
+answers waiting for the device, not a host file reached through a symlink. What our own copy is
+called, where it sits, and how long it lives is nobody else's business, and it is checked by
+nothing.
 
-- `incoming/` — every entry older than an hour goes, subdirectories and stray files alike. That
-  is an earlier run, and it is also the old `<node>/` layout of 0.1.20 and before;
-- `out/` — the same hour: an answer may still be downloading right after a restart, and an hour
-  is far longer than the two-minute guard a live answer has;
-- the directories of **this** run are never touched, however old the clock says they are — this
-  process is the one using them.
+A boot sweeps `work/` and `out/`, at start and then once a day:
 
-Age, not ownership, because a second process may share the cache and a file may still be read:
-"everything that is not mine" would delete a neighbour's live work. A leftover younger than the
-hour is simply picked up by the next boot, or by the daily sweep below.
+- every file older than an hour goes, and the directories it leaves empty go with it;
+- nothing below `incoming/` is swept: that tree is `dsh-nodes`, not ours;
+- the hour is the age of the file itself, never of the directory above it: a fresh copy can sit
+  in a run directory that looks hours old.
 
-Both trees are also swept by `mtime` at boot and then once a day: a recording older than 24 hours
-is removed, and an orphaned `.ogg` goes by the same rule (its fast path is the two-minute guard
-that follows every answer). The sweep is the insurance policy for a process that lives for weeks;
-the boot cleanup is what handles a process that is already gone.
+A copy lives for the second it takes to transcribe, and an answer for the two minutes the device
+gets to fetch it, so a file of an hour is the leftover of a crash in the middle of an exchange.
+That is the whole insurance policy: there is no retention window, no "keep the last take" and no
+setting for one. A boot cannot tell a kept recording from litter because there is nothing kept.
 
 ## Who speaks
 
@@ -118,8 +121,8 @@ converts the provider's WAV to OGG/Opus with the configured tempo, and hands the
 `voice.answer`; the device fetches it by the command it answers, and the file is removed once it
 has.
 
-Neither call is awaited: speaking takes as long as the sentence, and the next press must not
-queue behind it. `voice.stop` is what cuts a speech short. When a host synthesis fails the loop
+Neither call is awaited: speaking takes as long as the sentence, and nothing waits behind it.
+`voice.stop` is what cuts a speech short. When a host synthesis fails the loop
 falls back to the device engine and closes the line with `reason=tts-failed`.
 
 ## The screen sees both sides
@@ -155,8 +158,8 @@ While the model works, every tool call in its message becomes one `voice.activit
 one inside the exchange and reset on the next press: `bash`, `web_search`, `nodes_call` — the name
 the model used.
 
-None of these is awaited and none joins the exchange queue: a screen that is off, a build without
-`voice.chat`, a full queue — one warning line, and the answer still arrives. If the synthesis
+None of these is awaited: a screen that is off, a build without `voice.chat`, a device that does
+not answer — one warning line, and the answer still goes out. If the synthesis
 fails, the answer still goes out with `say: true` and no audio, and the closing line says
 `reason=tts-failed`.
 
@@ -245,9 +248,8 @@ that refuses the language is a warning and a fallback to the service default, ne
 recording.
 
 A take shorter than `minSeconds` (0.4 by default) is not speech at all: the session is untouched,
-the device is told nothing, and the closing line says `reason=too-short`. The file itself follows
-`keepRecording` like any other take — a click that was heard as words is exactly what one wants to
-listen to.
+the device is told nothing, and the closing line says `reason=too-short`. The copy is removed like
+any other — nothing is kept for listening afterwards.
 
 Both facts are visible in the trace: `stage=stt-request provider=… language=…`, and `language=…`
 in the closing line.
@@ -261,45 +263,30 @@ The push path is the main one; the pull path is kept while the clients migrate.
 | push | the device records and uploads | nothing — the file is already at `event.path` |
 | pull (older clients) | the host asks after `voice.want` | `voice.record` → `files.copyFromDevice` |
 
-`dsh-nodes/voice` carries `{node, nodeName, id, path, bytes, seconds}`. The `id` is the
-identity of one exchange: a retry with the same id is answered `already` and produces no
-second turn. The id is reserved as soon as the event is accepted, so a copy that arrives
-while the first one is still waiting for the model (up to three minutes) is a duplicate,
-not a second answer; a failed exchange releases it, because the client re-sends the same
-id on purpose. The reservation lives in memory: a restart kills the exchange in flight
-anyway, and a retry after it has to be handled again rather than declared answered.
+`dsh-nodes/voice` carries `{node, nodeName, id, path, bytes, seconds}`. The loop copies the file
+to `work/<run>/<id>.wav`, removes the original, and from then on reads only the copy.
 
-`path` must be a recording of this device, in one of the two layouts the cache really has:
+Nothing is deduplicated. The same `id` sent twice is two exchanges: when the link is flaky the
+model answers twice, or does not answer at all, and both are accepted — a retry swallowed as
+"already answered" loses the person's words, which is the worse failure. There is no `seen` map,
+no reservation and no `already` status to look for.
 
-| layout | who creates it |
+`path` has to be inside `<cacheDir>/incoming/`, and that is all that is checked about it:
+
+| accepted | refused |
 |---|---|
-| `<cacheDir>/incoming/<run>/<node>/<id>` | the voice loop, on the pull path: `voice.record` writes on the device, `files.copyFromDevice` puts the take here |
-| `<cacheDir>/incoming/<node>/<id>` | `dsh-nodes`, on the push path: it writes the file itself and knows nothing about the loop's run id |
+| `<cacheDir>/incoming/<node>/<id>` — what `dsh-nodes` writes | the cache root, with `sessions.json` |
+| `<cacheDir>/incoming/<run>/<node>/<id>` — the older per-run layout | `out/`, with the answers waiting for the device |
+| any other depth below `incoming/` | a host file reached through a symlink |
 
-Both are accepted; neither is the "real" one. The file is read and then removed, so an event
-naming anything else — another run, another node, the cache root with `sessions.json`, `out/`
-with the answers waiting for the device — is refused whole: a warning with the path and a
-closing line with `reason=refused-path`, the file untouched.
+The layout below `incoming/` is `dsh-nodes`' business: it names the directory after the node
+number or after the node name, and neither is a reason to refuse a recording. A refused path is a
+warning with the path, a closing line with `reason=refused-path`, and the file left untouched —
+it is not ours to delete.
 
-What is left of the take afterwards is the `keepRecording` setting, applied to the directory the
-file actually arrived in:
-
-| value | what stays in that node directory |
-|---|---|
-| `last` (default) | exactly one file — the newest take of that node; its predecessors are removed |
-| `none` | nothing; the take goes as soon as the exchange is over |
-
-Anything that is not `none` reads as `last`: a typo must not throw a recording away. The kept
-take does not live forever — a sweep removes recordings older than 24 hours, once at boot and
-then once a day, by `mtime` alone. So "what did it actually hear" can be listened to the same day,
-and the directory does not grow with every press.
-
-Keeping works **inside one run**. The leftovers of a run that is over are cleaned by age, measured
-on the files: the next boot removes every file older than an hour and then the directories that
-are left empty. Writing a take updates the mtime of `<node>/` and nothing above it, so a run
-directory that looks old may still hold a take written a minute ago — that one stays. After a
-restart the recording of the previous session is not an archive either way: the takes are a
-debugging aid of the live process.
+Exchanges are not serialised either. Two presses, or two takes, on one device run side by side:
+the answers may come back in either order, and a slow turn never holds the next one. That is
+accepted on purpose: a queue made the person wait behind a turn that could take three minutes.
 
 ## The voice loop
 
@@ -308,11 +295,12 @@ here. On the still-supported pull path the phone says *"I want to talk"* (`POST 
 with `{"voice":{"want":"record"}}`, no text, no session) and the host does the asking:
 
 1. `nodes.call(node, 'voice', 'record', {mode, maxSeconds: 30, timeout: 12})` — wait for the take;
-2. `nodes.call(node, 'files', 'copyFromDevice', {path, hostPath})` — pull it into
-   `<cacheDir>/incoming/<run>/<node>/`;
+2. `nodes.call(node, 'files', 'copyFromDevice', {path, hostPath})` — the device writes it straight
+   into `<cacheDir>/work/<run>/`, our own directory;
 3. `nodes.call(node, 'shell', 'exec', {command: 'rm -f -- <device path>'})` — the device copy
    is litter once it is here;
-4. `speechToText.resolve(...)` + `transcribe(...)` — the WAV is already the canonical 16 kHz mono PCM16;
+4. `speechToText.resolve(...)` + `transcribe(...)` on that copy — the WAV is already the canonical
+   16 kHz mono PCM16 — and the copy is removed as soon as it has been read;
 5. an empty transcript is answered out loud (`voice.say`) and never reaches a session;
 6. otherwise the text goes into the session as a user message with `source: {kind: 'dsh-nodes', voice: true}`;
 7. the turn is watched: on a completed turn the last assistant text is cut with `splitReply`,
