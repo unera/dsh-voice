@@ -163,8 +163,17 @@ function sameFile (a, b) {
  * @returns true only for a real path strictly under the real root.
  */
 function underReal (path, root) {
-  const target = realPath(path)
-  const base = realPath(root)
+  return underResolved(realPath(path), realPath(root))
+}
+
+/**
+ * The same test on two paths that are already resolved: one `realPath` per side, not two.
+ *
+ * @param target - an already resolved path.
+ * @param base - an already resolved directory.
+ * @returns true only for a real path strictly under the real root.
+ */
+function underResolved (target, base) {
   if (!target || !base) return false
   return target.startsWith(base + sep)
 }
@@ -189,30 +198,41 @@ export function insideCache (path, cacheDir, runId) {
 }
 
 /**
- * Is this path a recording of that very node?
- *
- * The uploads of one device live in their own directory, so a take of the phone is not a take of
- * the tablet even when the same cache is shared. Refusing a path under another node's directory
- * also means a pruning pass can never reach out of the node it belongs to.
- *
- * @param path - the path from the event.
- * @param cacheDir - the voice cache.
- * @param nodeName - the device name from the same event.
- * @param runId - the run whose uploads may be touched.
- * @returns true only for a path strictly under `<cacheDir>/incoming/<run>/<node>/`.
- */
-export function insideNodeDir (path, cacheDir, nodeName, runId) {
-  if (typeof path !== 'string' || !path) return false
-  return underReal(path, nodeDir(cacheDir, nodeName, runId))
-}
-
-/**
- * Which node directory of this run a path belongs to, if any.
+ * Which node directory a path belongs to, and which of the two layouts matched.
  *
  * The device event carries both the node number and its name, and `dsh-nodes` names the
  * directory after the number while older code used the name. A check against one of them
- * refuses a perfectly good recording, so both are tried and the matching segment is
- * returned — it is also the directory that may be pruned.
+ * refuses a perfectly good recording, so both are tried.
+ *
+ * The directory that really holds the file is returned with the segment, not just the segment:
+ * a caller that removes or prunes decides by the path that matched, and the two layouts differ
+ * in depth (`<incoming>/<node>/` against `<incoming>/<run>/<node>/`). Composing the directory
+ * from the segment is how the cleanup kept looking in a place where the file never was.
+ *
+ * @param path - the path from the event.
+ * @param cacheDir - the voice cache.
+ * @param segments - candidate directory names, in order of preference.
+ * @param runId - the run whose uploads may be touched; another run's directory never matches.
+ * @returns `{segment, dir, path}` with `dir` resolved, or null when no layout matched.
+ */
+export function matchNodeDir (path, cacheDir, segments, runId) {
+  if (typeof path !== 'string' || !path) return null
+  const target = realPath(path)
+  if (!target) return null
+  for (const segment of segments) {
+    if (typeof segment !== 'string' || !segment) continue
+    // Our own per-run layout first, then the one `dsh-nodes` writes and knows nothing about.
+    // Both are genuine: refusing the other one is how the voice chat went silent twice.
+    for (const candidate of [nodeDir(cacheDir, segment, runId), nodeDir(cacheDir, segment)]) {
+      const base = realPath(candidate)
+      if (underResolved(target, base)) return { segment, dir: base, path: target }
+    }
+  }
+  return null
+}
+
+/**
+ * Which node segment of this run a path belongs to, if any.
  *
  * @param path - the path from the event.
  * @param cacheDir - the voice cache.
@@ -221,16 +241,7 @@ export function insideNodeDir (path, cacheDir, nodeName, runId) {
  * @returns the segment that matched, or null.
  */
 export function matchNodeSegment (path, cacheDir, segments, runId) {
-  if (typeof path !== 'string' || !path) return null
-  for (const segment of segments) {
-    if (typeof segment !== 'string' || !segment) continue
-    if (underReal(path, nodeDir(cacheDir, segment, runId))) return segment
-    // `dsh-nodes` writes the recording itself and knows nothing about our run id, so its
-    // layout is `<incoming>/<node>/`. Both layouts are genuine: refusing the other one is
-    // how the voice chat went silent twice.
-    if (underReal(path, nodeDir(cacheDir, segment))) return segment
-  }
-  return null
+  return matchNodeDir(path, cacheDir, segments, runId)?.segment ?? null
 }
 
 /**
@@ -763,14 +774,25 @@ export function createVoiceLoop ({
    * can only be answered while the file exists — and removes the node's older ones, so the
    * directory holds exactly one file. `none` is the old behaviour: the file goes at once.
    *
+   * The question asked here is the one the receiving path asks, through the same check: both
+   * layouts of a take are genuine, `<incoming>/<run>/<node>/` when the loop wrote it and
+   * `<incoming>/<node>/` when `dsh-nodes` did. A single-layout guard refused the second one, so
+   * `none` left the file on disk and `last` never pruned it — and every upload logged a false
+   * "refusing to touch a file outside the voice cache".
+   *
    * @param path - the recording the exchange just used.
    * @param nodeName - the device the exchange belongs to; when known the take must sit in its
-   *   directory, because `last` prunes the whole directory the path names.
+   *   directory, because `last` prunes the whole directory the file is really in.
    * @returns the kept path, or null when it was removed.
    */
   function discardRecording (path, nodeName = null) {
-    const mine = nodeName ? insideNodeDir(path, cacheDir, nodeName, run) : insideCache(path, cacheDir, run)
-    if (!mine) {
+    // The directory comes from the path that matched, never from the segment: the flat layout has
+    // one level fewer, so a directory composed from the name is a place the file is not.
+    const known = nodeName !== null && nodeName !== undefined && nodeName !== ''
+    const matched = known
+      ? matchNodeDir(path, cacheDir, [nodeName], run)
+      : (insideCache(path, cacheDir, run) ? { dir: dirname(path) } : null)
+    if (!matched) {
       // A path that is not ours is neither read nor removed: `none` would unlink an arbitrary
       // file, and `last` would prune a directory belonging to somebody else — `cacheDir` itself
       // included, which is where `sessions.json` lives.
@@ -782,7 +804,7 @@ export function createVoiceLoop ({
       return null
     }
     try {
-      return pruneRecordings(dirname(path), { prefer: path, log })
+      return pruneRecordings(matched.dir, { prefer: path, log })
     } catch (error) {
       log.warn?.('[dsh-voice] could not tidy the recordings:', error?.message ?? error)
       return path

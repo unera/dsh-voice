@@ -2287,3 +2287,46 @@ test('a recording the host wrote outside our run directory is still ours', async
   assert.equal(outcome.status, 'delivered', 'the layout dsh-nodes writes must be accepted')
   assert.equal(delivered.length, 1)
 })
+
+test('keepRecording: none removes a take that arrived in the flat layout', async (t) => {
+  // `dsh-nodes` writes `<incoming>/<node>/<id>.wav` and knows nothing about our run id. The
+  // receiving guard accepts that layout, and the cleanup has to accept it by the very same rule:
+  // otherwise the file of a `none` exchange stays on disk and every upload logs a false refusal.
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-flat-none-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const { loop, lines } = traceLoop({ dir, keepRecording: 'none' })
+  t.after(() => loop.dispose())
+
+  const path = join(dir, 'cache', 'incoming', '19', 'flat-none.wav')
+  mkdirSync(dirname(path), { recursive: true })
+  writeFileSync(path, wavBytes())
+
+  const outcome = await loop.handleUpload({ node: 19, nodeName: 'Телефон', id: 'flat-none', path, seconds: 1.2 })
+  assert.equal(outcome.status, 'delivered')
+  assert.equal(existsSync(path), false, 'the used take is removed from the flat layout too')
+  assert.equal(lines.some((line) => line.includes('refusing to touch')), false,
+    'a recording of our own node is not reported as somebody else\'s file')
+})
+
+test('keepRecording: last keeps one take in the flat layout', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-flat-last-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const { loop, lines } = traceLoop({ dir, keepRecording: 'last' })
+  t.after(() => loop.dispose())
+
+  const nodeDir = join(dir, 'cache', 'incoming', '19')
+  mkdirSync(nodeDir, { recursive: true })
+  const earlier = join(nodeDir, 'earlier.wav')
+  writeFileSync(earlier, wavBytes())
+  const hourAgo = new Date(Date.now() - 3_600_000)
+  utimesSync(earlier, hourAgo, hourAgo)
+  const take = join(nodeDir, 'flat-last.wav')
+  writeFileSync(take, wavBytes())
+
+  const outcome = await loop.handleUpload({ node: 19, nodeName: 'Телефон', id: 'flat-last', path: take, seconds: 1.2 })
+  assert.equal(outcome.status, 'delivered')
+  assert.deepEqual(readdirSync(nodeDir), ['flat-last.wav'], 'one take stays, and it is the used one')
+  assert.equal(lines.some((line) => line.includes('refusing to touch')), false,
+    'and the pruning pass is not a refusal')
+})
+
