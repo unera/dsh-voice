@@ -1835,7 +1835,7 @@ test('a session that cannot be created is said out loud from the pull path too',
   assert.equal(outcome.status, 'no-session')
   assert.ok(nodes.calls.some((call) => call.method === 'say' && /Не смог начать новую сессию/.test(call.data.text)))
   assert.ok(lines.some((line) => line.includes(' done ') && line.includes('reason=no-session')))
-  const nodeDirectory = join(dir, 'cache', 'incoming', 'A059P')
+  const nodeDirectory = join(dir, 'cache', 'incoming', '19')
   assert.deepEqual(readdirSync(nodeDirectory), [], 'the take does not stay behind for a failed session')
 })
 
@@ -1904,7 +1904,7 @@ test('keepRecording: last keeps the pull take too', async (t) => {
 
   const outcome = await loop.handle({ node: 19, nodeName: 'A059P', mode: 'ptt' })
   assert.equal(outcome.status, 'delivered')
-  const kept = readdirSync(join(dir, 'cache', 'incoming', 'A059P'))
+  const kept = readdirSync(join(dir, 'cache', 'incoming', '19'))
   assert.equal(kept.length, 1, 'the take that was used is the one kept')
   assert.match(kept[0], /^take-\d+-a\.wav$/)
 })
@@ -1923,7 +1923,7 @@ test('keepRecording: none removes the pull take as it is used', async (t) => {
 
   const outcome = await loop.handle({ node: 19, nodeName: 'A059P', mode: 'ptt' })
   assert.equal(outcome.status, 'delivered')
-  assert.deepEqual(readdirSync(join(dir, 'cache', 'incoming', 'A059P')), [], 'nothing is left behind')
+  assert.deepEqual(readdirSync(join(dir, 'cache', 'incoming', '19')), [], 'nothing is left behind')
 })
 
 test('the sweep removes a rendered answer orphaned in out/', (t) => {

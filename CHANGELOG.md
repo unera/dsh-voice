@@ -5,6 +5,14 @@ All notable changes to this package are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.20] - 2026-11-16
+
+### Changed
+- The node **number** is the directory key on both paths. It is an auto-increment id: it never
+  changes and it is unique, while a name can be edited and two devices may share one. The
+  pull path used to write under the name, so the two paths disagreed; the name remains only
+  as a reading fallback for recordings written by older versions.
+
 ## [0.1.19] - 2026-11-16
 
 ### Fixed

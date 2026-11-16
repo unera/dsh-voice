@@ -776,12 +776,14 @@ export function createVoiceLoop ({
    */
   async function handle (want) {
     const nodeName = want?.nodeName ?? String(want?.node ?? '')
+    /** The directory key: the node number when there is one, the name only for old events. */
+    const nodeKey = want?.node === undefined || want?.node === null ? nodeName : String(want.node)
     // A press is a promise: it must end in an answer, even while the previous
     // exchange is still waiting for the model. Refusing it as "busy" used to drop
     // the press, park its take, and then answer the previous question only when
     // the *next* press asked for a recording — the words arrived one message late
     // and the delay grew with every press.
-    return await enqueue(nodeName, async () => await exchange(want, nodeName))
+    return await enqueue(nodeName, async () => await exchange(want, nodeName, nodeKey))
   }
 
   /**
@@ -837,7 +839,7 @@ export function createVoiceLoop ({
    * @param nodeName - the node to talk to.
    * @returns a short outcome for the log.
    */
-  async function exchange (want, nodeName) {
+  async function exchange (want, nodeName, nodeKey = nodeName) {
     const trace = createTrace({ id: `pull-${nodeName}-${Date.now()}`, node: nodeName, log })
     trace.mark('received')
     active.set(nodeName, { sessionId: want?.sessionId ?? bindings.get(nodeName) ?? null })
@@ -860,7 +862,7 @@ export function createVoiceLoop ({
     const devicePath = record.payload.path
     // The take lands in the node's own directory, the same one a pushed recording uses: then
     // `keepRecording` and the age sweep treat both paths alike.
-    const localPath = join(nodeDir(cacheDir, nodeName), `take-${Date.now()}-${basename(devicePath)}`)
+    const localPath = join(nodeDir(cacheDir, nodeKey), `take-${Date.now()}-${basename(devicePath)}`)
     mkdirSync(dirname(localPath), { recursive: true })
     const copy = await callNode(nodeName, 'files', 'copyFromDevice', { path: devicePath, hostPath: localPath })
     // The take belongs to the person's words: once it is here, the device copy is litter.
@@ -876,7 +878,7 @@ export function createVoiceLoop ({
     const recordedSeconds = Number(record.payload.seconds)
     if (Number.isFinite(recordedSeconds) && recordedSeconds > 0 && recordedSeconds < minSeconds) {
       releaseNode(nodeName)
-      discardRecording(localPath, nodeName)
+      discardRecording(localPath, nodeKey)
       trace.done('too-short', { language, seconds: recordedSeconds })
       return { status: 'too-short', code: 'too-short' }
     }
@@ -895,7 +897,7 @@ export function createVoiceLoop ({
     if (text) pushChat({ node: nodeName, role: 'user', text, trace })
     if (!text) {
       releaseNode(nodeName)
-      discardRecording(localPath, nodeName)
+      discardRecording(localPath, nodeKey)
       // "I did not hear you" is a lie when there is no recognizer at all: the reason is named.
       const noRecognizer = failure?.code === 'no_speech'
       await say(nodeName, noRecognizer ? NO_TRANSCRIBER : NOT_HEARD)
@@ -909,7 +911,7 @@ export function createVoiceLoop ({
       // This used to disappear into the outer catch: the words were never delivered, nothing was
       // said, and no closing line was written.
       releaseNode(nodeName)
-      discardRecording(localPath, nodeName)
+      discardRecording(localPath, nodeKey)
       log.warn?.('[dsh-voice] could not get a session:', error?.message ?? error)
       await say(nodeName, 'Не смог начать новую сессию.')
       trace.done('no-session', { language })
@@ -928,14 +930,14 @@ export function createVoiceLoop ({
       trace.mark('delivered')
     } catch (error) {
       releaseNode(nodeName)
-      discardRecording(localPath, nodeName)
+      discardRecording(localPath, nodeKey)
       awaiting.delete(sessionId)
       log.warn?.('[dsh-voice] delivery failed:', error?.message ?? error)
       await say(nodeName, 'Не смог передать запрос.')
       trace.done('no-session', { language })
       return { status: 'no-session' }
     }
-    discardRecording(localPath, nodeName)
+    discardRecording(localPath, nodeKey)
     return { status: 'delivered', session: sessionId, text }
   }
 
@@ -976,6 +978,8 @@ export function createVoiceLoop ({
     // The device number and the device name are both legitimate directory names: `dsh-nodes`
     // uses the number, older code used the name. Trying only one of them refused every real
     // recording once the two disagreed, so both are tried and the match decides the directory.
+    // The number is the key; the name is only a fallback for recordings written by older
+    // versions, which named the directory after the device.
     const segments = [event?.node, event?.nodeName].map((value) => (value === undefined || value === null ? '' : String(value))).filter(Boolean)
     const segment = matchNodeSegment(path, cacheDir, segments) ?? (segments.length === 0 ? (insideCache(path, cacheDir) ? '' : null) : null)
     // Symlinks are resolved, and the path has to be inside this node's own upload directory:
