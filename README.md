@@ -269,15 +269,22 @@ not a second answer; a failed exchange releases it, because the client re-sends 
 id on purpose. The reservation lives in memory: a restart kills the exchange in flight
 anyway, and a retry after it has to be handled again rather than declared answered.
 
-`path` must be inside this run's own upload directory, `<cacheDir>/incoming/<run>/<node>/`: the
-file is read and then removed, so an event naming anything else — another run, another node, the
-cache root with `sessions.json`, `out/` with the answers waiting for the device — is refused
-whole: a warning with the path and a closing line with `reason=refused-path`, the file untouched.
+`path` must be a recording of this device, in one of the two layouts the cache really has:
 
-Both paths put the take under `<cacheDir>/incoming/<run>/<node>/`. What is left of it
-afterwards is the `keepRecording` setting:
+| layout | who creates it |
+|---|---|
+| `<cacheDir>/incoming/<run>/<node>/<id>` | the voice loop, on the pull path: `voice.record` writes on the device, `files.copyFromDevice` puts the take here |
+| `<cacheDir>/incoming/<node>/<id>` | `dsh-nodes`, on the push path: it writes the file itself and knows nothing about the loop's run id |
 
-| value | what stays in `incoming/<run>/<node>/` |
+Both are accepted; neither is the "real" one. The file is read and then removed, so an event
+naming anything else — another run, another node, the cache root with `sessions.json`, `out/`
+with the answers waiting for the device — is refused whole: a warning with the path and a
+closing line with `reason=refused-path`, the file untouched.
+
+What is left of the take afterwards is the `keepRecording` setting, applied to the directory the
+file actually arrived in:
+
+| value | what stays in that node directory |
 |---|---|
 | `last` (default) | exactly one file — the newest take of that node; its predecessors are removed |
 | `none` | nothing; the take goes as soon as the exchange is over |
@@ -287,11 +294,12 @@ take does not live forever — a sweep removes recordings older than 24 hours, o
 then once a day, by `mtime` alone. So "what did it actually hear" can be listened to the same day,
 and the directory does not grow with every press.
 
-Keeping works **inside one run**. The directory of a run that is over is a leftover, not a
-library: once it is an hour old, the next boot removes it whole. After a restart the recording of
-the previous session cannot be listened to any more — that is the conscious price of naming the
-directories after the run, and it buys a cache where nothing has to be guessed: the takes are a
-debugging aid of the live process, not an archive.
+Keeping works **inside one run**. The leftovers of a run that is over are cleaned by age, measured
+on the files: the next boot removes every file older than an hour and then the directories that
+are left empty. Writing a take updates the mtime of `<node>/` and nothing above it, so a run
+directory that looks old may still hold a take written a minute ago — that one stays. After a
+restart the recording of the previous session is not an archive either way: the takes are a
+debugging aid of the live process.
 
 ## The voice loop
 
