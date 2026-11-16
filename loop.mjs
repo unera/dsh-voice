@@ -1254,8 +1254,11 @@ export function createVoiceLoop ({
       refused.done('refused-path', { language })
       return { status: 'refused-path', id: event?.id ?? null }
     }
-    // Two devices may well produce the same id: the key is the pair, not the id alone.
-    const key = `${nodeName}:${id}`
+    // Two devices may well produce the same id: the key is the pair. The number is the identity,
+    // not the name — a name is edited by hand and two devices can carry the same one, so keying by
+    // the name glued the words of the second device onto an `already` of the first. The upload
+    // directory has been named after the number since 0.1.20 for the same reason.
+    const key = `${event?.node ?? nodeName}:${id}`
     if (id && (seen.has(key) || inFlight.has(key))) {
       // A retry of something already answered, or of one still being worked on. The server has
       // just written a fresh file for it, and leaving every repeat behind would grow the cache

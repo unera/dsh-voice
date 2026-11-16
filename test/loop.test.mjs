@@ -2367,3 +2367,28 @@ test('the boot cleanup trusts the age of a file, not of the run directory above 
   assert.ok(removed.includes(staleTake), 'the removed file is reported')
 })
 
+test('two nodes with the same name and the same id are two exchanges', async (t) => {
+  // The node number is the identity: names are edited by hand and two devices may well carry the
+  // same one. Keying the deduplication by the name made the second device's words disappear into
+  // an `already` that belonged to the first.
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-dedup-number-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const { loop } = traceLoop({ dir })
+  t.after(() => loop.dispose())
+
+  const take = (node, name) => {
+    const path = join(dir, 'cache', 'incoming', RUN, node, name)
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(path, wavBytes())
+    return path
+  }
+
+  const first = await loop.handleUpload({ node: 19, nodeName: 'Телефон', id: 'shared-1', path: take('19', 'a.wav'), seconds: 1.2 })
+  const second = await loop.handleUpload({ node: 20, nodeName: 'Телефон', id: 'shared-1', path: take('20', 'b.wav'), seconds: 1.2 })
+  const repeat = await loop.handleUpload({ node: 19, nodeName: 'Телефон', id: 'shared-1', path: take('19', 'c.wav'), seconds: 1.2 })
+
+  assert.equal(first.status, 'delivered', 'the first node is answered')
+  assert.equal(second.status, 'delivered', 'and so is the second, under the same name and id')
+  assert.equal(repeat.status, 'already', 'a retry of one node is still a retry')
+})
+
