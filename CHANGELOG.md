@@ -5,6 +5,33 @@ All notable changes to this package are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.18] - 2026-11-16
+
+A recording path is now checked against the filesystem, not against a string:
+three boundary defects of the 0.1.17 path guard, one of them a way to read a
+host file into the recognizer.
+
+### Fixed
+
+- A recording path is checked with `realpathSync`, not with a lexical `resolve`:
+  a symlink inside `incoming/` that pointed at `/etc/shadow` passed the old
+  check and the recognizer was handed the target's bytes. A path that does not
+  exist yet is resolved through its nearest existing ancestor, and a path that
+  cannot be resolved at all (a symlink loop, a permission wall) is refused.
+- The guard now asks for `<cacheDir>/incoming/<node>/`, not for "under the
+  cache": the cache root holds `sessions.json` and `out/` holds the answers
+  waiting for the device, and an event naming `cacheDir/evil.wav` was accepted,
+  delivered, and then pruned "its" directory — the node → session bindings were
+  gone. A path outside the node's own upload directory is answered
+  `refused-path`, and the file is left alone.
+- A retry of a recording that is still in flight no longer deletes the file the
+  running exchange is reading. The push path names the file
+  `<cacheDir>/incoming/<node>/<id>.wav`, so a retry of one id writes the same
+  path: the duplicate branch removed exactly that file, and with
+  `keepRecording: last` a normally retried take disappeared. A synchronous
+  double delivery ended the first exchange as `empty` for the same reason.
+  `inFlight` now remembers the path, and only a different file is dropped.
+
 ## [0.1.17] - 2026-11-16
 
 The first published release. The history below is the whole of it: the package

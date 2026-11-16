@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
@@ -33,9 +33,9 @@ function wavBytes (seconds = 0.2, sampleRate = 16000) {
  * An upload event names a path inside `cacheDir/incoming`, and the loop now refuses anything
  * else — so a fixture that writes beside the cache is testing a case that cannot happen.
  */
-function uploadPath (dir, name = undefined) {
+function uploadPath (dir, name = undefined, node = 'A059P') {
   const file = name ?? `take-${Math.random().toString(36).slice(2, 8)}.wav`
-  const target = join(dir, 'cache', 'incoming', 'A059P', file)
+  const target = join(dir, 'cache', 'incoming', node, file)
   mkdirSync(dirname(target), { recursive: true })
   writeFileSync(target, wavBytes())
   return target
@@ -1507,9 +1507,10 @@ test('two devices with the same id are two different exchanges', async (t) => {
     log: { info: () => {}, warn: () => {}, debug: () => {} },
   })
 
-  const take = () => uploadPath(dir)
-  const phone = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'same', path: take(), seconds: 1.2 })
-  const tablet = await loop.handleUpload({ node: 20, nodeName: 'Tablet', id: 'same', path: take(), seconds: 1.2 })
+  // A device uploads into its own directory, so the tablet's take is the tablet's file.
+  const take = (node) => uploadPath(dir, undefined, node)
+  const phone = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'same', path: take('A059P'), seconds: 1.2 })
+  const tablet = await loop.handleUpload({ node: 20, nodeName: 'Tablet', id: 'same', path: take('Tablet'), seconds: 1.2 })
   assert.equal(phone.status, 'delivered')
   assert.equal(tablet.status, 'delivered', 'the id is one per device, not one globally')
 })
@@ -1973,4 +1974,136 @@ test('the warmup map holds only the nodes inside the debounce window', async (t)
   await new Promise((resolve) => setTimeout(resolve, 30))
   await loop.handleWarmup({ node: 2, nodeName: 'second' })
   assert.deepEqual([...loop.warmups.keys()], ['second'], 'the expired node is dropped')
+})
+
+test('a symlink inside the cache that points outside it is refused, and the target is never read', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-link-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  // A file of the host that is none of the loop's business, reached by a link that looks local.
+  const secret = join(dir, 'secret.txt')
+  writeFileSync(secret, 'HOST SECRET')
+  mkdirSync(join(dir, 'outside'), { recursive: true })
+  const outer = join(dir, 'outside', 'take.wav')
+  writeFileSync(outer, wavBytes())
+  const nodeDirectory = nodeDirOf(dir)
+  const escaping = join(nodeDirectory, 'link.wav')
+  symlinkSync(secret, escaping)
+  // A link to a cache file that exists but is not a recording: the bindings themselves.
+  writeFileSync(join(dir, 'cache', 'sessions.json'), JSON.stringify({ A059P: 'session-1' }))
+  const insideCacheLink = join(nodeDirectory, 'bindings.wav')
+  symlinkSync(join(dir, 'cache', 'sessions.json'), insideCacheLink)
+  let transcribed = 0
+  const { loop, lines } = traceLoop({
+    dir,
+    keepRecording: 'none',
+    speech: { resolve: (r) => r, transcribe: async () => { transcribed += 1; return { text: 'привет' } } },
+  })
+  t.after(() => loop.dispose())
+
+  const link = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'link-1', path: escaping, seconds: 1.2 })
+  assert.equal(link.status, 'refused-path', 'a link that leaves the cache is refused')
+  assert.equal(existsSync(escaping), true, 'and the link itself is left alone')
+  assert.equal(readFileSync(secret, 'utf8'), 'HOST SECRET', 'the target is untouched')
+
+  // A link to a whole directory outside: the file behind it is the host's too.
+  symlinkSync(join(dir, 'outside'), join(nodeDirectory, 'dir-link.wav'))
+  const through = join(nodeDirectory, 'dir-link.wav', 'take.wav')
+  const viaDir = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'link-2', path: through, seconds: 1.2 })
+  assert.equal(viaDir.status, 'refused-path', 'a link to a directory outside the cache is refused too')
+  assert.equal(existsSync(outer), true, 'the file behind the directory link is untouched')
+
+  const sideways = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'link-3', path: insideCacheLink, seconds: 1.2 })
+  assert.equal(sideways.status, 'refused-path', 'a link to a cache file outside incoming/ is refused')
+  assert.deepEqual(JSON.parse(readFileSync(join(dir, 'cache', 'sessions.json'), 'utf8')), { A059P: 'session-1' },
+    'the bindings the link pointed at are not touched')
+
+  assert.equal(transcribed, 0, 'nothing reached the recognizer')
+  assert.ok(lines.some((line) => line.startsWith('WARN') && line.includes('outside the voice cache')),
+    'the refusal is a warning, not a silence')
+  assert.ok(lines.some((line) => line.includes(' done ') && line.includes('reason=refused-path')))
+})
+
+test('a recording at the cache root or in out/ is refused, and sessions.json survives', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-root-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const cacheDir = join(dir, 'cache')
+  mkdirSync(join(cacheDir, 'out'), { recursive: true })
+  const bindings = join(cacheDir, 'sessions.json')
+  writeFileSync(bindings, JSON.stringify({ A059P: 'session-1' }))
+  const rootTake = join(cacheDir, 'evil.wav')
+  writeFileSync(rootTake, wavBytes())
+  const answer = join(cacheDir, 'out', 'x.ogg')
+  writeFileSync(answer, wavBytes())
+  let transcribed = 0
+  const { loop, lines } = traceLoop({
+    dir,
+    keepRecording: 'last',
+    speech: { resolve: (r) => r, transcribe: async () => { transcribed += 1; return { text: 'привет' } } },
+  })
+  t.after(() => loop.dispose())
+
+  for (const [id, path] of [['root-1', rootTake], ['out-1', answer]]) {
+    const outcome = await loop.handleUpload({ node: 19, nodeName: 'A059P', id, path, seconds: 1.2 })
+    assert.equal(outcome.status, 'refused-path', `a take at ${path} is refused`)
+    assert.equal(existsSync(path), true, 'and the file is not removed')
+  }
+  assert.equal(transcribed, 0, 'nothing outside incoming/ is read')
+  assert.equal(existsSync(bindings), true, 'the session bindings are still there')
+  assert.deepEqual(JSON.parse(readFileSync(bindings, 'utf8')), { A059P: 'session-1' },
+    'and their content is untouched')
+  assert.ok(lines.some((line) => line.startsWith('WARN') && line.includes('outside the voice cache')))
+})
+
+test('a retry of a recording in flight does not delete the file the running exchange is reading', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-keepalive-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  // The push path names the file `<cacheDir>/incoming/<node>/<id>.wav`, so a retry of the same id
+  // writes the very path the running exchange holds. The recognizer is the wait that holds it.
+  const { loop } = traceLoop({
+    dir,
+    keepRecording: 'last',
+    speech: { resolve: (r) => r, transcribe: async () => { await gate; return { text: 'привет' } } },
+  })
+  t.after(() => loop.dispose())
+
+  const path = uploadPath(dir, 'race-keep.wav')
+  const first = loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'race-keep', path, seconds: 1.2 })
+  await new Promise((resolve) => setImmediate(resolve))
+  const retry = await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'race-keep', path, seconds: 1.2 })
+
+  assert.equal(retry.status, 'already', 'the retry is not a second exchange')
+  assert.equal(existsSync(path), true, 'the take of the running exchange is not removed by the retry')
+  release()
+  const outcome = await first
+  assert.equal(outcome.status, 'delivered', 'the first exchange finishes on its own take')
+  assert.deepEqual(readdirSync(nodeDirOf(dir)), ['race-keep.wav'],
+    'keepRecording: last leaves exactly the take that was used')
+})
+
+test('a retry in flight leaves the first exchange delivered, not empty', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-keepalive2-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  const { loop, nodes } = traceLoop({
+    dir,
+    keepRecording: 'last',
+    speech: { resolve: (r) => r, transcribe: async () => { await gate; return { text: 'привет' } } },
+  })
+  t.after(() => loop.dispose())
+
+  const path = uploadPath(dir, 'race-keep.wav')
+  const first = loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'race-keep', path, seconds: 1.2 })
+  await new Promise((resolve) => setImmediate(resolve))
+  await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'race-keep', path, seconds: 1.2 })
+  release()
+
+  const outcome = await first
+  assert.equal(outcome.status, 'delivered', 'the first exchange delivers the words it recognized')
+  assert.equal(outcome.text, 'привет')
+  assert.equal(nodes.calls.filter((call) => call.method === 'chat' && call.data.role === 'user').length, 1)
+  assert.deepEqual(readdirSync(nodeDirOf(dir)), ['race-keep.wav'],
+    'and its take is the one kept, not a directory that lost the recording')
 })

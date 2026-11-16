@@ -7,7 +7,7 @@
 //
 // Every outside world dependency is passed in, so the whole loop can be exercised on stubs:
 // no device, no model, no speech service.
-import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join, resolve, sep } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
@@ -61,23 +61,101 @@ const INCOMING_DIR = 'incoming'
 const OUTPUT_DIR = 'out'
 
 /**
- * Is this path inside the voice cache?
+ * The same path with every symlink on the way resolved.
+ *
+ * A lexical `resolve` compares strings, and a symlink is a string that looks local while pointing
+ * anywhere: `cache/incoming/A059P/link.wav -> /etc/shadow` passed a lexical check, and the
+ * recognizer was handed the target's bytes. So the check has to ask the filesystem.
+ *
+ * A path that does not exist yet — a retry naming a file the device is about to write — is
+ * resolved through its nearest existing ancestor, with the missing tail kept as written. A
+ * failure that is not "no such file" (a symlink loop, a permission wall) is not resolvable at
+ * all, and the caller refuses it.
+ *
+ * @param path - the path to resolve.
+ * @returns the real path, or null when it cannot be resolved.
+ */
+function realPath (path) {
+  try {
+    return realpathSync(path)
+  } catch {}
+  let current = resolve(path)
+  const tail = []
+  for (;;) {
+    const parent = dirname(current)
+    if (parent === current) return null
+    tail.unshift(basename(current))
+    current = parent
+    try {
+      return join(realpathSync(current), ...tail)
+    } catch (error) {
+      if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') return null
+    }
+  }
+}
+
+/**
+ * Do these two paths name the same file, however each was spelled?
+ *
+ * Both sides are already known to be inside the cache, so they resolve; a path that does not is
+ * not the same file as anything.
+ *
+ * @param a - one path.
+ * @param b - the other path.
+ * @returns true when both resolve to the same real path.
+ */
+function sameFile (a, b) {
+  const left = realPath(a)
+  return Boolean(left) && left === realPath(b)
+}
+
+/**
+ * Is this path strictly under that directory, with symlinks resolved on both sides?
+ *
+ * @param path - the path from an event.
+ * @param root - the directory it has to be inside.
+ * @returns true only for a real path strictly under the real root.
+ */
+function underReal (path, root) {
+  const target = realPath(path)
+  const base = realPath(root)
+  if (!target || !base) return false
+  return target.startsWith(base + sep)
+}
+
+/**
+ * Is this path a recording the loop may read and delete?
  *
  * A recording path arrives in an event, and the file is read and then removed: `keepRecording:
- * none` unlinks it, `last` prunes its whole directory. The event source is internal, but the
- * boundary belongs to this plugin, so every path is checked before it is touched.
+ * none` unlinks it, `last` prunes its directory whole. The event source is internal, but the
+ * boundary belongs to this plugin, so every path is checked before it is touched — against
+ * `incoming/`, never against the cache root: the root holds `sessions.json`, and pruning "the
+ * directory of the take" there deletes the node → session bindings.
  *
  * @param path - the path from the event.
  * @param cacheDir - the voice cache.
- * @returns true only for a path strictly under the cache directory.
+ * @returns true only for a path strictly under `<cacheDir>/incoming/`.
  */
 export function insideCache (path, cacheDir) {
   if (typeof path !== 'string' || !path) return false
-  try {
-    return resolve(path).startsWith(resolve(cacheDir) + sep)
-  } catch {
-    return false
-  }
+  return underReal(path, join(cacheDir, INCOMING_DIR))
+}
+
+/**
+ * Is this path a recording of that very node?
+ *
+ * The uploads of one device live in their own directory, so a take of the phone is not a take of
+ * the tablet even when the same cache is shared. Refusing a path under another node's directory
+ * also means a pruning pass can never reach out of the node it belongs to.
+ *
+ * @param path - the path from the event.
+ * @param cacheDir - the voice cache.
+ * @param nodeName - the device name from the same event.
+ * @returns true only for a path strictly under `<cacheDir>/incoming/<node>/`.
+ */
+export function insideNodeDir (path, cacheDir, nodeName) {
+  if (typeof path !== 'string' || !path) return false
+  return underReal(path, nodeDir(cacheDir, nodeName))
 }
 
 /**
@@ -422,8 +500,13 @@ export function createVoiceLoop ({
    * check and the person was answered twice. The reservation is taken when the event is accepted
    * and released when the exchange ends, whatever the outcome — a failed exchange must leave the
    * id free, because the client re-sends it on purpose.
+   *
+   * The value is the path that exchange is reading. A retry of one id is written to the same
+   * `<cacheDir>/incoming/<node>/<id>.wav`, so "drop the duplicate's file" would delete the take
+   * the running exchange still has to read — and with `keepRecording: last` the person's
+   * recording was gone after a perfectly normal retry.
    */
-  const inFlight = new Set()
+  const inFlight = new Map()
 
   /**
    * Show one line on the device screen.
@@ -496,13 +579,17 @@ export function createVoiceLoop ({
    * directory holds exactly one file. `none` is the old behaviour: the file goes at once.
    *
    * @param path - the recording the exchange just used.
+   * @param nodeName - the device the exchange belongs to; when known the take must sit in its
+   *   directory, because `last` prunes the whole directory the path names.
    * @returns the kept path, or null when it was removed.
    */
-  function discardRecording (path) {
-    if (!insideCache(path, cacheDir)) {
+  function discardRecording (path, nodeName = null) {
+    const mine = nodeName ? insideNodeDir(path, cacheDir, nodeName) : insideCache(path, cacheDir)
+    if (!mine) {
       // A path that is not ours is neither read nor removed: `none` would unlink an arbitrary
-      // file, and `last` would prune a directory belonging to somebody else.
-      log.warn?.('[dsh-voice] refusing to touch a file outside the voice cache', { path })
+      // file, and `last` would prune a directory belonging to somebody else — `cacheDir` itself
+      // included, which is where `sessions.json` lives.
+      log.warn?.('[dsh-voice] refusing to touch a file outside the voice cache', { path, node: nodeName })
       return null
     }
     if (keeping !== KEEP_LAST) {
@@ -767,7 +854,7 @@ export function createVoiceLoop ({
     const recordedSeconds = Number(record.payload.seconds)
     if (Number.isFinite(recordedSeconds) && recordedSeconds > 0 && recordedSeconds < minSeconds) {
       releaseNode(nodeName)
-      discardRecording(localPath)
+      discardRecording(localPath, nodeName)
       trace.done('too-short', { language, seconds: recordedSeconds })
       return { status: 'too-short', code: 'too-short' }
     }
@@ -786,7 +873,7 @@ export function createVoiceLoop ({
     if (text) pushChat({ node: nodeName, role: 'user', text, trace })
     if (!text) {
       releaseNode(nodeName)
-      discardRecording(localPath)
+      discardRecording(localPath, nodeName)
       // "I did not hear you" is a lie when there is no recognizer at all: the reason is named.
       const noRecognizer = failure?.code === 'no_speech'
       await say(nodeName, noRecognizer ? NO_TRANSCRIBER : NOT_HEARD)
@@ -800,7 +887,7 @@ export function createVoiceLoop ({
       // This used to disappear into the outer catch: the words were never delivered, nothing was
       // said, and no closing line was written.
       releaseNode(nodeName)
-      discardRecording(localPath)
+      discardRecording(localPath, nodeName)
       log.warn?.('[dsh-voice] could not get a session:', error?.message ?? error)
       await say(nodeName, 'Не смог начать новую сессию.')
       trace.done('no-session', { language })
@@ -819,14 +906,14 @@ export function createVoiceLoop ({
       trace.mark('delivered')
     } catch (error) {
       releaseNode(nodeName)
-      discardRecording(localPath)
+      discardRecording(localPath, nodeName)
       awaiting.delete(sessionId)
       log.warn?.('[dsh-voice] delivery failed:', error?.message ?? error)
       await say(nodeName, 'Не смог передать запрос.')
       trace.done('no-session', { language })
       return { status: 'no-session' }
     }
-    discardRecording(localPath)
+    discardRecording(localPath, nodeName)
     return { status: 'delivered', session: sessionId, text }
   }
 
@@ -864,7 +951,11 @@ export function createVoiceLoop ({
     const path = typeof event?.path === 'string' ? event.path : ''
     if (!path) return { status: 'no-file' }
     const nodeName = event?.nodeName ?? String(event?.node ?? '')
-    if (!insideCache(path, cacheDir)) {
+    // Symlinks are resolved, and the path has to be inside this node's own upload directory:
+    // `cacheDir` itself and its `out/` are not recordings, and pruning "their" directory would
+    // delete `sessions.json` and the answers waiting for the device.
+    const mine = nodeName ? insideNodeDir(path, cacheDir, nodeName) : insideCache(path, cacheDir)
+    if (!mine) {
       // This path is read and then removed: `keepRecording: none` unlinks it, `last` prunes its
       // directory. The event source is internal, and this is the plugin's own boundary — one
       // event with a strange path must not delete files anywhere else, so it is refused whole.
@@ -885,10 +976,15 @@ export function createVoiceLoop ({
       // A retry of something already answered, or of one still being worked on. The server has
       // just written a fresh file for it, and leaving every repeat behind would grow the cache
       // without end: after a delivery the repeat becomes the node's one kept recording and its
-      // predecessors go; while the first is still running only its own file is dropped, because
-      // the take the running exchange reads must stay where it is.
-      if (inFlight.has(key)) cleanup([path])
-      else discardRecording(path)
+      // predecessors go.
+      // While the first exchange runs, only a *different* file is litter. A retry of the same id
+      // is written to the same `<node>/<id>.wav`, so removing "the duplicate" would delete the
+      // take the running exchange is about to read — the person's recording then disappeared
+      // under `keepRecording: last`, and a synchronous double delivery ended as `empty`.
+      const held = inFlight.get(key)
+      if (inFlight.has(key)) {
+        if (!held || !sameFile(held, path)) cleanup([path])
+      } else discardRecording(path, nodeName)
       log.info?.('[dsh-voice] the same recording arrived again, ignoring', {
         id,
         node: nodeName,
@@ -898,7 +994,7 @@ export function createVoiceLoop ({
     }
     // The id is taken now, not when the answer is delivered: the model may take three minutes,
     // and a second copy of the same recording arriving meanwhile must not become a second answer.
-    if (id) inFlight.add(key)
+    if (id) inFlight.set(key, path)
     // The same per-node order as a press: two takes cannot overtake each other, and the
     // second waits instead of being dropped.
     return await enqueue(nodeName, async () => {
@@ -929,7 +1025,7 @@ export function createVoiceLoop ({
       // Nothing worth recognizing: the session stays untouched and the device is told nothing —
       // the person knows they only brushed the button. The take itself is kept like any other,
       // because a click that was heard as words is exactly what one wants to listen to.
-      discardRecording(event.path)
+      discardRecording(event.path, nodeName)
       trace.done('too-short', { language, seconds })
       return { status: 'too-short', id: event?.id ?? null, seconds }
     }
@@ -945,7 +1041,7 @@ export function createVoiceLoop ({
     trace.mark('transcribed')
     if (text) pushChat({ node: nodeName, role: 'user', text, id: event?.id ?? null, trace })
     if (!text) {
-      discardRecording(event.path)
+      discardRecording(event.path, nodeName)
       const noRecognizer = failure?.code === 'no_speech'
       await say(nodeName, noRecognizer ? NO_TRANSCRIBER : NOT_HEARD)
       trace.done(noRecognizer ? 'no-stt' : 'empty', { language })
@@ -956,7 +1052,7 @@ export function createVoiceLoop ({
       sessionId = await sessionFor(nodeName, event?.sessionId ?? null, event?.node ?? null)
     } catch (error) {
       // The exception used to reach the outer catch: no answer, no words, and no closing line.
-      discardRecording(event.path)
+      discardRecording(event.path, nodeName)
       log.warn?.('[dsh-voice] could not get a session:', error?.message ?? error)
       await say(nodeName, 'Не смог начать новую сессию.')
       trace.done('no-session', { language })
@@ -975,7 +1071,7 @@ export function createVoiceLoop ({
     } catch (error) {
       awaiting.delete(sessionId)
       releaseNode(nodeName)
-      discardRecording(event.path)
+      discardRecording(event.path, nodeName)
       log.warn?.('[dsh-voice] delivery failed:', error?.message ?? error)
       await say(nodeName, 'Не смог передать запрос.')
       trace.done('no-session', { language })
@@ -983,7 +1079,7 @@ export function createVoiceLoop ({
     }
     // The recording has done its job: the newest take stays (unless keepRecording says `none`),
     // the node's older ones do not.
-    discardRecording(event.path)
+    discardRecording(event.path, nodeName)
     return { status: 'delivered', session: sessionId, text, id: event?.id ?? null }
   }
 
