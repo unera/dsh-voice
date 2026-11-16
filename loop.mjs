@@ -33,6 +33,13 @@ const AUDIO_TTL_MS = 120_000
  * nobody would ever end.
  */
 const EXCHANGE_TIMEOUT_MS = 180_000
+/**
+ * What the device says when the deadline passes.
+ *
+ * The exchange is over either way, and a silent phone is read as a broken button rather than as a
+ * slow model: the phrase names the reason and the one thing the person can do about it.
+ */
+const EXCHANGE_TIMEOUT_TEXT = 'Ответ не пришёл — слишком долго. Попробуйте короче.'
 /** The language we ask the recognizer for, unless the host says otherwise. */
 const DEFAULT_LANGUAGE = 'ru'
 /**
@@ -1585,7 +1592,11 @@ export function createVoiceLoop ({
       const stuck = finishAwaiting(entry.sessionId)
       if (!stuck) return
       stuck.trace?.mark('turn-end', { reason: 'timeout' })
-      stuck.trace?.done('timeout', { synth: stuck.synth ?? 'device', language })
+      // Three minutes of silence are indistinguishable from a dead button, and the person is
+      // holding the phone: the device says the one thing worth saying, in its own voice. It is a
+      // report, not an answer — a device that cannot be reached must not swallow it.
+      Promise.resolve(say(stuck.node, EXCHANGE_TIMEOUT_TEXT)).catch(() => {})
+      stuck.trace?.done('timeout', { synth: stuck.synth ?? 'device', language, said: 'timeout' })
       log.warn?.('[dsh-voice] the answer never came, releasing the exchange', { session: entry.sessionId })
     }, exchangeTimeoutMs)
     record.timer.unref?.()

@@ -2392,3 +2392,21 @@ test('two nodes with the same name and the same id are two exchanges', async (t)
   assert.equal(repeat.status, 'already', 'a retry of one node is still a retry')
 })
 
+test('an exchange that times out says so out loud', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-voice-timeout-say-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const nodes = stubNodes({ 'voice.chat': { status: 'ok' }, 'voice.say': { status: 'ok' } })
+  const lines = []
+  const loop = bareLoop({ dir, nodes, lines, synthService: null, exchangeTimeoutMs: 40 })
+  t.after(() => loop.dispose())
+
+  await loop.handleUpload({ node: 19, nodeName: 'A059P', id: 'stuck-say', path: uploadPath(dir, 'a.wav') })
+  await new Promise((resolve) => setTimeout(resolve, 80))
+
+  const said = nodes.calls.filter((call) => call.method === 'say')
+  assert.equal(said.length, 1, 'three minutes of silence look like a broken button, so it is spoken')
+  assert.match(said[0].data.text, /долго|короч/, 'the phrase tells the person what to do next')
+  const done = lines.filter((line) => line.includes(' done '))
+  assert.equal(done.length, 1, 'the exchange is closed once, not left open')
+  assert.match(done[0], /reason=timeout/)
+})
