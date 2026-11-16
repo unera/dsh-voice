@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.2] - 2026-11-16
 
 ### Fixed
+- **The settings card is on the plugin's own page now.** It was registered only
+  into `plugins.row.config`, which the Plugins page reaches through a configure
+  control on the row — so with no control there was no card and the two settings
+  were unreachable. The same card is now also registered into
+  `plugins.bundle.config`, under the package name, and renders as a section of the
+  plugin's page itself.
+- **The card reads the settings service instead of the page's props.** A bundle
+  page hands its entry no form at all, so the card could only say "the form is
+  unavailable". It is registered with `configForms.get('dsh-voice')` — a live
+  snapshot hook plus the write action — and still prefers an owner form when a row
+  page passes one.
 - The spoken-answer contract reached the model only with the switch on, so the format
   could not be written until someone found the switch — and the switch lives in a page
   the model cannot open. The contract is shown always now, and its own text says whether

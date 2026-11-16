@@ -35,12 +35,38 @@ async function loadBundle () {
   return { entry, module: entry.factory(require) }
 }
 
-/** A client context stand-in: slots, locale and effects, nothing else. */
-function clientContext () {
+/** A settings controller stand-in: the snapshot a page or the card would read. */
+function settingsController (value, { status = 'ready', writable = true } = {}) {
+  const listeners = new Set()
+  const writes = []
+  let snapshot = { status, writable, revision: 7, value }
+  return {
+    writes,
+    getSnapshot: () => snapshot,
+    subscribe (listener) {
+      listeners.add(listener)
+      return () => { listeners.delete(listener) }
+    },
+    async mutate (ops, revision) {
+      writes.push({ ops, revision })
+      return true
+    },
+    publish (next) {
+      snapshot = { ...snapshot, ...next }
+      for (const listener of [...listeners]) listener()
+    },
+  }
+}
+
+/** A client context stand-in: slots, locale, effects and the settings service. */
+function clientContext (form = settingsController({ speakReplies: false, maxChars: 600 })) {
   const registered = []
   const effects = []
   const dictionaries = []
+  const asked = []
   return {
+    form,
+    asked,
     registered,
     effects,
     dictionaries,
@@ -56,12 +82,45 @@ function clientContext () {
         return () => {}
       },
     },
+    configForms: {
+      get (namespace) {
+        asked.push(namespace)
+        return form
+      },
+    },
     locale: {
       bind: () => (key) => `t:${key}`,
       register: (ns, id, dictionary) => { dictionaries.push({ ns, id, dictionary }) },
       addLanguage: () => () => {},
     },
   }
+}
+
+/** The injected props of one placement, or a failure that names the missing one. */
+function faceFor (ctx, name) {
+  const page = ctx.registered.find((item) => item.options.name === name)
+  assert.ok(page, `the card is registered into ${name}`)
+  return page.options.inject()
+}
+
+/** Find the first node in the stub element tree that matches. */
+function find (node, match) {
+  if (node === null || typeof node !== 'object') return undefined
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const hit = find(child, match)
+      if (hit !== undefined) return hit
+    }
+    return undefined
+  }
+  if (match(node)) return node
+  return find(node.children ?? [], match)
+}
+
+/** The page view, rendered: the view hands off to the page component. */
+function pageOf (module, props) {
+  const element = module.VoiceSettingsView(props)
+  return typeof element.type === 'function' ? element.type(element.props) : element
 }
 
 test('the bundle loads and exports the client entry point', async () => {
@@ -72,22 +131,91 @@ test('the bundle loads and exports the client entry point', async () => {
   assert.deepEqual(Object.keys(module.DICTIONARIES).sort(), ['en', 'ru', 'zh'])
 })
 
-test('mounting registers one configuration page, keyed by package and row', async () => {
+test('mounting registers the card on the bundle page and on the row page', async () => {
   const { module } = await loadBundle()
   const ctx = clientContext()
   module.apply(ctx)
 
-  const page = ctx.registered.find((item) => item.options.name === 'plugins.row.config')
-  assert.ok(page, 'the card is registered into the Plugins page')
-  assert.equal(page.options.key, '@dr-co/dsh-voice#dsh-voice', 'the key the page addresses the row by')
-  assert.equal(page.options.locale, 'dsh-voice')
-  assert.equal(page.view, module.VoiceSettingsView)
-  assert.deepEqual(Object.keys(page.options.inject()), ['t'], 'the card travels with its translator')
-  assert.equal(page.options.inject().t('title'), 't:title')
+  const row = ctx.registered.find((item) => item.options.name === 'plugins.row.config')
+  assert.ok(row, 'the card is registered as the row configuration page')
+  assert.equal(row.options.key, '@dr-co/dsh-voice#dsh-voice', 'the key the page addresses the row by')
+
+  // The plugin's own page is the one a person opens first, and its slot hands the
+  // entry no form: without this registration the card is reachable only through a
+  // row control, and with no form behind it.
+  const bundle = ctx.registered.find((item) => item.options.name === 'plugins.bundle.config')
+  assert.ok(bundle, 'the card is registered on the plugin page itself')
+  assert.equal(bundle.options.key, '@dr-co/dsh-voice', 'a bundle page entry is keyed by the package name')
+
+  for (const page of [row, bundle]) {
+    assert.equal(page.options.locale, 'dsh-voice')
+    assert.equal(page.view, module.VoiceSettingsView)
+    const face = page.options.inject()
+    assert.equal(face.t('title'), 't:title', 'the card travels with its translator')
+    assert.equal(typeof face.mutateSettings, 'function', 'and with the settings write action')
+    assert.equal(typeof face.hooks.voiceSettings.getSnapshot, 'function')
+    assert.equal(typeof face.hooks.voiceSettings.subscribe, 'function')
+  }
 
   // All three dictionaries are handed to the locale service, English first.
   assert.deepEqual(ctx.dictionaries.map((item) => item.id), ['en', 'ru', 'zh'])
   for (const item of ctx.dictionaries) assert.equal(item.ns, 'dsh-voice')
+})
+
+test('the card takes the row page form when the page hands one', async () => {
+  const { module } = await loadBundle()
+  const page = settingsController({ speakReplies: false, maxChars: 600 })
+  const ctx = clientContext(page)
+  module.apply(ctx)
+  const face = faceFor(ctx, 'plugins.row.config')
+  const owner = { state: { status: 'ready', writable: true, value: { speakReplies: true, maxChars: 250 } }, mutate: () => true }
+
+  const tree = module.VoiceSettingsView({ view: 'summary', form: owner, ...face })
+  assert.equal(tree.children.join(''), 't:summary.on', 'the page owns the values it is rendering')
+})
+
+test('without an owner form the card still shows its controls from the settings service', async () => {
+  const { module } = await loadBundle()
+  const settings = settingsController({ speakReplies: true, maxChars: 480 })
+  const ctx = clientContext(settings)
+  module.apply(ctx)
+  const face = faceFor(ctx, 'plugins.bundle.config')
+
+  // Exactly what the Plugins page passes a bundle-config entry: the view, and no form.
+  const live = { getSnapshot: face.hooks.voiceSettings.getSnapshot, subscribe: face.hooks.voiceSettings.subscribe }
+  const props = {
+    view: 'page',
+    t: face.t,
+    mutateSettings: face.mutateSettings,
+    useVoiceSettings: (selector = (snapshot) => snapshot) => selector(live.getSnapshot()),
+  }
+  const tree = pageOf(module, props)
+  assert.notEqual(tree.type, 'p', 'the card is a card, not the "form unavailable" line')
+
+  const box = find(tree, (node) => node.props?.type === 'checkbox')
+  assert.ok(box, 'the switch is on the page')
+  assert.equal(box.props.checked, true, 'it shows the value the host holds')
+  const input = find(tree, (node) => node.props?.type === 'number')
+  assert.ok(input, 'the character limit is on the page')
+  assert.equal(input.props.value, '480')
+  assert.equal(input.props.min, 1)
+  assert.equal(input.props.max, 5000)
+
+  // A press writes through the settings service, not into a local copy.
+  box.props.onChange({ target: { checked: false } })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(settings.writes, [{ ops: [{ op: 'set', path: ['speakReplies'], value: false }], revision: undefined }])
+})
+
+test('a host without a settings form says so instead of drawing a dead switch', async () => {
+  const { module } = await loadBundle()
+  const ctx = clientContext()
+  module.apply(ctx)
+  const face = faceFor(ctx, 'plugins.bundle.config')
+
+  const tree = pageOf(module, { view: 'page', t: face.t, mutateSettings: face.mutateSettings })
+  assert.equal(tree.type, 'p', 'the page says the form is unavailable')
+  assert.equal(tree.children.join(''), 't:form.unavailable')
 })
 
 test('the summary view renders the state the form holds', async () => {

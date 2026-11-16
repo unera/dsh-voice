@@ -195,9 +195,18 @@ earlier stop, or one the model attached with `voice_say` — is never spoken twi
 
 ### Where the switch lives
 
-Settings → **Plugins** → `@dr-co/dsh-voice` → its row. The page is a client plugin
-(`lib/client.js`, built by `npm run build`), registered into the Plugins page's
-`plugins.row.config` slot under the key `@dr-co/dsh-voice#dsh-voice`.
+Settings → **Plugins** → `@dr-co/dsh-voice`. The card is a client plugin
+(`lib/client.js`, built by `npm run build`), registered into two slots of that
+page, both pointing at the same settings namespace `dsh-voice`:
+
+| slot | key | where it shows |
+|---|---|---|
+| `plugins.bundle.config` | `@dr-co/dsh-voice` | a section on the plugin's own page, right above «Components» — the page a person opens first |
+| `plugins.row.config` | `@dr-co/dsh-voice#dsh-voice` | the configuration page of the row the bundle declares |
+
+The owner hands a form only to the row slot, so the card is registered with the
+settings service itself (`configForms.get('dsh-voice')`) and reads the two values
+live from there; an owner form, when the page passes one, is preferred.
 
 | control | behaviour |
 |---|---|

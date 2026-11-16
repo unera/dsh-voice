@@ -12,7 +12,8 @@ import test from 'node:test'
 
 import {
   LIMIT_DEFAULT, LIMIT_MAX, LIMIT_MIN, SPEAK_FIELD, LIMIT_FIELD,
-  availabilityOf, availabilityText, format, limitDraft, parseLimit, readValues, summaryLine, switchDisabled,
+  availabilityOf, availabilityText, formFromProps, format, limitDraft, parseLimit, readValues, summaryLine,
+  switchDisabled,
 } from '../src/client/model.js'
 import { DICTIONARIES } from '../src/client/locales.js'
 import { DEFAULT_MAX_CHARS, MAX_CHARS_LIMIT } from '../structure.mjs'
@@ -21,7 +22,7 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)))
 const t = (key) => key
 
 /** A form snapshot as the Plugins page passes it. */
-function formOf (value, { status = 'ready', writable = true } = {}) {
+function formWith (value, { status = 'ready', writable = true } = {}) {
   return { state: { status, value, writable, base: undefined, user: undefined, revision: 3 }, mutate: async () => true }
 }
 
@@ -44,17 +45,17 @@ test('the card limits are the ones the Host enforces', () => {
 })
 
 test('the form values are read with the schema default behind them', () => {
-  const ready = readValues(formOf({ [SPEAK_FIELD]: true, [LIMIT_FIELD]: 250 }))
+  const ready = readValues(formWith({ [SPEAK_FIELD]: true, [LIMIT_FIELD]: 250 }))
   assert.deepEqual(ready, { status: 'ready', writable: true, known: true, speakReplies: true, maxChars: 250 })
 
   // Nothing accepted yet, or a host that cannot answer: the card shows nothing
   // to edit rather than a guess.
-  assert.equal(readValues(formOf(undefined, { status: 'loading' })).known, false)
+  assert.equal(readValues(formWith(undefined, { status: 'loading' })).known, false)
   assert.equal(readValues(null).known, false)
-  assert.equal(readValues(formOf(undefined)).known, true)
-  assert.equal(readValues(formOf(undefined)).maxChars, LIMIT_DEFAULT)
-  assert.equal(readValues(formOf({ [LIMIT_FIELD]: 99_999 })).maxChars, LIMIT_DEFAULT, 'a value outside the range falls back')
-  assert.equal(readValues(formOf({ [SPEAK_FIELD]: false })).speakReplies, false)
+  assert.equal(readValues(formWith(undefined)).known, true)
+  assert.equal(readValues(formWith(undefined)).maxChars, LIMIT_DEFAULT)
+  assert.equal(readValues(formWith({ [LIMIT_FIELD]: 99_999 })).maxChars, LIMIT_DEFAULT, 'a value outside the range falls back')
+  assert.equal(readValues(formWith({ [SPEAK_FIELD]: false })).speakReplies, false)
 })
 
 test('the limit input is read in three distinct ways', () => {
@@ -87,8 +88,8 @@ test('a host without a synthesizer makes the switch inactive, not silent', () =>
 })
 
 test('the switch is disabled for both reasons, and only those', () => {
-  const writable = readValues(formOf({ [SPEAK_FIELD]: false }, { writable: true }))
-  const readOnly = readValues(formOf({ [SPEAK_FIELD]: false }, { writable: false }))
+  const writable = readValues(formWith({ [SPEAK_FIELD]: false }, { writable: true }))
+  const readOnly = readValues(formWith({ [SPEAK_FIELD]: false }, { writable: false }))
   assert.equal(switchDisabled(writable, { textToSpeech: true }), false)
   assert.equal(switchDisabled(writable, { textToSpeech: false }), true, 'no synthesizer, no switch')
   assert.equal(switchDisabled(writable, null), true, 'the check has not answered yet')
@@ -104,6 +105,20 @@ test('the summary line says the state and the limit', () => {
   assert.equal(format((key) => `x ${'{missing}'} y`, 'k', {}), 'x {missing} y')
 })
 
+test('formFromProps: the page form wins, the settings service is the fallback, none is none', () => {
+  const owner = { state: { status: 'ready', writable: true, value: { speakReplies: true, maxChars: 200 } }, mutate: () => 'owner' }
+  const snapshot = { status: 'ready', writable: true, value: { speakReplies: false, maxChars: 600 } }
+  const remote = () => 'settings'
+
+  assert.equal(formFromProps({ form: owner, mutateSettings: remote }, snapshot), owner, 'a row page form is preferred')
+  const fallback = formFromProps({ mutateSettings: remote }, snapshot)
+  assert.equal(fallback.state, snapshot, 'a bundle page reads the live snapshot')
+  assert.equal(fallback.mutate([{ op: 'set', path: ['speakReplies'], value: true }]), 'settings', 'writes go to the settings service')
+  assert.equal(formFromProps({}, snapshot), null, 'no page form and no action is no form')
+  assert.equal(formFromProps({ mutateSettings: remote }, undefined), null, 'an action without a snapshot is no form')
+  assert.equal(formFromProps({ form: { state: snapshot } }, undefined), null, 'a form object with no write action is no form')
+})
+
 test('the bundle registers the plugin’s own page and keeps the disabled switch', async () => {
   const bundle = await readFile(join(root, 'lib/client.js'), 'utf8')
   assert.match(bundle, /window\.__ModuleLoader__\.load\(\{/u)
@@ -114,9 +129,13 @@ test('the bundle registers the plugin’s own page and keeps the disabled switch
   // consults the availability has no reason to exist.
   assert.match(bundle, /switchDisabled/u)
 
+  // Both placements, as data: the plugin's page (keyed by the package) and its row
+  // page (keyed by package and row id).
+  assert.match(bundle, /plugins\.bundle\.config/u)
+  assert.match(bundle, /@dr-co\/dsh-voice#dsh-voice/u)
   const source = await readFile(join(root, 'src/client/index.js'), 'utf8')
-  assert.match(source, /name: 'plugins\.row\.config'/u)
-  assert.match(source, /key: SECTION_KEY/u)
+  assert.match(source, /\['plugins\.bundle\.config', BUNDLE_SECTION_KEY\]/u)
+  assert.match(source, /\['plugins\.row\.config', SECTION_KEY\]/u)
   assert.match(source, /locale: NS/u)
 })
 

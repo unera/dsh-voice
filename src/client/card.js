@@ -15,12 +15,14 @@ import { createElement as h, useEffect, useState } from 'react'
 import { getState } from './api.js'
 import {
   LIMIT_FIELD, LIMIT_MAX, LIMIT_MIN, LIMIT_DEFAULT, SPEAK_FIELD,
-  availabilityOf, availabilityText, format, limitDraft, parseLimit, readValues, summaryLine, switchDisabled,
+  availabilityOf, availabilityText, formFromProps, format, limitDraft, parseLimit, readValues, summaryLine,
+  switchDisabled,
 } from './model.js'
 
 export {
   LIMIT_FIELD, LIMIT_MAX, LIMIT_MIN, LIMIT_DEFAULT, SPEAK_FIELD,
-  availabilityOf, availabilityText, format, limitDraft, parseLimit, readValues, summaryLine, switchDisabled,
+  availabilityOf, availabilityText, formFromProps, format, limitDraft, parseLimit, readValues, summaryLine,
+  switchDisabled,
 }
 
 /** A field label and its control, in the page's own styling. */
@@ -56,13 +58,17 @@ function useAvailability () {
 /**
  * The card.
  *
- * @param props - `{view, form, t}` from the Plugins page.
+ * @param props - `{view, form, t}` from the Plugins page, plus the entry's own
+ *   `{useVoiceSettings, mutateSettings}` where the page hands no form.
  * @returns the summary or the page, or null when the page has nothing to show.
  */
 export function VoiceSettingsView (props) {
   const view = props?.view === 'summary' ? 'summary' : 'page'
   const t = typeof props?.t === 'function' ? props.t : (key) => key
-  const form = props?.form ?? null
+  // The condition is fixed per registration — a bundle page never grows an owner
+  // form and a row page always has one — so the hook order is stable.
+  const live = typeof props?.useVoiceSettings === 'function' ? props.useVoiceSettings() : undefined
+  const form = formFromProps(props, live)
   const values = readValues(form)
 
   if (view === 'summary') return h('span', null, summaryLine(t, values))
