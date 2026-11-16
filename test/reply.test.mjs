@@ -147,7 +147,10 @@ test('the prompt section follows the switch and the limit', async (t) => {
   const section = host.sections.find((entry) => entry.name === 'dsh-voice:spoken-reply-contract')
   assert.ok(section, 'the section is registered even while the switch is off')
   assert.equal(section.order, 118)
-  assert.equal(section.text(), '', 'off means the model is told nothing')
+  // The format is taught whether or not voicing is on: otherwise the model cannot
+  // produce a document, and the switch is the second thing a person touches.
+  assert.match(section.text(), /^---$/mu, 'the format is shown while the switch is off')
+  assert.match(section.text(), /Озвучка сейчас выключена/u, 'and the text says so')
 
   const live = stubHost()
   const config = { speakReplies: true, maxChars: 120 }
@@ -159,7 +162,9 @@ test('the prompt section follows the switch and the limit', async (t) => {
   assert.match(text, /как есть/u)
 
   config.speakReplies = false
-  assert.equal(live.sections[0].text(), '')
+  // Turning voicing off does not erase the contract: the model must still know
+  // how to write a spoken answer, and the text now says it will not sound.
+  assert.match(live.sections[0].text(), /Озвучка сейчас выключена/u)
 })
 
 test('an answer without markers is passed through with no sound at all', async (t) => {

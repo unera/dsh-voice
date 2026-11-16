@@ -427,8 +427,12 @@ export function installReply (ctx, { config = {}, logger = null, service: engine
       text: () => {
         try {
           const settings = settingsNow()
-          if (!settings.speakReplies || !settings.prompt) return ''
-          return replyContract({ maxChars: settings.maxChars })
+          if (!settings.prompt) return ''
+          // The contract is shown whether or not the switch is on: a model that
+          // only learns the format after the switch flips can never produce one,
+          // and the switch is exactly what a person reaches for second. The text
+          // itself says what happens while voicing is off.
+          return replyContract({ maxChars: settings.maxChars, enabled: settings.speakReplies })
         } catch {
           return ''
         }

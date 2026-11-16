@@ -123,7 +123,10 @@ export function parseVoiceDocument (answer) {
  * @param options.maxChars - the limit the plugin will enforce.
  * @returns the text of the system-prompt section.
  */
-export function replyContract ({ maxChars = DEFAULT_MAX_CHARS } = {}) {
+export function replyContract ({ maxChars = DEFAULT_MAX_CHARS, enabled = true } = {}) {
+  const state = enabled
+    ? 'Озвучка сейчас включена: первая часть действительно уйдёт голосом.'
+    : 'Озвучка сейчас выключена: формат остаётся допустимым ответом, но звука не будет, пока её не включат на странице плагина.'
   return `## Ответ голосом
 
 Ответ, который должен прозвучать, оформляется ровно так — тремя маркерами:
@@ -137,5 +140,6 @@ export function replyContract ({ maxChars = DEFAULT_MAX_CHARS } = {}) {
 - первая непустая строка — \`---\`; ниже то, что произносят; затем ещё одна строка \`---\`; затем остальной текст; последняя непустая строка — \`...\`;
 - первая часть — не длиннее ${maxChars} символов, без markdown, ссылок и блоков кода;
 - обе части непустые; при любом отклонении от формата звука не будет — ответ уйдёт как есть;
-- маркеры остаются в ответе, их видит человек.`
+- маркеры остаются в ответе, их видит человек;
+- ${state}`
 }
