@@ -73,7 +73,12 @@ function positive (value, fallback) {
  *   an integer: a clamp would change what the owner asked for without saying so.
  */
 export function maxCharsSetting (value) {
-  if (value === undefined || value === null) return DEFAULT_MAX_CHARS
+  // The settings service hands back an empty object for a volatile field that has
+  // no saved value yet; that is a placeholder, not something a person typed, and
+  // treating it as an error stopped the whole plugin from mounting.
+  const unset = value === undefined || value === null
+    || (typeof value === 'object' && value !== null && Object.keys(value).length === 0)
+  if (unset) return DEFAULT_MAX_CHARS
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > MAX_CHARS_LIMIT) {
     throw new RangeError(
       `dsh-voice: maxChars должен быть целым числом от 1 до ${MAX_CHARS_LIMIT}, получено ${JSON.stringify(value)}`,

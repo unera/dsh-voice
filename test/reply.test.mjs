@@ -487,3 +487,11 @@ test('a host without a settings service still speaks', async () => {
   assert.doesNotThrow(() => installVoiceReply(host, { speakReplies: true }))
   assert.ok(listenerOf(host), 'the hook is mounted all the same')
 })
+
+test('a volatile field with no saved value mounts instead of failing', () => {
+  // The settings service answers `{}` for a volatile field nobody has set yet.
+  // Treating that as a bad number stopped dsh-voice from mounting at all.
+  const settings = normalizeReplySettings({ speakReplies: false, maxChars: {} })
+  assert.equal(settings.maxChars, 600)
+  assert.equal(settings.speakReplies, false)
+})

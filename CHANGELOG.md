@@ -5,6 +5,13 @@ All notable changes to this package are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-11-16
+
+### Fixed
+- A volatile setting with no saved value arrives as an empty object, and the range
+  check treated it as a bad number: the plugin then failed to mount, taking the
+  whole voice loop down. It now reads as unset and falls back to the default.
+
 ## [0.3.0] - 2026-11-16
 
 The host can now speak a text chat by itself, and the plugin it was meant to be
