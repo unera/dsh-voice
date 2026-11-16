@@ -158,8 +158,8 @@ export function normalizeReplySettings (config = {}) {
     ? speedValue
     : null
   return {
-    // `DSH_VOICE_SPEAK_REPLIES=1` is the escape hatch for a Host whose settings card
-    // cannot be reached: the switch is the same switch, only the way in is a shell.
+    // What the answer sounds like is decided by the markup; this switch only takes
+    // the sound away.
     // One switch: the markup stays in the answer and the plugin ignores it. A
     // marked answer is spoken without any switch at all.
     mute: mute === true,

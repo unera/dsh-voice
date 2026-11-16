@@ -110,7 +110,6 @@ async function speak (t, { settleMs, copyMs, hashMs, withChannel = true } = {}) 
   })
   const host = stubHost({ logger: fakeLogger() })
   const config = {
-    speakReplies: true,
     ...(settleMs === undefined ? {} : { settleMs }),
     deps: { probe: { dir } },
   }

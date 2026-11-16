@@ -75,7 +75,7 @@ function captureWarnings () {
 }
 
 /** A client context stand-in: slots, locale, effects and the settings service. */
-function clientContext (form = settingsController({ speakReplies: false, maxChars: 600 })) {
+function clientContext (form = settingsController({ mute: false, maxChars: 600 })) {
   const registered = []
   const effects = []
   const dictionaries = []
@@ -196,7 +196,7 @@ test('mounting registers the card on the bundle page and on the row page', async
 
 test('the card takes the row page form when the page hands one', async () => {
   const { module } = await loadBundle()
-  const page = settingsController({ speakReplies: false, maxChars: 600 })
+  const page = settingsController({ mute: false, maxChars: 600 })
   const ctx = clientContext(page)
   module.apply(ctx)
   const face = faceFor(ctx, 'plugins.row.config')
