@@ -105,17 +105,20 @@ test('the summary line says the state and the limit', () => {
   assert.equal(format((key) => `x ${'{missing}'} y`, 'k', {}), 'x {missing} y')
 })
 
-test('formFromProps: the page form wins, the settings service is the fallback, none is none', () => {
+test('formFromProps: the page form wins, the registered scope is the fallback, none is none', () => {
   const owner = { state: { status: 'ready', writable: true, value: { speakReplies: true, maxChars: 200 } }, mutate: () => 'owner' }
   const snapshot = { status: 'ready', writable: true, value: { speakReplies: false, maxChars: 600 } }
-  const remote = () => 'settings'
+  const writes = []
+  const scope = { getSnapshot: () => snapshot, subscribe: () => () => {}, mutate: (...ops) => { writes.push(ops); return 'settings' } }
 
-  assert.equal(formFromProps({ form: owner, mutateSettings: remote }, snapshot), owner, 'a row page form is preferred')
-  const fallback = formFromProps({ mutateSettings: remote }, snapshot)
+  assert.equal(formFromProps({ form: owner, scope }, snapshot), owner, 'a row page form is preferred')
+  const fallback = formFromProps({ scope }, snapshot)
   assert.equal(fallback.state, snapshot, 'a bundle page reads the live snapshot')
   assert.equal(fallback.mutate([{ op: 'set', path: ['speakReplies'], value: true }]), 'settings', 'writes go to the settings service')
-  assert.equal(formFromProps({}, snapshot), null, 'no page form and no action is no form')
-  assert.equal(formFromProps({ mutateSettings: remote }, undefined), null, 'an action without a snapshot is no form')
+  assert.deepEqual(writes, [[[{ op: 'set', path: ['speakReplies'], value: true }], undefined]], 'and carry no revision of their own')
+  assert.equal(formFromProps({}, snapshot), null, 'no page form and no scope is no form')
+  assert.equal(formFromProps({ scope }, undefined), null, 'a scope without a snapshot is no form')
+  assert.equal(formFromProps({ scope: { getSnapshot: () => snapshot } }, snapshot), null, 'a scope with no write action is no form')
   assert.equal(formFromProps({ form: { state: snapshot } }, undefined), null, 'a form object with no write action is no form')
 })
 
@@ -124,7 +127,10 @@ test('the bundle registers the plugin’s own page and keeps the disabled switch
   assert.match(bundle, /window\.__ModuleLoader__\.load\(\{/u)
   assert.match(bundle, /id: "@dr-co\/dsh-voice"/u)
   assert.match(bundle, /plugins\.row\.config/u)
-  assert.match(bundle, /@dr-co\/dsh-voice#dsh-voice/u)
+  // The row key is package plus row id, spelled from the two constants rather than
+  // typed twice: a literal here would drift from the package name.
+  assert.match(bundle, /var PACKAGE = "@dr-co\/dsh-voice"/u)
+  assert.ok(bundle.includes('var SECTION_KEY = `${PACKAGE}#${ENTRY}`'), 'the row key is built from the package and the entry id')
   // The decision itself, not a hardcoded attribute: a disabled switch that never
   // consults the availability has no reason to exist.
   assert.match(bundle, /switchDisabled/u)
@@ -132,7 +138,7 @@ test('the bundle registers the plugin’s own page and keeps the disabled switch
   // Both placements, as data: the plugin's page (keyed by the package) and its row
   // page (keyed by package and row id).
   assert.match(bundle, /plugins\.bundle\.config/u)
-  assert.match(bundle, /@dr-co\/dsh-voice#dsh-voice/u)
+  assert.match(bundle, /var BUNDLE_SECTION_KEY = PACKAGE/u)
   const source = await readFile(join(root, 'src/client/index.js'), 'utf8')
   assert.match(source, /\['plugins\.bundle\.config', BUNDLE_SECTION_KEY\]/u)
   assert.match(source, /\['plugins\.row\.config', SECTION_KEY\]/u)

@@ -205,8 +205,11 @@ page, both pointing at the same settings namespace `dsh-voice`:
 | `plugins.row.config` | `@dr-co/dsh-voice#dsh-voice` | the configuration page of the row the bundle declares |
 
 The owner hands a form only to the row slot, so the card is registered with the
-settings service itself (`configForms.get('dsh-voice')`) and reads the two values
-live from there; an owner form, when the page passes one, is preferred.
+settings service itself: `configForms.get('dsh-voice')` is read **once**, at mount,
+and the controller travels to the card as its `scope` prop, which the card
+subscribes to with `useSyncExternalStore`. An owner form, when the page passes one,
+is preferred. Every early return of the client entry writes a `[dsh-voice]` line to
+the browser console naming the reason, so a card that does not appear says why.
 
 | control | behaviour |
 |---|---|

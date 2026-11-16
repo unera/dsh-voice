@@ -13,11 +13,15 @@ import test from 'node:test'
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
 
-/** The two React powers the card uses, reduced to plain data. */
+/** The React powers the card uses, reduced to plain data. */
 const react = {
   createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
   useEffect: () => {},
   useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
+  useMemo: (factory) => factory(),
+  useCallback: (fn) => fn,
+  // A render, not a subscription: the card reads the store's current snapshot.
+  useSyncExternalStore: (subscribe, read) => read(),
 }
 
 /** Load `lib/client.js` and return its exports. */
@@ -56,6 +60,18 @@ function settingsController (value, { status = 'ready', writable = true } = {}) 
       for (const listener of [...listeners]) listener()
     },
   }
+}
+
+/**
+ * Collect the console lines `apply` writes, so a test can assert the reason.
+ *
+ * @returns `{warnings, restore}`; `restore` must run even when the assertion fails.
+ */
+function captureWarnings () {
+  const warnings = []
+  const warn = console.warn
+  console.warn = (...args) => { warnings.push(args.map(String).join(' ')) }
+  return { warnings, restore () { console.warn = warn } }
 }
 
 /** A client context stand-in: slots, locale, effects and the settings service. */
@@ -152,10 +168,15 @@ test('mounting registers the card on the bundle page and on the row page', async
     assert.equal(page.view, module.VoiceSettingsView)
     const face = page.options.inject()
     assert.equal(face.t('title'), 't:title', 'the card travels with its translator')
-    assert.equal(typeof face.mutateSettings, 'function', 'and with the settings write action')
-    assert.equal(typeof face.hooks.voiceSettings.getSnapshot, 'function')
-    assert.equal(typeof face.hooks.voiceSettings.subscribe, 'function')
+    assert.equal(face.scope, ctx.form, 'and with the settings store itself, not a hook the host may not have')
+    assert.equal(typeof face.scope.getSnapshot, 'function')
+    assert.equal(typeof face.scope.subscribe, 'function')
+    assert.equal(face.hooks, undefined, 'no hook face: the host has no such injection')
+    assert.equal(face.mutateSettings, undefined, 'and no write action of its own')
   }
+
+  // One read of the store for the whole page, not one per render.
+  assert.deepEqual(ctx.asked, ['dsh-voice'])
 
   // All three dictionaries are handed to the locale service, English first.
   assert.deepEqual(ctx.dictionaries.map((item) => item.id), ['en', 'ru', 'zh'])
@@ -181,14 +202,9 @@ test('without an owner form the card still shows its controls from the settings 
   module.apply(ctx)
   const face = faceFor(ctx, 'plugins.bundle.config')
 
-  // Exactly what the Plugins page passes a bundle-config entry: the view, and no form.
-  const live = { getSnapshot: face.hooks.voiceSettings.getSnapshot, subscribe: face.hooks.voiceSettings.subscribe }
-  const props = {
-    view: 'page',
-    t: face.t,
-    mutateSettings: face.mutateSettings,
-    useVoiceSettings: (selector = (snapshot) => snapshot) => selector(live.getSnapshot()),
-  }
+  // Exactly what the Plugins page passes a bundle-config entry: the view, the
+  // translator, and the store — and no owner form.
+  const props = { view: 'page', t: face.t, scope: face.scope }
   const tree = pageOf(module, props)
   assert.notEqual(tree.type, 'p', 'the card is a card, not the "form unavailable" line')
 
@@ -207,15 +223,41 @@ test('without an owner form the card still shows its controls from the settings 
   assert.deepEqual(settings.writes, [{ ops: [{ op: 'set', path: ['speakReplies'], value: false }], revision: undefined }])
 })
 
-test('a host without a settings form says so instead of drawing a dead switch', async () => {
+test('a host whose settings service has no form warns and registers no card', async () => {
   const { module } = await loadBundle()
-  const ctx = clientContext()
-  module.apply(ctx)
-  const face = faceFor(ctx, 'plugins.bundle.config')
+  const ctx = clientContext(null)
+  const captured = captureWarnings()
+  try {
+    module.apply(ctx)
+  } finally {
+    captured.restore()
+  }
 
-  const tree = pageOf(module, { view: 'page', t: face.t, mutateSettings: face.mutateSettings })
+  assert.deepEqual(ctx.registered, [], 'nothing is registered without a store')
+  const lines = captured.warnings.join('\n')
+  assert.match(lines, /configForms\.get\('dsh-voice'\) вернул пусто/u, 'the console names the missing store')
+  assert.match(lines, /client apply: старт/u, 'and shows that the bundle did mount')
+
+  // A card rendered without any kind of form still says so instead of drawing a
+  // dead switch.
+  const tree = pageOf(module, { view: 'page', t: (key) => `t:${key}` })
   assert.equal(tree.type, 'p', 'the page says the form is unavailable')
   assert.equal(tree.children.join(''), 't:form.unavailable')
+})
+
+test('a settings service that throws is reported, not swallowed', async () => {
+  const { module } = await loadBundle()
+  const ctx = clientContext()
+  ctx.configForms.get = () => { throw new Error('inactive context') }
+  const captured = captureWarnings()
+  try {
+    module.apply(ctx)
+  } finally {
+    captured.restore()
+  }
+
+  assert.deepEqual(ctx.registered, [])
+  assert.match(captured.warnings.join('\n'), /configForms\.get\('dsh-voice'\) упал: inactive context/u)
 })
 
 test('the summary view renders the state the form holds', async () => {

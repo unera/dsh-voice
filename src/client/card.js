@@ -10,7 +10,7 @@
 // The pure functions below are the card's behaviour and are tested directly; the
 // components are a thin paint over them.
 
-import { createElement as h, useEffect, useState } from 'react'
+import { createElement as h, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react'
 
 import { getState } from './api.js'
 import {
@@ -56,19 +56,44 @@ function useAvailability () {
 }
 
 /**
+ * The settings snapshot of the form this card was handed.
+ *
+ * One subscription for the whole card, through the store the entry was registered
+ * with: `useSyncExternalStore` is what makes a value written elsewhere — another
+ * page, another tab — reach this card without a reload. A card without a store
+ * still renders (the row page may hand its own form instead); it then reads the
+ * one snapshot its path gets and subscribes to nothing.
+ *
+ * @param scope - the settings controller, or undefined.
+ * @returns the current snapshot, or null.
+ */
+function useScopeSnapshot (scope) {
+  const subscribe = useMemo(
+    () => (typeof scope?.subscribe === 'function' ? (listener) => scope.subscribe(listener) : () => {}),
+    [scope],
+  )
+  const read = useCallback(
+    () => (typeof scope?.getSnapshot === 'function' ? scope.getSnapshot() : null),
+    [scope],
+  )
+  return useSyncExternalStore(subscribe, read, read)
+}
+
+/**
  * The card.
  *
- * @param props - `{view, form, t}` from the Plugins page, plus the entry's own
- *   `{useVoiceSettings, mutateSettings}` where the page hands no form.
- * @returns the summary or the page, or null when the page has nothing to show.
+ * @param props - `{view, t, scope}` from the entry's own `inject` face, plus the
+ *   owner `{state, mutate}` a row page hands over.
+ * @returns the summary or the page, or the "form unavailable" line when this host
+ *   offers nothing to write.
  */
 export function VoiceSettingsView (props) {
   const view = props?.view === 'summary' ? 'summary' : 'page'
   const t = typeof props?.t === 'function' ? props.t : (key) => key
-  // The condition is fixed per registration — a bundle page never grows an owner
-  // form and a row page always has one — so the hook order is stable.
-  const live = typeof props?.useVoiceSettings === 'function' ? props.useVoiceSettings() : undefined
-  const form = formFromProps(props, live)
+  // Called unconditionally: a hook that appears only on some renders changes the
+  // hook order between them, and React fails the whole subtree.
+  const snapshot = useScopeSnapshot(props?.scope)
+  const form = formFromProps(props, snapshot)
   const values = readValues(form)
 
   if (view === 'summary') return h('span', null, summaryLine(t, values))

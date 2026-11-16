@@ -5,6 +5,19 @@ All notable changes to this package are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-11-16
+
+### Fixed
+- The settings card is registered the way the working `@dr-co/dsh-graceful-restart` card is:
+  `configForms.get('dsh-voice')` is read **once**, at mount, and the controller travels to the
+  card as the `scope` prop, which the card subscribes to with `useSyncExternalStore`. The old
+  registration handed the entry a `hooks.voiceSettings` face and looked the form up lazily per
+  read — a shape this Host has no injection for, and a section that did not render.
+- Every early return of the client entry, and the entry itself, now writes a `[dsh-voice]` line
+  to the browser console naming the reason (no settings service, a throwing `configForms.get`,
+  a controller without `getSnapshot`/`subscribe`, missing slots). A card that does not appear
+  is a sentence in the console instead of an absence nobody can explain.
+
 ## [0.4.1] - 2026-11-16
 
 ### Added

@@ -8,14 +8,20 @@
 // One card, two placements, both on Settings → Plugins → @dr-co/dsh-voice:
 //
 // - `plugins.bundle.config`, keyed by this package, renders the card as a section
-//   of the plugin's own page — the page a person opens first. The owner passes no
-//   form to that slot, so the card reads the settings service itself.
+//   of the plugin's own page — the page a person opens first.
 // - `plugins.row.config`, keyed by this package and the row it declares, renders
-//   the same card as the row's configuration page; that slot does hand a form over.
+//   the same card as the row's configuration page.
 //
-// Either way the values come from the settings service: `speakReplies` and
-// `maxChars` are volatile configuration, and the card never keeps a copy of a
-// value it could disagree with the Host about.
+// The settings form is the host's own: `configForms.get(entry)` is read ONCE, at
+// mount, and the resulting controller travels to the card as the `scope` prop —
+// the same shape `@dr-co/dsh-graceful-restart` uses. The card subscribes to it
+// with `useSyncExternalStore` and never keeps a copy of a value it could disagree
+// with the host about. A page that hands the entry its own owner form still wins:
+// that form is the one the host is rendering.
+//
+// Nothing here may fail silently. Every early return writes a `[dsh-voice]` line
+// to the browser console naming the reason: a card that does not appear must be a
+// sentence in the console rather than an absence nobody can explain.
 
 import { VoiceSettingsPage, VoiceSettingsView } from './card.js'
 import { DICTIONARIES, NS } from './locales.js'
@@ -27,11 +33,20 @@ export {
   switchDisabled,
 } from './card.js'
 
-/** The Loader entry id of this plugin — and therefore its settings namespace. */
-export const SETTINGS_NAMESPACE = 'dsh-voice'
+/** The npm package name: the key a bundle's own page addresses this plugin by. */
+export const PACKAGE = '@dr-co/dsh-voice'
+
+/**
+ * The Loader entry id of this plugin — the id the settings service knows it by,
+ * and therefore the id whose form the card reads.
+ */
+export const ENTRY = 'dsh-voice'
+
+/** The settings namespace of this plugin: where its keys live in the document. */
+export const SETTINGS_NAMESPACE = ENTRY
 
 /** The key of the row's configuration page: `<package name>#<row id>`. */
-export const SECTION_KEY = '@dr-co/dsh-voice#dsh-voice'
+export const SECTION_KEY = `${PACKAGE}#${ENTRY}`
 
 /**
  * The key of the section on the plugin's own page: the package name.
@@ -40,7 +55,7 @@ export const SECTION_KEY = '@dr-co/dsh-voice#dsh-voice'
  * the Plugins page renders it whenever this package is configured — which it is,
  * as soon as this client bundle is mounted.
  */
-export const BUNDLE_SECTION_KEY = '@dr-co/dsh-voice'
+export const BUNDLE_SECTION_KEY = PACKAGE
 
 /** Order among the rows' configuration pages; no neighbour is close. */
 export const SECTION_ORDER = 40
@@ -56,34 +71,10 @@ const PLACEMENTS = [
   ['plugins.row.config', SECTION_KEY],
 ]
 
-/**
- * What the card is handed besides the page's owner props.
- *
- * `t` travels with the entry: the page passes owner props only, and a card that
- * renders keys is a card nobody read.
- *
- * `hooks`/`mutateSettings` are the settings service's own form, read live. A row
- * page hands the entry `{state, mutate}` and that is preferred; a bundle page
- * hands nothing at all, so without this the card had no values to show and could
- * only say "the form is unavailable". The controller is fetched per call because
- * the card mounts before the settings mirror has finished loading.
- *
- * @param ctx - client root context with the `configForms` service.
- * @param t - the bound translate function.
- * @returns the injected props of one placement.
- */
-function cardFace (ctx, t) {
-  const form = () => ctx.configForms.get(SETTINGS_NAMESPACE)
-  return {
-    t,
-    mutateSettings: (ops, revision) => form().mutate(ops, revision),
-    hooks: {
-      voiceSettings: {
-        getSnapshot: () => form().getSnapshot(),
-        subscribe: (listener) => form().subscribe(listener),
-      },
-    },
-  }
+/** Every line this module writes starts with the plugin's name. */
+function say (message, detail) {
+  // eslint-disable-next-line no-console
+  console.warn(`[dsh-voice] ${message}`, ...(detail === undefined ? [] : [detail]))
 }
 
 // Declared, not grabbed: without this the host refuses the property access itself
@@ -107,10 +98,40 @@ function safeMount (ctx, label, run) {
     run()
     return true
   } catch (error) {
-    // eslint-disable-next-line no-console
-    console.warn(`[dsh-voice] ${label} не смонтирован: ${error?.message ?? error}`)
+    say(`${label} не смонтирован: ${error?.message ?? error}`)
     return false
   }
+}
+
+/**
+ * Read the settings form of this plugin, once, at mount.
+ *
+ * A host without the settings service, an id the service does not know, and a
+ * controller that cannot be subscribed to are three different failures, and each
+ * one has its own sentence: the person reading the console should not have to
+ * guess which one happened.
+ *
+ * @param ctx - client root context.
+ * @returns the controller, or `null` when the card cannot be built here.
+ */
+function readScope (ctx) {
+  let scope = null
+  try {
+    scope = ctx.configForms.get(ENTRY)
+  } catch (error) {
+    say(`configForms.get('${ENTRY}') упал: ${error?.message ?? error}`)
+    return null
+  }
+  if (!scope) {
+    say(`configForms.get('${ENTRY}') вернул пусто: форма настроек этого плагина не найдена`)
+    return null
+  }
+  const missing = ['getSnapshot', 'subscribe'].filter((name) => typeof scope[name] !== 'function')
+  if (missing.length > 0) {
+    say(`форма настроек '${ENTRY}' не годится в стор: нет ${missing.join(', ')}`)
+    return null
+  }
+  return scope
 }
 
 /**
@@ -120,12 +141,19 @@ function safeMount (ctx, label, run) {
  * @returns nothing; failures are reported and the rest still mounts.
  */
 export function apply (ctx) {
+  // The first line of the trace: seeing it in the console means the host loaded
+  // this bundle and called `apply`, so a missing card is a later failure.
+  say('client apply: старт', {
+    package: PACKAGE,
+    entry: ENTRY,
+    services: ['slots', 'locale', 'configForms'].filter((name) => ctx?.[name] !== undefined),
+  })
+
   let t = (key) => key
   try {
     t = ctx.locale.bind(NS)
   } catch (error) {
-    // eslint-disable-next-line no-console
-    console.warn(`[dsh-voice] locale недоступна, показываю ключи: ${error?.message ?? error}`)
+    say(`locale недоступна, показываю ключи: ${error?.message ?? error}`)
   }
 
   safeMount(ctx, 'dictionaries', () => {
@@ -152,9 +180,13 @@ export function apply (ctx) {
     })
   }
 
-  // One face, built once: the renderer caches its hook by source identity, and a
-  // fresh object per render would resubscribe the card on every paint.
-  const face = cardFace(ctx, t)
+  if (typeof ctx?.slots?.inject !== 'function' || typeof ctx.slots.register !== 'function') {
+    say('слоты недоступны: ctx.slots.inject/register отсутствуют, карточка не зарегистрирована')
+    return
+  }
+
+  const scope = readScope(ctx)
+  if (!scope) return
 
   for (const [name, key] of PLACEMENTS) {
     safeMount(ctx, name, () => {
@@ -167,11 +199,14 @@ export function apply (ctx) {
             // Without `locale` the host does not inject `t` and the card draws keys.
             locale: NS,
             label: () => t('title'),
-            inject: () => face,
+            // The store travels as one prop, read once above: the card owns no
+            // path back to the settings service and cannot ask for a form twice.
+            inject: () => ({ t, scope }),
           },
           VoiceSettingsView,
         ),
       )
+      say(`карточка зарегистрирована: ${name} key=${key}`)
     })
   }
 }

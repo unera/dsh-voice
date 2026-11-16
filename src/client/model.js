@@ -55,21 +55,22 @@ export function readValues (form) {
  * The form the card edits.
  *
  * Two placements, two ways in: a row page hands its entry `{state, mutate}`, while
- * a bundle page hands nothing, so the card is also registered with the settings
- * service's own live snapshot and write action. The page's own form wins when both
- * are present — it is the one the host is rendering.
+ * a bundle page hands nothing, so the entry is registered with the settings
+ * service's own controller as its `scope` and the card writes through that. The
+ * page's own form wins when both are present — it is the one the host is
+ * rendering.
  *
- * @param props - the card's props: `{form}` from the owner, `{mutateSettings}`
- *   and `{useVoiceSettings}` from the entry itself.
- * @param snapshot - the live settings snapshot, when the entry's hook has one.
+ * @param props - the card's props: `{form}` from the owner, `{scope}` from the
+ *   entry's own inject face.
+ * @param snapshot - the live settings snapshot, read from `scope` by the card.
  * @returns `{state, mutate}`, or `null` when this host offers no form at all.
  */
 export function formFromProps (props, snapshot) {
   const owner = props?.form
   if (owner !== null && typeof owner === 'object' && typeof owner.mutate === 'function') return owner
-  const mutate = props?.mutateSettings
-  if (typeof mutate !== 'function' || snapshot === undefined || snapshot === null) return null
-  return { state: snapshot, mutate: (...ops) => mutate(...ops) }
+  const scope = props?.scope
+  if (typeof scope?.mutate !== 'function' || snapshot === undefined || snapshot === null) return null
+  return { state: snapshot, mutate: (ops, revision) => scope.mutate(ops, revision) }
 }
 
 /**
