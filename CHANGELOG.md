@@ -5,6 +5,57 @@ All notable changes to this package are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-11-16
+
+The cache is no longer divided with another plugin: a recording is copied into our own directory,
+and the voice loop works with the copy alone.
+
+### Changed
+
+Every item below breaks a host that relied on 0.1.x: a recording is no longer kept, the setting
+that decided it is gone, exchanges are no longer serialised and a repeated `id` is no longer
+deduplicated.
+
+- **A copy instead of reading in place.** The path in `dsh-nodes/voice` still names a file under
+  `<cacheDir>/incoming/`, but the loop no longer reads or keeps it: the file is copied to
+  `<cacheDir>/work/<run>/<id>.wav`, the original is removed **right after the copy** — before
+  recognition, so a crash in the middle of an exchange cannot leave another plugin's file on disk
+  — and only the copy is read. The copy is removed as soon as it has been read. The pull path
+  copies straight into `work/<run>/` with `files.copyFromDevice`; nothing is written into
+  `incoming/` by this plugin any more.
+- **The path guard is simpler.** It used to ask "is this inside this run's `incoming/<run>/<node>/`",
+  and had to know both layouts. Now it asks one question: is the path inside `<cacheDir>/incoming/`,
+  any layout below it. That is the whole boundary, because the file is ours to delete: the cache
+  root (`sessions.json`), `out/` (the answers waiting for the device) and a host file reached
+  through a symlink are still refused whole with `reason=refused-path`. A copy needs no check at
+  all — it is our own file.
+- **`keepRecording` is gone, with everything that implemented it.** No `last`, no `none`, no
+  `pruneRecordings`, no thinning of the node directories by age, no "keep the newest take". The
+  setting is removed from the config, from `index.mjs` and from the README. In its place the loop
+  sweeps its own trees — `work/` and `out/` — at start and then once a day, removing every file
+  older than an hour and the directories it leaves empty. That is insurance against a crash in
+  the middle of an exchange and nothing else: there is no retention window, and a recording can
+  no longer be listened to afterwards.
+- **The queue is gone.** Two exchanges on one device no longer serialise: `enqueue` is removed
+  from both paths, and with it the per-node chain map. **The order of answers is no longer
+  guaranteed** — a slow turn does not hold the next one, and two answers may arrive in either
+  order. The owner accepted this: waiting behind a turn that can take three minutes was worse.
+- **Deduplication is gone.** No `seen`, no `inFlight`, no `rememberId`, no `SEEN_LIMIT`, and no
+  `already` status: a repeat of the same `id` is simply a second exchange. When the link is
+  flaky the model answers twice or does not answer at all, and both are accepted — a retry
+  swallowed as "already answered" loses the person's words.
+
+### Unchanged
+
+- the session and its binding (`sessions.json`), and creating a new session;
+- the transcript reaching the device as `voice.chat` with `role: user` **before** the model's
+  answer;
+- `markup.mjs` reply parsing, synthesis, the single `voice.answer` command, `degraded`;
+- the trace and its stages;
+- every refusal said out loud: no recording, no recognizer, a timeout, a session that could not
+  be created;
+- the `out/` sweep of orphaned answers.
+
 ## [0.1.23] - 2026-11-16
 
 ### Fixed
