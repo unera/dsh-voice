@@ -225,6 +225,10 @@ export function matchNodeSegment (path, cacheDir, segments, runId) {
   for (const segment of segments) {
     if (typeof segment !== 'string' || !segment) continue
     if (underReal(path, nodeDir(cacheDir, segment, runId))) return segment
+    // `dsh-nodes` writes the recording itself and knows nothing about our run id, so its
+    // layout is `<incoming>/<node>/`. Both layouts are genuine: refusing the other one is
+    // how the voice chat went silent twice.
+    if (underReal(path, nodeDir(cacheDir, segment))) return segment
   }
   return null
 }
@@ -264,6 +268,9 @@ export function runOutputDir (cacheDir, runId) {
  */
 export function nodeDir (cacheDir, nodeName, runId) {
   const safe = String(nodeName ?? '').replace(/[^A-Za-z0-9._-]/g, '_') || '_'
+  // Without a run there is no run segment: that is the layout `dsh-nodes` writes, and the
+  // guard has to understand it as well as our own.
+  if (runId === undefined || runId === null || runId === '') return join(cacheDir, INCOMING_DIR, safe)
   return join(runIncomingDir(cacheDir, runId), safe)
 }
 

@@ -2270,3 +2270,20 @@ test('a recording in the node-number directory is accepted and pruned there', as
   assert.equal(delivered.length, 1)
   assert.equal(existsSync(path), true, 'keepRecording: last keeps the take that was just used')
 })
+
+test('a recording the host wrote outside our run directory is still ours', async () => {
+  // `dsh-nodes` writes `<incoming>/<node>/<id>.wav` and knows nothing about the voice loop's
+  // run id. Two layouts are both real; refusing the other one is how the chat went silent.
+  const { loop, dir, delivered } = makeLoop({
+    keepRecording: 'last',
+    speechToText: { resolve: (r) => r, transcribe: async () => ({ text: 'привет' }) },
+  })
+  const id = 'plain-layout-1'
+  const path = join(dir, 'voice', 'incoming', '19', `${id}.wav`)
+  mkdirSync(dirname(path), { recursive: true })
+  writeFileSync(path, Buffer.alloc(3200))
+
+  const outcome = await loop.handleUpload({ node: 19, nodeName: 'Телефон', id, path, seconds: 1 })
+  assert.equal(outcome.status, 'delivered', 'the layout dsh-nodes writes must be accepted')
+  assert.equal(delivered.length, 1)
+})

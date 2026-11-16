@@ -1,6 +1,6 @@
 {
   "name": "@dr-co/dsh-voice",
-  "version": "0.1.21",
+  "version": "0.1.22",
   "description": "A spoken turn for DeepSeek Harness: the voice loop that turns a device recording into a chat answer the phone can speak, the input marker and the reply contract.",
   "type": "module",
   "main": "./index.mjs",
