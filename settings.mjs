@@ -59,6 +59,12 @@ export function defaultCacheDir (env = process.env, base = null) {
   return join(root, 'reply')
 }
 
+/** Whether the environment turns voicing on, for a Host with no reachable switch. */
+function envSwitch (env) {
+  const value = String(env?.DSH_VOICE_SPEAK_REPLIES ?? '').trim().toLowerCase()
+  return value === '1' || value === 'true' || value === 'yes' || value === 'on'
+}
+
 /** A positive finite number, or the fallback. */
 function positive (value, fallback) {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback
@@ -101,7 +107,9 @@ export function normalizeReplySettings (config = {}) {
     ? source.speed
     : null
   return {
-    speakReplies: source.speakReplies === true,
+    // `DSH_VOICE_SPEAK_REPLIES=1` is the escape hatch for a Host whose settings card
+    // cannot be reached: the switch is the same switch, only the way in is a shell.
+    speakReplies: source.speakReplies === true || envSwitch(process.env),
     maxChars: maxCharsSetting(source.maxChars),
     timeoutMs: positive(source.timeoutMs, DEFAULT_TIMEOUT_MS),
     speed,

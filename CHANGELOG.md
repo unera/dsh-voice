@@ -5,6 +5,13 @@ All notable changes to this package are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-11-16
+
+### Added
+- `DSH_VOICE_SPEAK_REPLIES=1` turns voicing on from the environment. The settings card is
+  the way a person expects to flip the switch, but a Host whose client module never mounts
+  leaves no way in at all, and a feature nobody can turn on is not a feature.
+
 ## [0.4.0] - 2026-11-16
 
 ### Changed

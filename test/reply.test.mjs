@@ -504,3 +504,19 @@ test('a volatile field with no saved value mounts instead of failing', () => {
   assert.throws(() => normalizeReplySettings({ maxChars: 6000 }), /целым числом/u)
   assert.throws(() => normalizeReplySettings({ maxChars: 2.5 }), /целым числом/u)
 })
+
+test('the environment can turn voicing on when no switch is reachable', () => {
+  const before = process.env.DSH_VOICE_SPEAK_REPLIES
+  try {
+    process.env.DSH_VOICE_SPEAK_REPLIES = '1'
+    assert.equal(normalizeReplySettings({}).speakReplies, true)
+    process.env.DSH_VOICE_SPEAK_REPLIES = 'no'
+    assert.equal(normalizeReplySettings({}).speakReplies, false)
+    // An explicit setting still wins over nothing, and the env cannot turn it off.
+    process.env.DSH_VOICE_SPEAK_REPLIES = '1'
+    assert.equal(normalizeReplySettings({ speakReplies: false }).speakReplies, true)
+  } finally {
+    if (before === undefined) delete process.env.DSH_VOICE_SPEAK_REPLIES
+    else process.env.DSH_VOICE_SPEAK_REPLIES = before
+  }
+})
