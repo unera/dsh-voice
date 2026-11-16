@@ -5,6 +5,27 @@ All notable changes to this package are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.23] - 2026-11-16
+
+### Fixed
+- The cleanup of a used recording asks the same question as the receiving path — both layouts,
+  `matchNodeSegment`'s rule — and prunes the directory the file is really in. `dsh-nodes` writes
+  `<incoming>/<node>/`, the loop writes `<incoming>/<run>/<node>/`, and the single-layout guard
+  refused the first: with `keepRecording: none` the take stayed on disk, `last` never pruned its
+  directory, and every upload logged a false "refusing to touch a file outside the voice cache".
+- The boot cleanup measures age on the files, not on the run directory above them. A take updates
+  `<node>/` and nothing higher up, so a run directory older than an hour was removed whole
+  together with a recording written a minute ago; now every file older than an hour goes, the
+  directories it leaves empty follow, and a fresh file inside an old run stays.
+- The deduplication key of an upload is the node number, not its name: `${node}:${id}`. A name is
+  edited by hand and two devices may carry the same one; keyed by the name, the words of the
+  second device were answered `already` instead of being delivered.
+- An exchange that passes its deadline now speaks: "Ответ не пришёл — слишком долго. Попробуйте
+  короче." goes to the device, and the closing trace line carries `said=timeout`. Three minutes of
+  silence were indistinguishable from a dead button.
+- The README describes both upload layouts and who creates each, and states that the leftovers of
+  a finished run are cleaned by the age of the files, not by the age of its directory.
+
 ## [0.1.22] - 2026-11-16
 
 ### Fixed
